@@ -12,6 +12,7 @@ use lsp_types::{
 use triomphe::Arc;
 use vfs::{AbsPathBuf, ChangeKind, VfsPath};
 
+use crate::u_path::{u_compile_to_rust, u_save_span_pairs, u_to_rs_url};
 use crate::{
     config::Config,
     global_state::GlobalState,
@@ -56,6 +57,10 @@ pub(crate) fn handle_did_open_text_document(
 ) -> anyhow::Result<()> {
     let _p = profile::span("handle_did_open_text_document");
 
+    let mut params = params;
+    let url_path = u_to_rs_url(&state.config.root_path(), &mut params.text_document.uri);
+    let span_pairs = u_compile_to_rust(&mut params.text_document.text, &url_path);
+
     if let Ok(path) = from_proto::vfs_path(&params.text_document.uri) {
         let already_exists = state
             .mem_docs
@@ -65,6 +70,7 @@ pub(crate) fn handle_did_open_text_document(
             tracing::error!("duplicate DidOpenTextDocument: {}", path);
         }
         state.vfs.write().0.set_file_contents(path, Some(params.text_document.text.into_bytes()));
+        u_save_span_pairs(state, &params.text_document.uri, span_pairs);
     }
     Ok(())
 }
@@ -74,6 +80,13 @@ pub(crate) fn handle_did_change_text_document(
     params: DidChangeTextDocumentParams,
 ) -> anyhow::Result<()> {
     let _p = profile::span("handle_did_change_text_document");
+
+    let mut params = params;
+    let url_path = u_to_rs_url(&state.config.root_path(), &mut params.text_document.uri);
+    if !params.content_changes.is_empty() {
+        let span_pairs = u_compile_to_rust(&mut params.content_changes[0].text, &url_path);
+        u_save_span_pairs(state, &params.text_document.uri, span_pairs);
+    }
 
     if let Ok(path) = from_proto::vfs_path(&params.text_document.uri) {
         match state.mem_docs.get_mut(&path) {
@@ -107,6 +120,9 @@ pub(crate) fn handle_did_close_text_document(
     params: DidCloseTextDocumentParams,
 ) -> anyhow::Result<()> {
     let _p = profile::span("handle_did_close_text_document");
+
+    let mut params = params;
+    u_to_rs_url(&state.config.root_path(), &mut params.text_document.uri);
 
     if let Ok(path) = from_proto::vfs_path(&params.text_document.uri) {
         if state.mem_docs.remove(&path).is_err() {

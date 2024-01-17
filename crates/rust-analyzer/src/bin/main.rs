@@ -188,7 +188,9 @@ fn run_server() -> anyhow::Result<()> {
         .map(patch_path_prefix)
         .and_then(|it| AbsPathBuf::try_from(it).ok())
     {
-        Some(it) => it,
+        // Some(it) => it,
+        // $CRATE_ROOT to $WORKSPACE_ROOT/.u
+        Some(it) => it.parent().unwrap().parent().unwrap().join(".u"),
         None => {
             let cwd = env::current_dir()?;
             AbsPathBuf::assert(cwd)
@@ -208,6 +210,7 @@ fn run_server() -> anyhow::Result<()> {
                 .filter_map(|it| it.uri.to_file_path().ok())
                 .map(patch_path_prefix)
                 .filter_map(|it| AbsPathBuf::try_from(it).ok())
+                .filter_map(|it| Some(it.parent().unwrap().parent().unwrap().join(".u"))) // mhf
                 .collect::<Vec<_>>()
         })
         .filter(|workspaces| !workspaces.is_empty())

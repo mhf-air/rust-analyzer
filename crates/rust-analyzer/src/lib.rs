@@ -31,6 +31,7 @@ mod op_queue;
 mod reload;
 mod task_pool;
 mod version;
+mod u_path;
 
 mod handlers {
     pub(crate) mod notification;

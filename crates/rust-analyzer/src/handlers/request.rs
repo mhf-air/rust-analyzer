@@ -48,6 +48,9 @@ use crate::{
         self, CrateInfoResult, ExternalDocsPair, ExternalDocsResponse, FetchDependencyListParams,
         FetchDependencyListResult, PositionOrRange, ViewCrateGraphParams, WorkspaceSymbolParams,
     },
+    u_path::{
+        u_to_rs_position, u_to_rs_url, u_transform_completion_items, u_transform_signature_help,
+    },
 };
 
 pub(crate) fn handle_workspace_reload(state: &mut GlobalState, _: ()) -> anyhow::Result<()> {
@@ -611,6 +614,13 @@ pub(crate) fn handle_goto_definition(
     snap: GlobalStateSnapshot,
     params: lsp_types::GotoDefinitionParams,
 ) -> anyhow::Result<Option<lsp_types::GotoDefinitionResponse>> {
+    let mut params = params;
+    u_to_rs_url(
+        &snap.config.root_path(),
+        &mut params.text_document_position_params.text_document.uri,
+    );
+    u_to_rs_position(&snap, &mut params.text_document_position_params);
+
     let _p = profile::span("handle_goto_definition");
     let position = from_proto::file_position(&snap, params.text_document_position_params)?;
     let nav_info = match snap.analysis.goto_definition(position)? {
@@ -851,11 +861,27 @@ pub(crate) fn handle_completion(
     snap: GlobalStateSnapshot,
     params: lsp_types::CompletionParams,
 ) -> anyhow::Result<Option<lsp_types::CompletionResponse>> {
+    let mut params = params;
+    u_to_rs_url(&snap.config.root_path(), &mut params.text_document_position.text_document.uri);
+    u_to_rs_position(&snap, &mut params.text_document_position);
+
     let _p = profile::span("handle_completion");
     let text_document_position = params.text_document_position.clone();
     let position = from_proto::file_position(&snap, params.text_document_position)?;
     let completion_trigger_character =
         params.context.and_then(|ctx| ctx.trigger_character).and_then(|s| s.chars().next());
+
+    /* if Some(':') == completion_trigger_character {
+        let source_file = snap.analysis.parse(position.file_id)?;
+        let left_token = source_file.syntax().token_at_offset(position.offset).left_biased();
+        let completion_triggered_after_single_colon = match left_token {
+            Some(left_token) => left_token.kind() == T![:],
+            None => true,
+        };
+        if completion_triggered_after_single_colon {
+            return Ok(None);
+        }
+    } */
 
     let completion_config = &snap.config.completion();
     let items = match snap.analysis.completions(
@@ -868,8 +894,10 @@ pub(crate) fn handle_completion(
     };
     let line_index = snap.file_line_index(position.file_id)?;
 
-    let items =
+    let url = text_document_position.text_document.uri.clone();
+    let mut items =
         to_proto::completion_items(&snap.config, &line_index, text_document_position, items);
+    u_transform_completion_items(&snap, &url, &mut items);
 
     let completion_list = lsp_types::CompletionList { is_incomplete: true, items };
     Ok(Some(completion_list.into()))
@@ -952,6 +980,13 @@ pub(crate) fn handle_signature_help(
     snap: GlobalStateSnapshot,
     params: lsp_types::SignatureHelpParams,
 ) -> anyhow::Result<Option<lsp_types::SignatureHelp>> {
+    let mut params = params;
+    u_to_rs_url(
+        &snap.config.root_path(),
+        &mut params.text_document_position_params.text_document.uri,
+    );
+    u_to_rs_position(&snap, &mut params.text_document_position_params);
+
     let _p = profile::span("handle_signature_help");
     let position = from_proto::file_position(&snap, params.text_document_position_params)?;
     let help = match snap.analysis.signature_help(position)? {
@@ -959,7 +994,9 @@ pub(crate) fn handle_signature_help(
         None => return Ok(None),
     };
     let config = snap.config.call_info();
-    let res = to_proto::signature_help(help, config, snap.config.signature_help_label_offsets());
+    let mut res =
+        to_proto::signature_help(help, config, snap.config.signature_help_label_offsets());
+    u_transform_signature_help(&mut res);
     Ok(Some(res))
 }
 

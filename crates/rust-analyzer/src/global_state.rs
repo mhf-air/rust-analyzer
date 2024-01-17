@@ -34,6 +34,7 @@ use crate::{
     op_queue::OpQueue,
     reload,
     task_pool::TaskPool,
+    u_path::UMeta,
 };
 
 // Enforces drop order
@@ -76,6 +77,8 @@ pub(crate) struct GlobalState {
     // proc macros
     pub(crate) proc_macro_changed: bool,
     pub(crate) proc_macro_clients: Arc<[anyhow::Result<ProcMacroServer>]>,
+
+    pub(crate) u: UMeta,
 
     // Flycheck
     pub(crate) flycheck: Arc<[FlycheckHandle]>,
@@ -140,6 +143,8 @@ pub(crate) struct GlobalStateSnapshot {
     // used to signal semantic highlighting to fall back to syntax based highlighting until proc-macros have been loaded
     pub(crate) proc_macros_loaded: bool,
     pub(crate) flycheck: Arc<[FlycheckHandle]>,
+
+    pub(crate) u: UMeta,
 }
 
 impl std::panic::UnwindSafe for GlobalStateSnapshot {}
@@ -190,6 +195,7 @@ impl GlobalState {
             proc_macro_changed: false,
             proc_macro_clients: Arc::from_iter([]),
 
+            u: Default::default(),
             flycheck: Arc::from_iter([]),
             flycheck_sender,
             flycheck_receiver,
@@ -367,6 +373,7 @@ impl GlobalState {
             proc_macros_loaded: !self.config.expand_proc_macros()
                 || *self.fetch_proc_macros_queue.last_op_result(),
             flycheck: self.flycheck.clone(),
+            u: self.u.clone(),
         }
     }
 
