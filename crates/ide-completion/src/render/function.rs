@@ -4,12 +4,17 @@ use hir::{db::HirDatabase, AsAssocItem, HirDisplay};
 use ide_db::{SnippetCap, SymbolKind};
 use itertools::Itertools;
 use stdx::{format_to, to_lower_snake_case};
-use syntax::{AstNode, SmolStr};
+use syntax::{format_smolstr, AstNode, SmolStr};
 
 use crate::{
     context::{CompletionContext, DotAccess, DotAccessKind, PathCompletionCtx, PathKind},
-    item::{Builder, CompletionItem, CompletionItemKind, CompletionRelevance},
-    render::{compute_exact_name_match, compute_ref_match, compute_type_match, RenderContext},
+    item::{
+        Builder, CompletionItem, CompletionItemKind, CompletionRelevance, CompletionRelevanceFn,
+        CompletionRelevanceReturnType,
+    },
+    render::{
+        compute_exact_name_match, compute_ref_match, compute_type_match, match_types, RenderContext,
+    },
     CallableSnippets,
 };
 
@@ -25,7 +30,7 @@ pub(crate) fn render_fn(
     local_name: Option<hir::Name>,
     func: hir::Function,
 ) -> Builder {
-    let _p = profile::span("render_fn");
+    let _p = tracing::span!(tracing::Level::INFO, "render_fn").entered();
     render(ctx, local_name, func, FuncKind::Function(path_ctx))
 }
 
@@ -36,7 +41,7 @@ pub(crate) fn render_method(
     local_name: Option<hir::Name>,
     func: hir::Function,
 ) -> Builder {
-    let _p = profile::span("render_method");
+    let _p = tracing::span!(tracing::Level::INFO, "render_method").entered();
     render(ctx, local_name, func, FuncKind::Method(dot_access, receiver))
 }
 
@@ -52,32 +57,34 @@ fn render(
 
     let (call, escaped_call) = match &func_kind {
         FuncKind::Method(_, Some(receiver)) => (
-            format!(
+            format_smolstr!(
                 "{}.{}",
                 receiver.unescaped().display(ctx.db()),
                 name.unescaped().display(ctx.db())
-            )
-            .into(),
-            format!("{}.{}", receiver.display(ctx.db()), name.display(ctx.db())).into(),
+            ),
+            format_smolstr!("{}.{}", receiver.display(ctx.db()), name.display(ctx.db())),
         ),
         _ => (name.unescaped().to_smol_str(), name.to_smol_str()),
     };
-
+    let has_self_param = func.self_param(db).is_some();
     let mut item = CompletionItem::new(
-        if func.self_param(db).is_some() {
-            CompletionItemKind::Method
+        CompletionItemKind::SymbolKind(if has_self_param {
+            SymbolKind::Method
         } else {
-            CompletionItemKind::SymbolKind(SymbolKind::Function)
-        },
+            SymbolKind::Function
+        }),
         ctx.source_range(),
         call.clone(),
     );
 
     let ret_type = func.ret_type(db);
-    let is_op_method = func
-        .as_assoc_item(ctx.db())
-        .and_then(|trait_| trait_.containing_trait_or_trait_impl(ctx.db()))
-        .map_or(false, |trait_| completion.is_ops_trait(trait_));
+    let assoc_item = func.as_assoc_item(db);
+
+    let trait_ = assoc_item.and_then(|trait_| trait_.container_or_implemented_trait(db));
+    let is_op_method = trait_.map_or(false, |trait_| completion.is_ops_trait(trait_));
+
+    let is_item_from_notable_trait =
+        trait_.map_or(false, |trait_| completion.is_doc_notable_trait(trait_));
 
     let (has_dot_receiver, has_call_parens, cap) = match func_kind {
         FuncKind::Function(&PathCompletionCtx {
@@ -97,6 +104,15 @@ fn render(
         .filter(|_| !has_call_parens)
         .and_then(|cap| Some((cap, params(ctx.completion, func, &func_kind, has_dot_receiver)?)));
 
+    let function = assoc_item
+        .and_then(|assoc_item| assoc_item.implementing_ty(db))
+        .map(|self_type| compute_return_type_match(db, &ctx, self_type, &ret_type))
+        .map(|return_type| CompletionRelevanceFn {
+            has_params: has_self_param || func.num_params(db) > 0,
+            has_self_param,
+            return_type,
+        });
+
     item.set_relevance(CompletionRelevance {
         type_match: if has_call_parens || complete_call_parens.is_some() {
             compute_type_match(completion, &ret_type)
@@ -104,7 +120,9 @@ fn render(
             compute_type_match(completion, &func.ty(db))
         },
         exact_name_match: compute_exact_name_match(completion, &call),
+        function,
         is_op_method,
+        is_item_from_notable_trait,
         ..ctx.completion_relevance()
     });
 
@@ -141,8 +159,8 @@ fn render(
             item.add_import(import_to_add);
         }
         None => {
-            if let Some(actm) = func.as_assoc_item(db) {
-                if let Some(trt) = actm.containing_trait_or_trait_impl(db) {
+            if let Some(actm) = assoc_item {
+                if let Some(trt) = actm.container_or_implemented_trait(db) {
                     item.trait_name(trt.name(db).to_smol_str());
                 }
             }
@@ -151,6 +169,33 @@ fn render(
 
     item.doc_aliases(ctx.doc_aliases);
     item
+}
+
+fn compute_return_type_match(
+    db: &dyn HirDatabase,
+    ctx: &RenderContext<'_>,
+    self_type: hir::Type,
+    ret_type: &hir::Type,
+) -> CompletionRelevanceReturnType {
+    if match_types(ctx.completion, &self_type, ret_type).is_some() {
+        // fn([..]) -> Self
+        CompletionRelevanceReturnType::DirectConstructor
+    } else if ret_type
+        .type_arguments()
+        .any(|ret_type_arg| match_types(ctx.completion, &self_type, &ret_type_arg).is_some())
+    {
+        // fn([..]) -> Result<Self, E> OR Wrapped<Foo, Self>
+        CompletionRelevanceReturnType::Constructor
+    } else if ret_type
+        .as_adt()
+        .and_then(|adt| adt.name(db).as_str().map(|name| name.ends_with("Builder")))
+        .unwrap_or(false)
+    {
+        // fn([..]) -> [..]Builder
+        CompletionRelevanceReturnType::Builder
+    } else {
+        CompletionRelevanceReturnType::Other
+    }
 }
 
 pub(super) fn add_call_parens<'b>(
@@ -181,12 +226,12 @@ pub(super) fn add_call_parens<'b>(
                         }
                         None => {
                             let name = match param.ty().as_adt() {
-                                None => "_".to_string(),
+                                None => "_".to_owned(),
                                 Some(adt) => adt
                                     .name(ctx.db)
                                     .as_text()
                                     .map(|s| to_lower_snake_case(s.as_str()))
-                                    .unwrap_or_else(|| "_".to_string()),
+                                    .unwrap_or_else(|| "_".to_owned()),
                             };
                             f(&format_args!("${{{}:{name}}}", index + offset))
                         }
@@ -301,16 +346,17 @@ fn params(
     func_kind: &FuncKind<'_>,
     has_dot_receiver: bool,
 ) -> Option<(Option<hir::SelfParam>, Vec<hir::Param>)> {
-    if ctx.config.callable.is_none() {
-        return None;
-    }
+    ctx.config.callable.as_ref()?;
 
-    // Don't add parentheses if the expected type is some function reference.
-    if let Some(ty) = &ctx.expected_type {
-        // FIXME: check signature matches?
-        if ty.is_fn() {
-            cov_mark::hit!(no_call_parens_if_fn_ptr_needed);
-            return None;
+    // Don't add parentheses if the expected type is a function reference with the same signature.
+    if let Some(expected) = ctx.expected_type.as_ref().filter(|e| e.is_fn()) {
+        if let Some(expected) = expected.as_callable(ctx.db) {
+            if let Some(completed) = func.ty(ctx.db).as_callable(ctx.db) {
+                if expected.sig() == completed.sig() {
+                    cov_mark::hit!(no_call_parens_if_fn_ptr_needed);
+                    return None;
+                }
+            }
         }
     }
 

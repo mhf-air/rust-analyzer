@@ -86,7 +86,11 @@ impl Metrics {
     fn measure_rustc_tests(&mut self, sh: &Shell) -> anyhow::Result<()> {
         eprintln!("\nMeasuring rustc tests");
 
-        cmd!(sh, "git clone --depth=1 https://github.com/rust-lang/rust").run()?;
+        cmd!(
+            sh,
+            "git clone --depth=1 --branch 1.76.0 https://github.com/rust-lang/rust.git --single-branch"
+        )
+        .run()?;
 
         let output = cmd!(sh, "./target/release/rust-analyzer rustc-tests ./rust").read()?;
         for (metric, value, unit) in parse_metrics(&output) {
@@ -113,7 +117,11 @@ impl Metrics {
     ) -> anyhow::Result<()> {
         assert!(Path::new(path).exists(), "unable to find bench in {path}");
         eprintln!("\nMeasuring analysis-stats/{name}");
-        let output = cmd!(sh, "./target/release/rust-analyzer -q analysis-stats {path}").read()?;
+        let output = cmd!(
+            sh,
+            "./target/release/rust-analyzer -q analysis-stats {path} --query-sysroot-metadata"
+        )
+        .read()?;
         for (metric, value, unit) in parse_metrics(&output) {
             self.report(&format!("analysis-stats/{name}/{metric}"), value, unit.into());
         }
@@ -188,12 +196,12 @@ impl Host {
             bail!("can only collect metrics on Linux ");
         }
 
-        let os = read_field(sh, "/etc/os-release", "PRETTY_NAME=")?.trim_matches('"').to_string();
+        let os = read_field(sh, "/etc/os-release", "PRETTY_NAME=")?.trim_matches('"').to_owned();
 
         let cpu = read_field(sh, "/proc/cpuinfo", "model name")?
             .trim_start_matches(':')
             .trim()
-            .to_string();
+            .to_owned();
 
         let mem = read_field(sh, "/proc/meminfo", "MemTotal:")?;
 
@@ -204,7 +212,7 @@ impl Host {
 
             text.lines()
                 .find_map(|it| it.strip_prefix(field))
-                .map(|it| it.trim().to_string())
+                .map(|it| it.trim().to_owned())
                 .ok_or_else(|| format_err!("can't parse {}", path))
         }
     }

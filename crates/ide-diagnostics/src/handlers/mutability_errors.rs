@@ -7,7 +7,11 @@ use crate::{fix, Diagnostic, DiagnosticCode, DiagnosticsContext};
 // Diagnostic: need-mut
 //
 // This diagnostic is triggered on mutating an immutable variable.
-pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Diagnostic {
+pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Option<Diagnostic> {
+    if d.span.file_id.macro_file().is_some() {
+        // FIXME: Our infra can't handle allow from within macro expansions rn
+        return None;
+    }
     let fixes = (|| {
         if d.local.is_ref(ctx.sema.db) {
             // There is no simple way to add `mut` to `ref x` and `ref mut x`
@@ -19,7 +23,7 @@ pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Diagno
         for source in d.local.sources(ctx.sema.db) {
             let Some(ast) = source.name() else { continue };
             // FIXME: macros
-            edit_builder.insert(ast.value.syntax().text_range().start(), "mut ".to_string());
+            edit_builder.insert(ast.value.syntax().text_range().start(), "mut ".to_owned());
         }
         let edit = edit_builder.finish();
         Some(vec![fix(
@@ -29,24 +33,30 @@ pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Diagno
             use_range,
         )])
     })();
-    Diagnostic::new_with_syntax_node_ptr(
-        ctx,
-        // FIXME: `E0384` is not the only error that this diagnostic handles
-        DiagnosticCode::RustcHardError("E0384"),
-        format!(
-            "cannot mutate immutable variable `{}`",
-            d.local.name(ctx.sema.db).display(ctx.sema.db)
-        ),
-        d.span.clone(),
+    Some(
+        Diagnostic::new_with_syntax_node_ptr(
+            ctx,
+            // FIXME: `E0384` is not the only error that this diagnostic handles
+            DiagnosticCode::RustcHardError("E0384"),
+            format!(
+                "cannot mutate immutable variable `{}`",
+                d.local.name(ctx.sema.db).display(ctx.sema.db)
+            ),
+            d.span,
+        )
+        .with_fixes(fixes),
     )
-    .with_fixes(fixes)
 }
 
 // Diagnostic: unused-mut
 //
 // This diagnostic is triggered when a mutable variable isn't actually mutated.
-pub(crate) fn unused_mut(ctx: &DiagnosticsContext<'_>, d: &hir::UnusedMut) -> Diagnostic {
+pub(crate) fn unused_mut(ctx: &DiagnosticsContext<'_>, d: &hir::UnusedMut) -> Option<Diagnostic> {
     let ast = d.local.primary_source(ctx.sema.db).syntax_ptr();
+    if ast.file_id.macro_file().is_some() {
+        // FIXME: Our infra can't handle allow from within macro expansions rn
+        return None;
+    }
     let fixes = (|| {
         let file_id = ast.file_id.file_id()?;
         let mut edit_builder = TextEdit::builder();
@@ -70,14 +80,16 @@ pub(crate) fn unused_mut(ctx: &DiagnosticsContext<'_>, d: &hir::UnusedMut) -> Di
         )])
     })();
     let ast = d.local.primary_source(ctx.sema.db).syntax_ptr();
-    Diagnostic::new_with_syntax_node_ptr(
-        ctx,
-        DiagnosticCode::RustcLint("unused_mut"),
-        "variable does not need to be mutable",
-        ast,
+    Some(
+        Diagnostic::new_with_syntax_node_ptr(
+            ctx,
+            DiagnosticCode::RustcLint("unused_mut"),
+            "variable does not need to be mutable",
+            ast,
+        )
+        .experimental() // Not supporting `#[allow(unused_mut)]` in proc macros leads to false positive.
+        .with_fixes(fixes),
     )
-    .experimental() // Not supporting `#[allow(unused_mut)]` in proc macros leads to false positive.
-    .with_fixes(fixes)
 }
 
 pub(super) fn token(parent: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxToken> {
@@ -86,7 +98,7 @@ pub(super) fn token(parent: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxToken
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::{check_diagnostics, check_fix};
+    use crate::tests::{check_diagnostics, check_diagnostics_with_disabled, check_fix};
 
     #[test]
     fn unused_mut_simple() {
@@ -413,7 +425,7 @@ fn main() {
 fn main() {
     return;
     let mut x = 2;
-      //^^^^^ warn: unused variable
+      //^^^^^ 💡 warn: unused variable
     &mut x;
 }
 "#,
@@ -423,12 +435,12 @@ fn main() {
 fn main() {
     loop {}
     let mut x = 2;
-      //^^^^^ warn: unused variable
+      //^^^^^ 💡 warn: unused variable
     &mut x;
 }
 "#,
         );
-        check_diagnostics(
+        check_diagnostics_with_disabled(
             r#"
 enum X {}
 fn g() -> X {
@@ -444,12 +456,13 @@ fn main(b: bool) {
         g();
     }
     let mut x = 2;
-      //^^^^^ warn: unused variable
+      //^^^^^ 💡 warn: unused variable
     &mut x;
 }
 "#,
+            &["remove-unnecessary-else"],
         );
-        check_diagnostics(
+        check_diagnostics_with_disabled(
             r#"
 fn main(b: bool) {
     if b {
@@ -458,10 +471,11 @@ fn main(b: bool) {
         return;
     }
     let mut x = 2;
-      //^^^^^ warn: unused variable
+      //^^^^^ 💡 warn: unused variable
     &mut x;
 }
 "#,
+            &["remove-unnecessary-else"],
         );
     }
 
@@ -787,7 +801,7 @@ fn f() {
                //^^ 💡 error: cannot mutate immutable variable `x`
     _ = (x, y);
     let x = Foo;
-      //^ warn: unused variable
+      //^ 💡 warn: unused variable
     let x = Foo;
     let y: &mut (i32, u8) = &mut x;
                           //^^^^^^ 💡 error: cannot mutate immutable variable `x`
@@ -815,7 +829,7 @@ fn f() {
 //- minicore: option
 fn f(_: i32) {}
 fn main() {
-    let ((Some(mut x), None) | (_, Some(mut x))) = (None, Some(7));
+    let ((Some(mut x), None) | (_, Some(mut x))) = (None, Some(7)) else { return };
              //^^^^^ 💡 warn: variable does not need to be mutable
     f(x);
 }

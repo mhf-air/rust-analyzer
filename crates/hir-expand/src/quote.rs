@@ -1,8 +1,14 @@
 //! A simplified version of quote-crate like quasi quote macro
+#![allow(clippy::crate_in_macro_def)]
 
 use span::Span;
+use syntax::format_smolstr;
 
 use crate::name::Name;
+
+pub(crate) const fn dollar_crate(span: Span) -> tt::Ident<Span> {
+    tt::Ident { text: syntax::SmolStr::new_static("$crate"), span }
+}
 
 // A helper macro quote macro
 // FIXME:
@@ -13,19 +19,19 @@ use crate::name::Name;
 #[macro_export]
 macro_rules! __quote {
     ($span:ident) => {
-        Vec::<crate::tt::TokenTree>::new()
+        Vec::<$crate::tt::TokenTree>::new()
     };
 
     ( @SUBTREE($span:ident) $delim:ident $($tt:tt)* ) => {
         {
             let children = $crate::__quote!($span $($tt)*);
-            crate::tt::Subtree {
+            $crate::tt::Subtree {
                 delimiter: crate::tt::Delimiter {
                     kind: crate::tt::DelimiterKind::$delim,
                     open: $span,
                     close: $span,
                 },
-                token_trees: $crate::quote::IntoTt::to_tokens(children),
+                token_trees: $crate::quote::IntoTt::to_tokens(children).into_boxed_slice(),
             }
         }
     };
@@ -140,7 +146,7 @@ impl IntoTt for Vec<crate::tt::TokenTree> {
     fn to_subtree(self, span: Span) -> crate::tt::Subtree {
         crate::tt::Subtree {
             delimiter: crate::tt::Delimiter::invisible_spanned(span),
-            token_trees: self,
+            token_trees: self.into_boxed_slice(),
         }
     }
 
@@ -210,8 +216,8 @@ impl_to_to_tokentrees! {
     _span: crate::tt::Literal => self { self };
     _span: crate::tt::Ident => self { self };
     _span: crate::tt::Punct => self { self };
-    span: &str => self { crate::tt::Literal{text: format!("\"{}\"", self.escape_default()).into(), span}};
-    span: String => self { crate::tt::Literal{text: format!("\"{}\"", self.escape_default()).into(), span}};
+    span: &str => self { crate::tt::Literal{text: format_smolstr!("\"{}\"", self.escape_default()), span}};
+    span: String => self { crate::tt::Literal{text: format_smolstr!("\"{}\"", self.escape_default()), span}};
     span: Name => self { crate::tt::Ident{text: self.to_smol_str(), span}};
 }
 
@@ -260,10 +266,11 @@ mod tests {
 
         let quoted = quote!(DUMMY =>#a);
         assert_eq!(quoted.to_string(), "hello");
-        let t = format!("{quoted:?}");
+        let t = format!("{quoted:#?}");
         expect![[r#"
-            SUBTREE $$ SpanData { range: 0..0, anchor: SpanAnchor(FileId(937550), 0), ctx: SyntaxContextId(0) } SpanData { range: 0..0, anchor: SpanAnchor(FileId(937550), 0), ctx: SyntaxContextId(0) }
-              IDENT   hello SpanData { range: 0..0, anchor: SpanAnchor(FileId(937550), 0), ctx: SyntaxContextId(0) }"#]].assert_eq(&t);
+            SUBTREE $$ 937550:0@0..0#0 937550:0@0..0#0
+              IDENT   hello 937550:0@0..0#0"#]]
+        .assert_eq(&t);
     }
 
     #[test]
@@ -290,8 +297,9 @@ mod tests {
         // }
         let struct_name = mk_ident("Foo");
         let fields = [mk_ident("name"), mk_ident("id")];
-        let fields =
-            fields.iter().flat_map(|it| quote!(DUMMY =>#it: self.#it.clone(), ).token_trees);
+        let fields = fields
+            .iter()
+            .flat_map(|it| quote!(DUMMY =>#it: self.#it.clone(), ).token_trees.into_vec());
 
         let list = crate::tt::Subtree {
             delimiter: crate::tt::Delimiter {

@@ -2,16 +2,31 @@
 
 use std::collections::hash_map::Entry;
 
-use hir_expand::{ast_id_map::AstIdMap, span_map::SpanMapRef, HirFileId};
-use syntax::ast::{self, HasModuleItem, HasTypeBounds};
+use hir_expand::{mod_path::path, name, name::AsName, span_map::SpanMapRef, HirFileId};
+use la_arena::Arena;
+use span::{AstIdMap, SyntaxContextId};
+use syntax::{
+    ast::{self, HasModuleItem, HasName, HasTypeBounds, IsString},
+    AstNode,
+};
+use triomphe::Arc;
 
 use crate::{
-    generics::{GenericParams, TypeParamData, TypeParamProvenance},
-    type_ref::{LifetimeRef, TraitBoundModifier, TraitRef},
+    db::DefDatabase,
+    generics::{GenericParams, GenericParamsCollector, TypeParamData, TypeParamProvenance},
+    item_tree::{
+        AssocItem, AttrOwner, Const, Either, Enum, ExternBlock, ExternCrate, Field, FieldAstId,
+        Fields, FileItemTreeId, FnFlags, Function, GenericArgs, Idx, IdxRange, Impl, ImportAlias,
+        Interned, ItemTree, ItemTreeData, ItemTreeNode, Macro2, MacroCall, MacroRules, Mod,
+        ModItem, ModKind, ModPath, Mutability, Name, Param, ParamAstId, Path, Range, RawAttrs,
+        RawIdx, RawVisibilityId, Static, Struct, StructKind, Trait, TraitAlias, TypeAlias, Union,
+        Use, UseTree, UseTreeKind, Variant,
+    },
+    path::AssociatedTypeBinding,
+    type_ref::{LifetimeRef, TraitBoundModifier, TraitRef, TypeBound, TypeRef},
+    visibility::RawVisibility,
     LocalLifetimeParamId, LocalTypeOrConstParamId,
 };
-
-use super::*;
 
 fn id<N: ItemTreeNode>(index: Idx<N>) -> FileItemTreeId<N> {
     FileItemTreeId(index)
@@ -30,7 +45,7 @@ impl<'a> Ctx<'a> {
             db,
             tree: ItemTree::default(),
             source_ast_id_map: db.ast_id_map(file),
-            body_ctx: crate::lower::LowerCtx::with_file_id(db, file),
+            body_ctx: crate::lower::LowerCtx::new(db, file),
         }
     }
 
@@ -253,25 +268,27 @@ impl<'a> Ctx<'a> {
         let generic_params = self.lower_generic_params(HasImplicitSelf::No, enum_);
         let variants = match &enum_.variant_list() {
             Some(variant_list) => self.lower_variants(variant_list),
-            None => IdxRange::new(self.next_variant_idx()..self.next_variant_idx()),
+            None => {
+                FileItemTreeId(self.next_variant_idx())..FileItemTreeId(self.next_variant_idx())
+            }
         };
         let res = Enum { name, visibility, generic_params, variants, ast_id };
         Some(id(self.data().enums.alloc(res)))
     }
 
-    fn lower_variants(&mut self, variants: &ast::VariantList) -> IdxRange<Variant> {
+    fn lower_variants(&mut self, variants: &ast::VariantList) -> Range<FileItemTreeId<Variant>> {
         let start = self.next_variant_idx();
         for variant in variants.variants() {
             if let Some(data) = self.lower_variant(&variant) {
                 let idx = self.data().variants.alloc(data);
                 self.add_attrs(
-                    idx.into(),
+                    id(idx).into(),
                     RawAttrs::new(self.db.upcast(), &variant, self.span_map()),
                 );
             }
         }
         let end = self.next_variant_idx();
-        IdxRange::new(start..end)
+        FileItemTreeId(start)..FileItemTreeId(end)
     }
 
     fn lower_variant(&mut self, variant: &ast::Variant) -> Option<Variant> {
@@ -386,17 +403,16 @@ impl<'a> Ctx<'a> {
             flags |= FnFlags::HAS_UNSAFE_KW;
         }
 
-        let mut res = Function {
+        let res = Function {
             name,
             visibility,
-            explicit_generic_params: Interned::new(GenericParams::default()),
+            explicit_generic_params: self.lower_generic_params(HasImplicitSelf::No, func),
             abi,
             params,
             ret_type: Interned::new(ret_type),
             ast_id,
             flags,
         };
-        res.explicit_generic_params = self.lower_generic_params(HasImplicitSelf::No, func);
 
         Some(id(self.data().functions.alloc(res)))
     }
@@ -519,7 +535,9 @@ impl<'a> Ctx<'a> {
     fn lower_use(&mut self, use_item: &ast::Use) -> Option<FileItemTreeId<Use>> {
         let visibility = self.lower_visibility(use_item);
         let ast_id = self.source_ast_id_map.ast_id(use_item);
-        let (use_tree, _) = lower_use_tree(self.db, self.span_map(), use_item.use_tree()?)?;
+        let (use_tree, _) = lower_use_tree(self.db, use_item.use_tree()?, &mut |range| {
+            self.span_map().span_for_range(range).ctx
+        })?;
 
         let res = Use { visibility, ast_id, use_tree };
         Some(id(self.data().uses.alloc(res)))
@@ -542,33 +560,32 @@ impl<'a> Ctx<'a> {
 
     fn lower_macro_call(&mut self, m: &ast::MacroCall) -> Option<FileItemTreeId<MacroCall>> {
         let span_map = self.span_map();
-        let path = Interned::new(ModPath::from_src(self.db.upcast(), m.path()?, span_map)?);
+        let path = m.path()?;
+        let range = path.syntax().text_range();
+        let path = Interned::new(ModPath::from_src(self.db.upcast(), path, &mut |range| {
+            span_map.span_for_range(range).ctx
+        })?);
         let ast_id = self.source_ast_id_map.ast_id(m);
         let expand_to = hir_expand::ExpandTo::from_call_site(m);
-        let res = MacroCall {
-            path,
-            ast_id,
-            expand_to,
-            call_site: span_map.span_for_range(m.syntax().text_range()),
-        };
+        let res = MacroCall { path, ast_id, expand_to, ctxt: span_map.span_for_range(range).ctx };
         Some(id(self.data().macro_calls.alloc(res)))
     }
 
     fn lower_macro_rules(&mut self, m: &ast::MacroRules) -> Option<FileItemTreeId<MacroRules>> {
-        let name = m.name().map(|it| it.as_name())?;
+        let name = m.name()?;
         let ast_id = self.source_ast_id_map.ast_id(m);
 
-        let res = MacroRules { name, ast_id };
+        let res = MacroRules { name: name.as_name(), ast_id };
         Some(id(self.data().macro_rules.alloc(res)))
     }
 
     fn lower_macro_def(&mut self, m: &ast::MacroDef) -> Option<FileItemTreeId<Macro2>> {
-        let name = m.name().map(|it| it.as_name())?;
+        let name = m.name()?;
 
         let ast_id = self.source_ast_id_map.ast_id(m);
         let visibility = self.lower_visibility(m);
 
-        let res = Macro2 { name, ast_id, visibility };
+        let res = Macro2 { name: name.as_name(), ast_id, visibility };
         Some(id(self.data().macro_defs.alloc(res)))
     }
 
@@ -604,7 +621,7 @@ impl<'a> Ctx<'a> {
         has_implicit_self: HasImplicitSelf,
         node: &dyn ast::HasGenericParams,
     ) -> Interned<GenericParams> {
-        let mut generics = GenericParams::default();
+        let mut generics = GenericParamsCollector::default();
 
         if let HasImplicitSelf::Yes(bounds) = has_implicit_self {
             // Traits and trait aliases get the Self type as an implicit first type parameter.
@@ -642,8 +659,7 @@ impl<'a> Ctx<'a> {
         };
         generics.fill(&self.body_ctx, node, add_param_attrs);
 
-        generics.shrink_to_fit();
-        Interned::new(generics)
+        Interned::new(generics.finish())
     }
 
     fn lower_type_bounds(&mut self, node: &dyn ast::HasTypeBounds) -> Box<[Interned<TypeBound>]> {
@@ -657,8 +673,9 @@ impl<'a> Ctx<'a> {
     }
 
     fn lower_visibility(&mut self, item: &dyn ast::HasVisibility) -> RawVisibilityId {
-        let vis =
-            RawVisibility::from_ast_with_span_map(self.db, item.visibility(), self.span_map());
+        let vis = RawVisibility::from_ast(self.db, item.visibility(), &mut |range| {
+            self.span_map().span_for_range(range).ctx
+        });
         self.data().vis.alloc(vis)
     }
 
@@ -721,27 +738,24 @@ enum HasImplicitSelf {
 }
 
 fn lower_abi(abi: ast::Abi) -> Interned<str> {
-    // FIXME: Abi::abi() -> Option<SyntaxToken>?
-    match abi.syntax().last_token() {
-        Some(tok) if tok.kind() == SyntaxKind::STRING => {
-            // FIXME: Better way to unescape?
-            Interned::new_str(tok.text().trim_matches('"'))
-        }
-        _ => {
-            // `extern` default to be `extern "C"`.
-            Interned::new_str("C")
-        }
+    match abi.abi_string() {
+        Some(tok) => Interned::new_str(tok.text_without_quotes()),
+        // `extern` default to be `extern "C"`.
+        _ => Interned::new_str("C"),
     }
 }
 
 struct UseTreeLowering<'a> {
     db: &'a dyn DefDatabase,
-    span_map: SpanMapRef<'a>,
     mapping: Arena<ast::UseTree>,
 }
 
 impl UseTreeLowering<'_> {
-    fn lower_use_tree(&mut self, tree: ast::UseTree) -> Option<UseTree> {
+    fn lower_use_tree(
+        &mut self,
+        tree: ast::UseTree,
+        span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContextId,
+    ) -> Option<UseTree> {
         if let Some(use_tree_list) = tree.use_tree_list() {
             let prefix = match tree.path() {
                 // E.g. use something::{{{inner}}};
@@ -749,15 +763,17 @@ impl UseTreeLowering<'_> {
                 // E.g. `use something::{inner}` (prefix is `None`, path is `something`)
                 // or `use something::{path::{inner::{innerer}}}` (prefix is `something::path`, path is `inner`)
                 Some(path) => {
-                    match ModPath::from_src(self.db.upcast(), path, self.span_map) {
+                    match ModPath::from_src(self.db.upcast(), path, span_for_range) {
                         Some(it) => Some(it),
                         None => return None, // FIXME: report errors somewhere
                     }
                 }
             };
 
-            let list =
-                use_tree_list.use_trees().filter_map(|tree| self.lower_use_tree(tree)).collect();
+            let list = use_tree_list
+                .use_trees()
+                .filter_map(|tree| self.lower_use_tree(tree, span_for_range))
+                .collect();
 
             Some(
                 self.use_tree(
@@ -768,7 +784,7 @@ impl UseTreeLowering<'_> {
         } else {
             let is_glob = tree.star_token().is_some();
             let path = match tree.path() {
-                Some(path) => Some(ModPath::from_src(self.db.upcast(), path, self.span_map)?),
+                Some(path) => Some(ModPath::from_src(self.db.upcast(), path, span_for_range)?),
                 None => None,
             };
             let alias = tree.rename().map(|a| {
@@ -804,10 +820,10 @@ impl UseTreeLowering<'_> {
 
 pub(crate) fn lower_use_tree(
     db: &dyn DefDatabase,
-    span_map: SpanMapRef<'_>,
     tree: ast::UseTree,
+    span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContextId,
 ) -> Option<(UseTree, Arena<ast::UseTree>)> {
-    let mut lowering = UseTreeLowering { db, span_map, mapping: Arena::new() };
-    let tree = lowering.lower_use_tree(tree)?;
+    let mut lowering = UseTreeLowering { db, mapping: Arena::new() };
+    let tree = lowering.lower_use_tree(tree, span_for_range)?;
     Some((tree, lowering.mapping))
 }

@@ -77,8 +77,10 @@ impl Definition {
         // it is not allowed for these defs to be renamed.
         // cases where self.krate() is None is handled below.
         if let Some(krate) = self.krate(sema.db) {
+            // Can we not rename non-local items?
+            // Then bail if non-local
             if !krate.origin(sema.db).is_local() {
-                bail!("Cannot rename a non-local definition.")
+                bail!("Cannot rename a non-local definition")
             }
         }
 
@@ -104,7 +106,7 @@ impl Definition {
     /// renamed and extern crate names will report its range, though a rename will introduce
     /// an alias instead.
     pub fn range_for_rename(self, sema: &Semantics<'_, RootDatabase>) -> Option<FileRange> {
-        let syn_ctx_is_root = |(range, ctx): (_, SyntaxContextId)| ctx.is_root().then(|| range);
+        let syn_ctx_is_root = |(range, ctx): (_, SyntaxContextId)| ctx.is_root().then_some(range);
         let res = match self {
             Definition::Macro(mac) => {
                 let src = mac.source(sema.db)?;
@@ -198,6 +200,7 @@ impl Definition {
             Definition::SelfType(_) => return None,
             Definition::BuiltinAttr(_) => return None,
             Definition::ToolModule(_) => return None,
+            Definition::TupleField(_) => return None,
             // FIXME: This should be doable in theory
             Definition::DeriveHelper(_) => return None,
         };

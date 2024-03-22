@@ -22,27 +22,27 @@
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![warn(rust_2018_idioms, unused_lifetimes)]
 
-#[allow(unused)]
-macro_rules! eprintln {
-    ($($tt:tt)*) => { stdx::eprintln!($($tt)*) };
-}
+#[cfg(not(feature = "in-rust-tree"))]
+extern crate ra_ap_rustc_lexer as rustc_lexer;
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_lexer;
 
-mod syntax_node;
-mod syntax_error;
 mod parsing;
-mod validation;
 mod ptr;
-mod token_text;
+mod syntax_error;
+mod syntax_node;
 #[cfg(test)]
 mod tests;
+mod token_text;
+mod validation;
 
 pub mod algo;
 pub mod ast;
 #[doc(hidden)]
 pub mod fuzz;
-pub mod utils;
-pub mod ted;
 pub mod hacks;
+pub mod ted;
+pub mod utils;
 
 use std::marker::PhantomData;
 
@@ -65,7 +65,7 @@ pub use rowan::{
     api::Preorder, Direction, GreenNode, NodeOrToken, SyntaxText, TextRange, TextSize,
     TokenAtOffset, WalkEvent,
 };
-pub use smol_str::SmolStr;
+pub use smol_str::{format_smolstr, SmolStr};
 
 /// `Parse` is the result of the parsing: a syntax tree and a collection of
 /// errors.
@@ -97,8 +97,11 @@ impl<T> Parse<T> {
     pub fn syntax_node(&self) -> SyntaxNode {
         SyntaxNode::new_root(self.green.clone())
     }
-    pub fn errors(&self) -> &[SyntaxError] {
-        self.errors.as_deref().unwrap_or_default()
+
+    pub fn errors(&self) -> Vec<SyntaxError> {
+        let mut errors = if let Some(e) = self.errors.as_deref() { e.to_vec() } else { vec![] };
+        validation::validate(&self.syntax_node(), &mut errors);
+        errors
     }
 }
 
@@ -111,10 +114,10 @@ impl<T: AstNode> Parse<T> {
         T::cast(self.syntax_node()).unwrap()
     }
 
-    pub fn ok(self) -> Result<T, Arc<[SyntaxError]>> {
-        match self.errors {
-            Some(e) => Err(e),
-            None => Ok(self.tree()),
+    pub fn ok(self) -> Result<T, Vec<SyntaxError>> {
+        match self.errors() {
+            errors if !errors.is_empty() => Err(errors),
+            _ => Ok(self.tree()),
         }
     }
 }
@@ -132,7 +135,7 @@ impl Parse<SyntaxNode> {
 impl Parse<SourceFile> {
     pub fn debug_dump(&self) -> String {
         let mut buf = format!("{:#?}", self.tree().syntax());
-        for err in self.errors.as_deref().into_iter().flat_map(<[_]>::iter) {
+        for err in self.errors() {
             format_to!(buf, "error {:?}: {}\n", err.range(), err);
         }
         buf
@@ -168,10 +171,9 @@ pub use crate::ast::SourceFile;
 
 impl SourceFile {
     pub fn parse(text: &str) -> Parse<SourceFile> {
-        let (green, mut errors) = parsing::parse_text(text);
+        let _p = tracing::span!(tracing::Level::INFO, "SourceFile::parse").entered();
+        let (green, errors) = parsing::parse_text(text);
         let root = SyntaxNode::new_root(green.clone());
-
-        errors.extend(validation::validate(&root));
 
         assert_eq!(root.kind(), SyntaxKind::SOURCE_FILE);
         Parse {
@@ -427,7 +429,7 @@ fn api_walkthrough() {
             WalkEvent::Enter(node) => {
                 let text = match &node {
                     NodeOrToken::Node(it) => it.text().to_string(),
-                    NodeOrToken::Token(it) => it.text().to_string(),
+                    NodeOrToken::Token(it) => it.text().to_owned(),
                 };
                 format_to!(buf, "{:indent$}{:?} {:?}\n", " ", text, node.kind(), indent = indent);
                 indent += 2;

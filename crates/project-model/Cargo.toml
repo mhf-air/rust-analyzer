@@ -25,11 +25,14 @@ itertools.workspace = true
 
 # local deps
 base-db.workspace = true
+span.workspace = true
 cfg.workspace = true
-paths.workspace = true
-profile.workspace = true
+paths = { workspace = true, features = ["serde1"] }
 stdx.workspace = true
 toolchain.workspace = true
 
 [dev-dependencies]
 expect-test = "1.4.0"
+
+[lints]
+workspace = true

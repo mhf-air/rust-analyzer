@@ -8,9 +8,9 @@ mod context;
 mod item;
 mod render;
 
+mod snippet;
 #[cfg(test)]
 mod tests;
-mod snippet;
 
 use ide_db::{
     base_db::FilePosition,
@@ -64,6 +64,7 @@ pub use crate::{
 // - `expr.ref` -> `&expr`
 // - `expr.refm` -> `&mut expr`
 // - `expr.let` -> `let $0 = expr;`
+// - `expr.lete` -> `let $1 = expr else { $0 };`
 // - `expr.letm` -> `let mut $0 = expr;`
 // - `expr.not` -> `!expr`
 // - `expr.dbg` -> `dbg!(expr)`
@@ -206,7 +207,7 @@ pub fn completions(
             CompletionAnalysis::String { original, expanded: Some(expanded) } => {
                 completions::extern_abi::complete_extern_abi(acc, ctx, expanded);
                 completions::format_string::format_string(acc, ctx, original, expanded);
-                completions::env_vars::complete_cargo_env_vars(acc, ctx, expanded);
+                completions::env_vars::complete_cargo_env_vars(acc, ctx, original, expanded);
             }
             CompletionAnalysis::UnexpandedAttrTT {
                 colon_prefix,
@@ -236,7 +237,7 @@ pub fn resolve_completion_edits(
     FilePosition { file_id, offset }: FilePosition,
     imports: impl IntoIterator<Item = (String, String)>,
 ) -> Option<Vec<TextEdit>> {
-    let _p = profile::span("resolve_completion_edits");
+    let _p = tracing::span!(tracing::Level::INFO, "resolve_completion_edits").entered();
     let sema = hir::Semantics::new(db);
 
     let original_file = sema.parse(file_id);
@@ -256,7 +257,6 @@ pub fn resolve_completion_edits(
             current_crate,
             NameToImport::exact_case_sensitive(imported_name),
             items_locator::AssocSearchMode::Include,
-            Some(items_locator::DEFAULT_QUERY_SEARCH_LIMIT.inner()),
         );
         let import = items_with_name
             .filter_map(|candidate| {

@@ -1,9 +1,10 @@
 //! Defines database & queries for name resolution.
-use base_db::{salsa, CrateId, SourceDatabase, Upcast};
+use base_db::{salsa, CrateId, FileId, SourceDatabase, Upcast};
 use either::Either;
 use hir_expand::{db::ExpandDatabase, HirFileId, MacroDefId};
 use intern::Interned;
 use la_arena::ArenaMap;
+use span::MacroCallId;
 use syntax::{ast, AstPtr};
 use triomphe::Arc;
 
@@ -11,7 +12,7 @@ use crate::{
     attr::{Attrs, AttrsWithOwner},
     body::{scope::ExprScopes, Body, BodySourceMap},
     data::{
-        adt::{EnumData, StructData},
+        adt::{EnumData, EnumVariantData, StructData},
         ConstData, ExternCrateDeclData, FunctionData, ImplData, Macro2Data, MacroRulesData,
         ProcMacroData, StaticData, TraitAliasData, TraitData, TypeAliasData,
     },
@@ -19,15 +20,15 @@ use crate::{
     import_map::ImportMap,
     item_tree::{AttrOwner, ItemTree},
     lang_item::{self, LangItem, LangItemTarget, LangItems},
-    nameres::{diagnostics::DefDiagnostic, DefMap},
+    nameres::{diagnostics::DefDiagnostics, DefMap},
     visibility::{self, Visibility},
     AttrDefId, BlockId, BlockLoc, ConstBlockId, ConstBlockLoc, ConstId, ConstLoc, DefWithBodyId,
-    EnumId, EnumLoc, ExternBlockId, ExternBlockLoc, ExternCrateId, ExternCrateLoc, FunctionId,
-    FunctionLoc, GenericDefId, ImplId, ImplLoc, InTypeConstId, InTypeConstLoc, LocalEnumVariantId,
-    LocalFieldId, Macro2Id, Macro2Loc, MacroId, MacroRulesId, MacroRulesLoc, MacroRulesLocFlags,
-    ProcMacroId, ProcMacroLoc, StaticId, StaticLoc, StructId, StructLoc, TraitAliasId,
-    TraitAliasLoc, TraitId, TraitLoc, TypeAliasId, TypeAliasLoc, UnionId, UnionLoc, UseId, UseLoc,
-    VariantId,
+    EnumId, EnumLoc, EnumVariantId, EnumVariantLoc, ExternBlockId, ExternBlockLoc, ExternCrateId,
+    ExternCrateLoc, FunctionId, FunctionLoc, GenericDefId, ImplId, ImplLoc, InTypeConstId,
+    InTypeConstLoc, LocalFieldId, Macro2Id, Macro2Loc, MacroId, MacroRulesId, MacroRulesLoc,
+    MacroRulesLocFlags, ProcMacroId, ProcMacroLoc, StaticId, StaticLoc, StructId, StructLoc,
+    TraitAliasId, TraitAliasLoc, TraitId, TraitLoc, TypeAliasId, TypeAliasLoc, UnionId, UnionLoc,
+    UseId, UseLoc, VariantId,
 };
 
 #[salsa::query_group(InternDatabaseStorage)]
@@ -45,6 +46,8 @@ pub trait InternDatabase: SourceDatabase {
     fn intern_union(&self, loc: UnionLoc) -> UnionId;
     #[salsa::interned]
     fn intern_enum(&self, loc: EnumLoc) -> EnumId;
+    #[salsa::interned]
+    fn intern_enum_variant(&self, loc: EnumVariantLoc) -> EnumVariantId;
     #[salsa::interned]
     fn intern_const(&self, loc: ConstLoc) -> ConstId;
     #[salsa::interned]
@@ -84,30 +87,12 @@ pub trait DefDatabase: InternDatabase + ExpandDatabase + Upcast<dyn ExpandDataba
     fn file_item_tree(&self, file_id: HirFileId) -> Arc<ItemTree>;
 
     #[salsa::invoke(ItemTree::block_item_tree_query)]
-    fn block_item_tree_query(&self, block_id: BlockId) -> Arc<ItemTree>;
-
-    #[salsa::invoke(crate_def_map_wait)]
-    #[salsa::transparent]
-    fn crate_def_map(&self, krate: CrateId) -> Arc<DefMap>;
+    fn block_item_tree(&self, block_id: BlockId) -> Arc<ItemTree>;
 
     #[salsa::invoke(DefMap::crate_def_map_query)]
-    fn crate_def_map_query(&self, krate: CrateId) -> Arc<DefMap>;
+    fn crate_def_map(&self, krate: CrateId) -> Arc<DefMap>;
 
-    /// Computes the block-level `DefMap`, returning `None` when `block` doesn't contain any inner
-    /// items directly.
-    ///
-    /// For example:
-    ///
-    /// ```
-    /// fn f() { // (0)
-    ///     { // (1)
-    ///         fn inner() {}
-    ///     }
-    /// }
-    /// ```
-    ///
-    /// The `block_def_map` for block 0 would return `None`, while `block_def_map` of block 1 would
-    /// return a `DefMap` containing `inner`.
+    /// Computes the block-level `DefMap`.
     #[salsa::invoke(DefMap::block_def_map_query)]
     fn block_def_map(&self, block: BlockId) -> Arc<DefMap>;
 
@@ -115,36 +100,46 @@ pub trait DefDatabase: InternDatabase + ExpandDatabase + Upcast<dyn ExpandDataba
 
     // region:data
 
+    #[salsa::transparent]
     #[salsa::invoke(StructData::struct_data_query)]
     fn struct_data(&self, id: StructId) -> Arc<StructData>;
 
     #[salsa::invoke(StructData::struct_data_with_diagnostics_query)]
-    fn struct_data_with_diagnostics(&self, id: StructId)
-        -> (Arc<StructData>, Arc<[DefDiagnostic]>);
+    fn struct_data_with_diagnostics(&self, id: StructId) -> (Arc<StructData>, DefDiagnostics);
 
+    #[salsa::transparent]
     #[salsa::invoke(StructData::union_data_query)]
     fn union_data(&self, id: UnionId) -> Arc<StructData>;
 
     #[salsa::invoke(StructData::union_data_with_diagnostics_query)]
-    fn union_data_with_diagnostics(&self, id: UnionId) -> (Arc<StructData>, Arc<[DefDiagnostic]>);
+    fn union_data_with_diagnostics(&self, id: UnionId) -> (Arc<StructData>, DefDiagnostics);
 
     #[salsa::invoke(EnumData::enum_data_query)]
     fn enum_data(&self, e: EnumId) -> Arc<EnumData>;
 
-    #[salsa::invoke(EnumData::enum_data_with_diagnostics_query)]
-    fn enum_data_with_diagnostics(&self, e: EnumId) -> (Arc<EnumData>, Arc<[DefDiagnostic]>);
+    #[salsa::transparent]
+    #[salsa::invoke(EnumVariantData::enum_variant_data_query)]
+    fn enum_variant_data(&self, id: EnumVariantId) -> Arc<EnumVariantData>;
 
+    #[salsa::invoke(EnumVariantData::enum_variant_data_with_diagnostics_query)]
+    fn enum_variant_data_with_diagnostics(
+        &self,
+        id: EnumVariantId,
+    ) -> (Arc<EnumVariantData>, DefDiagnostics);
+
+    #[salsa::transparent]
     #[salsa::invoke(ImplData::impl_data_query)]
     fn impl_data(&self, e: ImplId) -> Arc<ImplData>;
 
     #[salsa::invoke(ImplData::impl_data_with_diagnostics_query)]
-    fn impl_data_with_diagnostics(&self, e: ImplId) -> (Arc<ImplData>, Arc<[DefDiagnostic]>);
+    fn impl_data_with_diagnostics(&self, e: ImplId) -> (Arc<ImplData>, DefDiagnostics);
 
+    #[salsa::transparent]
     #[salsa::invoke(TraitData::trait_data_query)]
     fn trait_data(&self, e: TraitId) -> Arc<TraitData>;
 
     #[salsa::invoke(TraitData::trait_data_with_diagnostics_query)]
-    fn trait_data_with_diagnostics(&self, tr: TraitId) -> (Arc<TraitData>, Arc<[DefDiagnostic]>);
+    fn trait_data_with_diagnostics(&self, tr: TraitId) -> (Arc<TraitData>, DefDiagnostics);
 
     #[salsa::invoke(TraitAliasData::trait_alias_query)]
     fn trait_alias_data(&self, e: TraitAliasId) -> Arc<TraitAliasData>;
@@ -189,33 +184,21 @@ pub trait DefDatabase: InternDatabase + ExpandDatabase + Upcast<dyn ExpandDataba
 
     // region:attrs
 
-    #[salsa::invoke(Attrs::variants_attrs_query)]
-    fn variants_attrs(&self, def: EnumId) -> Arc<ArenaMap<LocalEnumVariantId, Attrs>>;
-
     #[salsa::invoke(Attrs::fields_attrs_query)]
     fn fields_attrs(&self, def: VariantId) -> Arc<ArenaMap<LocalFieldId, Attrs>>;
-
-    #[salsa::invoke(crate::attr::variants_attrs_source_map)]
-    fn variants_attrs_source_map(
-        &self,
-        def: EnumId,
-    ) -> Arc<ArenaMap<LocalEnumVariantId, AstPtr<ast::Variant>>>;
 
     #[salsa::invoke(crate::attr::fields_attrs_source_map)]
     fn fields_attrs_source_map(
         &self,
         def: VariantId,
-    ) -> Arc<ArenaMap<LocalFieldId, Either<AstPtr<ast::TupleField>, AstPtr<ast::RecordField>>>>;
+    ) -> Arc<ArenaMap<LocalFieldId, AstPtr<Either<ast::TupleField, ast::RecordField>>>>;
 
     #[salsa::invoke(AttrsWithOwner::attrs_query)]
     fn attrs(&self, def: AttrDefId) -> Attrs;
 
-    #[salsa::invoke(lang_item::lang_attr_query)]
-    fn lang_attr(&self, def: AttrDefId) -> Option<LangItem>;
-
     #[salsa::transparent]
-    #[salsa::invoke(AttrsWithOwner::attrs_with_owner)]
-    fn attrs_with_owner(&self, def: AttrDefId) -> AttrsWithOwner;
+    #[salsa::invoke(lang_item::lang_attr)]
+    fn lang_attr(&self, def: AttrDefId) -> Option<LangItem>;
 
     // endregion:attrs
 
@@ -240,14 +223,30 @@ pub trait DefDatabase: InternDatabase + ExpandDatabase + Upcast<dyn ExpandDataba
     // endregion:visibilities
 
     #[salsa::invoke(LangItems::crate_lang_items_query)]
-    fn crate_lang_items(&self, krate: CrateId) -> Arc<LangItems>;
+    fn crate_lang_items(&self, krate: CrateId) -> Option<Arc<LangItems>>;
+
+    #[salsa::invoke(crate::lang_item::notable_traits_in_deps)]
+    fn notable_traits_in_deps(&self, krate: CrateId) -> Arc<[Arc<[TraitId]>]>;
+    #[salsa::invoke(crate::lang_item::crate_notable_traits)]
+    fn crate_notable_traits(&self, krate: CrateId) -> Option<Arc<[TraitId]>>;
 
     fn crate_supports_no_std(&self, crate_id: CrateId) -> bool;
+
+    fn include_macro_invoc(&self, crate_id: CrateId) -> Vec<(MacroCallId, FileId)>;
 }
 
-fn crate_def_map_wait(db: &dyn DefDatabase, krate: CrateId) -> Arc<DefMap> {
-    let _p = profile::span("crate_def_map:wait");
-    db.crate_def_map_query(krate)
+// return: macro call id and include file id
+fn include_macro_invoc(db: &dyn DefDatabase, krate: CrateId) -> Vec<(MacroCallId, FileId)> {
+    db.crate_def_map(krate)
+        .modules
+        .values()
+        .flat_map(|m| m.scope.iter_macro_invoc())
+        .filter_map(|invoc| {
+            db.lookup_intern_macro_call(*invoc.1)
+                .include_file_id(db.upcast(), *invoc.1)
+                .map(|x| (*invoc.1, x))
+        })
+        .collect()
 }
 
 fn crate_supports_no_std(db: &dyn DefDatabase, crate_id: CrateId) -> bool {
@@ -268,10 +267,8 @@ fn crate_supports_no_std(db: &dyn DefDatabase, crate_id: CrateId) -> bool {
             None => continue,
         };
 
-        let segments = tt.split(|tt| match tt {
-            tt::TokenTree::Leaf(tt::Leaf::Punct(p)) if p.char == ',' => true,
-            _ => false,
-        });
+        let segments =
+            tt.split(|tt| matches!(tt, tt::TokenTree::Leaf(tt::Leaf::Punct(p)) if p.char == ','));
         for output in segments.skip(1) {
             match output {
                 [tt::TokenTree::Leaf(tt::Leaf::Ident(ident))] if ident.text == "no_std" => {
@@ -312,13 +309,9 @@ fn macro_def(db: &dyn DefDatabase, id: MacroId) -> MacroDefId {
                 kind: kind(loc.expander, loc.id.file_id(), makro.ast_id.upcast()),
                 local_inner: false,
                 allow_internal_unsafe: loc.allow_internal_unsafe,
-                span: db
-                    .span_map(loc.id.file_id())
-                    .span_for_range(db.ast_id_map(loc.id.file_id()).get(makro.ast_id).text_range()),
                 edition: loc.edition,
             }
         }
-
         MacroId::MacroRulesId(it) => {
             let loc: MacroRulesLoc = it.lookup(db);
 
@@ -331,9 +324,6 @@ fn macro_def(db: &dyn DefDatabase, id: MacroId) -> MacroDefId {
                 allow_internal_unsafe: loc
                     .flags
                     .contains(MacroRulesLocFlags::ALLOW_INTERNAL_UNSAFE),
-                span: db
-                    .span_map(loc.id.file_id())
-                    .span_for_range(db.ast_id_map(loc.id.file_id()).get(makro.ast_id).text_range()),
                 edition: loc.edition,
             }
         }
@@ -351,9 +341,6 @@ fn macro_def(db: &dyn DefDatabase, id: MacroId) -> MacroDefId {
                 ),
                 local_inner: false,
                 allow_internal_unsafe: false,
-                span: db
-                    .span_map(loc.id.file_id())
-                    .span_for_range(db.ast_id_map(loc.id.file_id()).get(makro.ast_id).text_range()),
                 edition: loc.edition,
             }
         }

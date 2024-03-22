@@ -1,11 +1,9 @@
 //! Defines messages for cross-process message passing based on `ndjson` wire protocol
 pub(crate) mod flat;
 
-use std::{
-    io::{self, BufRead, Write},
-    path::PathBuf,
-};
+use std::io::{self, BufRead, Write};
 
+use paths::Utf8PathBuf;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::ProcMacroKind;
@@ -27,9 +25,9 @@ pub const CURRENT_API_VERSION: u32 = RUST_ANALYZER_SPAN_SUPPORT;
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     /// Since [`NO_VERSION_CHECK_VERSION`]
-    ListMacros { dylib_path: PathBuf },
+    ListMacros { dylib_path: Utf8PathBuf },
     /// Since [`NO_VERSION_CHECK_VERSION`]
-    ExpandMacro(ExpandMacro),
+    ExpandMacro(Box<ExpandMacro>),
     /// Since [`VERSION_CHECK_VERSION`]
     ApiVersionCheck {},
     /// Since [`RUST_ANALYZER_SPAN_SUPPORT`]
@@ -89,7 +87,7 @@ pub struct ExpandMacro {
     /// Possible attributes for the attribute-like macros.
     pub attributes: Option<FlatTree>,
 
-    pub lib: PathBuf,
+    pub lib: Utf8PathBuf,
 
     /// Environment variables to set during macro expansion.
     pub env: Vec<(String, String)>,
@@ -187,7 +185,67 @@ mod tests {
             file_id: FileId::from_raw(0),
             ast_id: ErasedFileAstId::from_raw(RawIdx::from(0)),
         };
-        let mut subtree = Subtree {
+
+        let token_trees = Box::new([
+            TokenTree::Leaf(
+                Ident {
+                    text: "struct".into(),
+                    span: Span {
+                        range: TextRange::at(TextSize::new(0), TextSize::of("struct")),
+                        anchor,
+                        ctx: SyntaxContextId::ROOT,
+                    },
+                }
+                .into(),
+            ),
+            TokenTree::Leaf(
+                Ident {
+                    text: "Foo".into(),
+                    span: Span {
+                        range: TextRange::at(TextSize::new(5), TextSize::of("Foo")),
+                        anchor,
+                        ctx: SyntaxContextId::ROOT,
+                    },
+                }
+                .into(),
+            ),
+            TokenTree::Leaf(Leaf::Literal(Literal {
+                text: "Foo".into(),
+
+                span: Span {
+                    range: TextRange::at(TextSize::new(8), TextSize::of("Foo")),
+                    anchor,
+                    ctx: SyntaxContextId::ROOT,
+                },
+            })),
+            TokenTree::Leaf(Leaf::Punct(Punct {
+                char: '@',
+                span: Span {
+                    range: TextRange::at(TextSize::new(11), TextSize::of('@')),
+                    anchor,
+                    ctx: SyntaxContextId::ROOT,
+                },
+                spacing: Spacing::Joint,
+            })),
+            TokenTree::Subtree(Subtree {
+                delimiter: Delimiter {
+                    open: Span {
+                        range: TextRange::at(TextSize::new(12), TextSize::of('{')),
+                        anchor,
+                        ctx: SyntaxContextId::ROOT,
+                    },
+                    close: Span {
+                        range: TextRange::at(TextSize::new(13), TextSize::of('}')),
+                        anchor,
+                        ctx: SyntaxContextId::ROOT,
+                    },
+                    kind: DelimiterKind::Brace,
+                },
+                token_trees: Box::new([]),
+            }),
+        ]);
+
+        Subtree {
             delimiter: Delimiter {
                 open: Span {
                     range: TextRange::empty(TextSize::new(0)),
@@ -201,65 +259,8 @@ mod tests {
                 },
                 kind: DelimiterKind::Invisible,
             },
-            token_trees: Vec::new(),
-        };
-        subtree.token_trees.push(TokenTree::Leaf(
-            Ident {
-                text: "struct".into(),
-                span: Span {
-                    range: TextRange::at(TextSize::new(0), TextSize::of("struct")),
-                    anchor,
-                    ctx: SyntaxContextId::ROOT,
-                },
-            }
-            .into(),
-        ));
-        subtree.token_trees.push(TokenTree::Leaf(
-            Ident {
-                text: "Foo".into(),
-                span: Span {
-                    range: TextRange::at(TextSize::new(5), TextSize::of("Foo")),
-                    anchor,
-                    ctx: SyntaxContextId::ROOT,
-                },
-            }
-            .into(),
-        ));
-        subtree.token_trees.push(TokenTree::Leaf(Leaf::Literal(Literal {
-            text: "Foo".into(),
-
-            span: Span {
-                range: TextRange::at(TextSize::new(8), TextSize::of("Foo")),
-                anchor,
-                ctx: SyntaxContextId::ROOT,
-            },
-        })));
-        subtree.token_trees.push(TokenTree::Leaf(Leaf::Punct(Punct {
-            char: '@',
-            span: Span {
-                range: TextRange::at(TextSize::new(11), TextSize::of('@')),
-                anchor,
-                ctx: SyntaxContextId::ROOT,
-            },
-            spacing: Spacing::Joint,
-        })));
-        subtree.token_trees.push(TokenTree::Subtree(Subtree {
-            delimiter: Delimiter {
-                open: Span {
-                    range: TextRange::at(TextSize::new(12), TextSize::of('{')),
-                    anchor,
-                    ctx: SyntaxContextId::ROOT,
-                },
-                close: Span {
-                    range: TextRange::at(TextSize::new(13), TextSize::of('}')),
-                    anchor,
-                    ctx: SyntaxContextId::ROOT,
-                },
-                kind: DelimiterKind::Brace,
-            },
-            token_trees: vec![],
-        }));
-        subtree
+            token_trees,
+        }
     }
 
     #[test]
@@ -270,7 +271,7 @@ mod tests {
             macro_body: FlatTree::new(&tt, CURRENT_API_VERSION, &mut span_data_table),
             macro_name: Default::default(),
             attributes: None,
-            lib: std::env::current_dir().unwrap(),
+            lib: Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap(),
             env: Default::default(),
             current_dir: Default::default(),
             has_global_spans: ExpnGlobals {

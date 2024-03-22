@@ -15,10 +15,10 @@ use syntax::{
     ast::{self, HasLoopBody},
     match_ast, AstNode,
     SyntaxKind::{self, IDENT, INT_NUMBER},
-    SyntaxNode, SyntaxToken, TextRange, T,
+    SyntaxToken, TextRange, T,
 };
 
-use crate::{navigation_target::ToNav, references, NavigationTarget, TryToNav};
+use crate::{navigation_target::ToNav, NavigationTarget, TryToNav};
 
 #[derive(PartialEq, Eq, Hash)]
 pub struct HighlightedRange {
@@ -55,7 +55,7 @@ pub(crate) fn highlight_related(
     config: HighlightRelatedConfig,
     pos @ FilePosition { offset, file_id }: FilePosition,
 ) -> Option<Vec<HighlightedRange>> {
-    let _p = profile::span("highlight_related");
+    let _p = tracing::span!(tracing::Level::INFO, "highlight_related").entered();
     let syntax = sema.parse(file_id).syntax().clone();
 
     let token = pick_best_token(syntax.token_at_offset(offset), |kind| match kind {
@@ -81,7 +81,7 @@ pub(crate) fn highlight_related(
         }
         T![|] if config.closure_captures => highlight_closure_captures(sema, token, file_id),
         T![move] if config.closure_captures => highlight_closure_captures(sema, token, file_id),
-        _ if config.references => highlight_references(sema, &syntax, token, pos),
+        _ if config.references => highlight_references(sema, token, pos),
         _ => None,
     }
 }
@@ -129,7 +129,6 @@ fn highlight_closure_captures(
 
 fn highlight_references(
     sema: &Semantics<'_, RootDatabase>,
-    node: &SyntaxNode,
     token: SyntaxToken,
     FilePosition { file_id, offset }: FilePosition,
 ) -> Option<Vec<HighlightedRange>> {
@@ -167,7 +166,7 @@ fn highlight_references(
                     match parent {
                         ast::UseTree(it) => it.syntax().ancestors().find(|it| {
                             ast::SourceFile::can_cast(it.kind()) || ast::Module::can_cast(it.kind())
-                        }),
+                        }).zip(Some(true)),
                         ast::PathType(it) => it
                             .syntax()
                             .ancestors()
@@ -179,14 +178,14 @@ fn highlight_references(
                             .ancestors()
                             .find(|it| {
                                 ast::Item::can_cast(it.kind())
-                            }),
+                            }).zip(Some(false)),
                         _ => None,
                     }
                 }
             })();
-            if let Some(trait_item_use_scope) = trait_item_use_scope {
+            if let Some((trait_item_use_scope, use_tree)) = trait_item_use_scope {
                 res.extend(
-                    t.items_with_supertraits(sema.db)
+                    if use_tree { t.items(sema.db) } else { t.items_with_supertraits(sema.db) }
                         .into_iter()
                         .filter_map(|item| {
                             Definition::from(item)
@@ -239,7 +238,7 @@ fn highlight_references(
                         continue;
                     }
                     let hl_range = nav.focus_range.map(|range| {
-                        let category = references::decl_mutability(&def, node, range)
+                        let category = matches!(def, Definition::Local(l) if l.is_mut(sema.db))
                             .then_some(ReferenceCategory::Write);
                         HighlightedRange { range, category }
                     });
@@ -476,8 +475,7 @@ fn find_defs(sema: &Semantics<'_, RootDatabase>, token: SyntaxToken) -> FxHashSe
     sema.descend_into_macros(DescendPreference::None, token)
         .into_iter()
         .filter_map(|token| IdentClass::classify_token(sema, &token))
-        .map(IdentClass::definitions_no_ops)
-        .flatten()
+        .flat_map(IdentClass::definitions_no_ops)
         .collect()
 }
 
@@ -521,8 +519,9 @@ mod tests {
                             ReferenceCategory::Read => "read",
                             ReferenceCategory::Write => "write",
                             ReferenceCategory::Import => "import",
+                            ReferenceCategory::Test => "test",
                         }
-                        .to_string()
+                        .to_owned()
                     }),
                 )
             })
@@ -1599,7 +1598,10 @@ fn f() {
     fn test_trait_highlights_assoc_item_uses() {
         check(
             r#"
-trait Foo {
+trait Super {
+    type SuperT;
+}
+trait Foo: Super {
     //^^^
     type T;
     const C: usize;
@@ -1615,6 +1617,8 @@ impl Foo for i32 {
 }
 fn f<T: Foo$0>(t: T) {
       //^^^
+    let _: T::SuperT;
+            //^^^^^^
     let _: T::T;
             //^
     t.m();
@@ -1631,6 +1635,49 @@ fn f2<T: Foo>(t: T) {
     t.m();
     T::C;
     T::f();
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_trait_highlights_assoc_item_uses_use_tree() {
+        check(
+            r#"
+use Foo$0;
+ // ^^^ import
+trait Super {
+    type SuperT;
+}
+trait Foo: Super {
+    //^^^
+    type T;
+    const C: usize;
+    fn f() {}
+    fn m(&self) {}
+}
+impl Foo for i32 {
+   //^^^
+    type T = i32;
+      // ^
+    const C: usize = 0;
+       // ^
+    fn f() {}
+    // ^
+    fn m(&self) {}
+    // ^
+}
+fn f<T: Foo>(t: T) {
+      //^^^
+    let _: T::SuperT;
+    let _: T::T;
+            //^
+    t.m();
+    //^
+    T::C;
+     //^
+    T::f();
+     //^
 }
 "#,
         );

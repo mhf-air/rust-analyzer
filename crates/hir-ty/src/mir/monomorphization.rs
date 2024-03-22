@@ -19,7 +19,7 @@ use triomphe::Arc;
 
 use crate::{
     consteval::{intern_const_scalar, unknown_const},
-    db::HirDatabase,
+    db::{HirDatabase, InternedClosure},
     from_placeholder_idx,
     infer::normalize,
     utils::{generics, Generics},
@@ -81,6 +81,9 @@ impl FallibleTypeFolder<Interner> for Filler<'_> {
                             generics: Some(generics(self.db.upcast(), func.into())),
                         };
                         filler.try_fold_ty(infer.type_of_rpit[idx].clone(), outer_binder)
+                    }
+                    crate::ImplTraitId::AssociatedTypeImplTrait(..) => {
+                        not_supported!("associated type impl trait");
                     }
                     crate::ImplTraitId::AsyncBlockTypeImplTrait(_, _) => {
                         not_supported!("async block impl trait");
@@ -275,7 +278,7 @@ impl Filler<'_> {
                     | TerminatorKind::DropAndReplace { .. }
                     | TerminatorKind::Assert { .. }
                     | TerminatorKind::Yield { .. }
-                    | TerminatorKind::GeneratorDrop
+                    | TerminatorKind::CoroutineDrop
                     | TerminatorKind::FalseEdge { .. }
                     | TerminatorKind::FalseUnwind { .. } => (),
                 }
@@ -306,7 +309,7 @@ pub fn monomorphized_mir_body_recover(
     _: &Substitution,
     _: &Arc<crate::TraitEnvironment>,
 ) -> Result<Arc<MirBody>, MirLowerError> {
-    return Err(MirLowerError::Loop);
+    Err(MirLowerError::Loop)
 }
 
 pub fn monomorphized_mir_body_for_closure_query(
@@ -315,7 +318,7 @@ pub fn monomorphized_mir_body_for_closure_query(
     subst: Substitution,
     trait_env: Arc<crate::TraitEnvironment>,
 ) -> Result<Arc<MirBody>, MirLowerError> {
-    let (owner, _) = db.lookup_intern_closure(closure.into());
+    let InternedClosure(owner, _) = db.lookup_intern_closure(closure.into());
     let generics = owner.as_generic_def_id().map(|g_def| generics(db.upcast(), g_def));
     let filler = &mut Filler { db, subst: &subst, trait_env, generics, owner };
     let body = db.mir_body_for_closure(closure)?;

@@ -11,26 +11,33 @@
 //!   rustc rather than `unstable`. (Although in general ABI compatibility is still an issue)…
 
 #![cfg(any(feature = "sysroot-abi", rust_analyzer))]
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![feature(proc_macro_internals, proc_macro_diagnostic, proc_macro_span)]
 #![warn(rust_2018_idioms, unused_lifetimes)]
 #![allow(unreachable_pub, internal_features)]
 
 extern crate proc_macro;
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
+
+#[cfg(not(feature = "in-rust-tree"))]
+extern crate ra_ap_rustc_lexer as rustc_lexer;
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_lexer;
 
 mod dylib;
-mod server;
 mod proc_macros;
+mod server;
 
 use std::{
     collections::{hash_map::Entry, HashMap},
     env,
     ffi::OsString,
-    fs,
-    path::{Path, PathBuf},
-    thread,
+    fs, thread,
     time::SystemTime,
 };
 
+use paths::{Utf8Path, Utf8PathBuf};
 use proc_macro_api::{
     msg::{
         self, deserialize_span_data_index_map, serialize_span_data_index_map, ExpnGlobals,
@@ -45,7 +52,7 @@ use crate::server::TokenStream;
 // see `build.rs`
 include!(concat!(env!("OUT_DIR"), "/rustc_version.rs"));
 
-trait ProcMacroSrvSpan: tt::Span {
+trait ProcMacroSrvSpan: Copy {
     type Server: proc_macro::bridge::server::Server<TokenStream = TokenStream<Self>>;
     fn make_server(call_site: Self, def_site: Self, mixed_site: Self) -> Self::Server;
 }
@@ -73,7 +80,7 @@ impl ProcMacroSrvSpan for Span {
 
 #[derive(Default)]
 pub struct ProcMacroSrv {
-    expanders: HashMap<(PathBuf, SystemTime), dylib::Expander>,
+    expanders: HashMap<(Utf8PathBuf, SystemTime), dylib::Expander>,
     span_mode: SpanMode,
 }
 
@@ -141,23 +148,22 @@ impl ProcMacroSrv {
 
     pub fn list_macros(
         &mut self,
-        dylib_path: &Path,
+        dylib_path: &Utf8Path,
     ) -> Result<Vec<(String, ProcMacroKind)>, String> {
         let expander = self.expander(dylib_path)?;
         Ok(expander.list_macros())
     }
 
-    fn expander(&mut self, path: &Path) -> Result<&dylib::Expander, String> {
+    fn expander(&mut self, path: &Utf8Path) -> Result<&dylib::Expander, String> {
         let time = fs::metadata(path)
             .and_then(|it| it.modified())
-            .map_err(|err| format!("Failed to get file metadata for {}: {err}", path.display()))?;
+            .map_err(|err| format!("Failed to get file metadata for {path}: {err}",))?;
 
         Ok(match self.expanders.entry((path.to_path_buf(), time)) {
-            Entry::Vacant(v) => {
-                v.insert(dylib::Expander::new(path).map_err(|err| {
-                    format!("Cannot create expander for {}: {err}", path.display())
-                })?)
-            }
+            Entry::Vacant(v) => v.insert(
+                dylib::Expander::new(path)
+                    .map_err(|err| format!("Cannot create expander for {path}: {err}",))?,
+            ),
             Entry::Occupied(e) => e.into_mut(),
         })
     }
@@ -298,6 +304,6 @@ impl Drop for EnvSnapshot {
 mod tests;
 
 #[cfg(test)]
-pub fn proc_macro_test_dylib_path() -> std::path::PathBuf {
+pub fn proc_macro_test_dylib_path() -> paths::Utf8PathBuf {
     proc_macro_test::PROC_MACRO_TEST_LOCATION.into()
 }

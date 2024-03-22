@@ -1,17 +1,71 @@
 //! File and span related types.
-// FIXME: This should be moved into its own crate to get rid of the dependency inversion, base-db
-// has business depending on tt, tt should depend on a span crate only (which unforunately will have
-// to depend on salsa)
-use std::fmt;
+use std::fmt::{self, Write};
 
 use salsa::InternId;
 
+mod ast_id;
+mod hygiene;
 mod map;
 
-pub use crate::map::{RealSpanMap, SpanMap};
+pub use self::{
+    ast_id::{AstIdMap, AstIdNode, ErasedFileAstId, FileAstId},
+    hygiene::{SyntaxContextData, SyntaxContextId, Transparency},
+    map::{RealSpanMap, SpanMap},
+};
+
 pub use syntax::{TextRange, TextSize};
 pub use vfs::FileId;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Edition {
+    Edition2015,
+    Edition2018,
+    Edition2021,
+    Edition2024,
+}
+
+impl Edition {
+    pub const CURRENT: Edition = Edition::Edition2021;
+    pub const DEFAULT: Edition = Edition::Edition2015;
+}
+
+#[derive(Debug)]
+pub struct ParseEditionError {
+    invalid_input: String,
+}
+
+impl std::error::Error for ParseEditionError {}
+impl fmt::Display for ParseEditionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid edition: {:?}", self.invalid_input)
+    }
+}
+
+impl std::str::FromStr for Edition {
+    type Err = ParseEditionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let res = match s {
+            "2015" => Edition::Edition2015,
+            "2018" => Edition::Edition2018,
+            "2021" => Edition::Edition2021,
+            "2024" => Edition::Edition2024,
+            _ => return Err(ParseEditionError { invalid_input: s.to_owned() }),
+        };
+        Ok(res)
+    }
+}
+
+impl fmt::Display for Edition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Edition::Edition2015 => "2015",
+            Edition::Edition2018 => "2018",
+            Edition::Edition2021 => "2021",
+            Edition::Edition2024 => "2024",
+        })
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FilePosition {
     pub file_id: FileId,
@@ -24,9 +78,10 @@ pub struct FileRange {
     pub range: TextRange,
 }
 
-pub type ErasedFileAstId = la_arena::Idx<syntax::SyntaxNodePtr>;
-
-// The first inde is always the root node's AstId
+// The first index is always the root node's AstId
+/// The root ast id always points to the encompassing file, using this in spans is discouraged as
+/// any range relative to it will be effectively absolute, ruining the entire point of anchored
+/// relative text ranges.
 pub const ROOT_ERASED_FILE_AST_ID: ErasedFileAstId =
     la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(0));
 
@@ -37,80 +92,67 @@ pub const FIXUP_ERASED_FILE_AST_ID_MARKER: ErasedFileAstId =
     // is required to be stable for the proc-macro-server
     la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(!0 - 1));
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub type Span = SpanData<SyntaxContextId>;
+
+/// Spans represent a region of code, used by the IDE to be able link macro inputs and outputs
+/// together. Positions in spans are relative to some [`SpanAnchor`] to make them more incremental
+/// friendly.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SpanData<Ctx> {
     /// The text range of this span, relative to the anchor.
     /// We need the anchor for incrementality, as storing absolute ranges will require
     /// recomputation on every change in a file at all times.
     pub range: TextRange,
+    /// The anchor this span is relative to.
     pub anchor: SpanAnchor,
     /// The syntax context of the span.
     pub ctx: Ctx,
 }
+
+impl<Ctx: fmt::Debug> fmt::Debug for SpanData<Ctx> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if f.alternate() {
+            fmt::Debug::fmt(&self.anchor.file_id.index(), f)?;
+            f.write_char(':')?;
+            fmt::Debug::fmt(&self.anchor.ast_id.into_raw(), f)?;
+            f.write_char('@')?;
+            fmt::Debug::fmt(&self.range, f)?;
+            f.write_char('#')?;
+            self.ctx.fmt(f)
+        } else {
+            f.debug_struct("SpanData")
+                .field("range", &self.range)
+                .field("anchor", &self.anchor)
+                .field("ctx", &self.ctx)
+                .finish()
+        }
+    }
+}
+
+impl<Ctx: Copy> SpanData<Ctx> {
+    pub fn eq_ignoring_ctx(self, other: Self) -> bool {
+        self.anchor == other.anchor && self.range == other.range
+    }
+}
+
 impl Span {
     #[deprecated = "dummy spans will panic if surfaced incorrectly, as such they should be replaced appropriately"]
-    pub const DUMMY: Self = SpanData {
+    pub const DUMMY: Self = Self {
         range: TextRange::empty(TextSize::new(0)),
         anchor: SpanAnchor { file_id: FileId::BOGUS, ast_id: ROOT_ERASED_FILE_AST_ID },
         ctx: SyntaxContextId::ROOT,
     };
 }
 
-pub type Span = SpanData<SyntaxContextId>;
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SyntaxContextId(InternId);
-
-impl fmt::Debug for SyntaxContextId {
+impl fmt::Display for Span {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if *self == Self::SELF_REF {
-            f.debug_tuple("SyntaxContextId")
-                .field(&{
-                    #[derive(Debug)]
-                    #[allow(non_camel_case_types)]
-                    struct SELF_REF;
-                    SELF_REF
-                })
-                .finish()
-        } else {
-            f.debug_tuple("SyntaxContextId").field(&self.0).finish()
-        }
-    }
-}
-
-impl salsa::InternKey for SyntaxContextId {
-    fn from_intern_id(v: salsa::InternId) -> Self {
-        SyntaxContextId(v)
-    }
-    fn as_intern_id(&self) -> salsa::InternId {
-        self.0
-    }
-}
-
-impl fmt::Display for SyntaxContextId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0.as_u32())
-    }
-}
-
-// inherent trait impls please tyvm
-impl SyntaxContextId {
-    pub const ROOT: Self = SyntaxContextId(unsafe { InternId::new_unchecked(0) });
-    // veykril(HACK): FIXME salsa doesn't allow us fetching the id of the current input to be allocated so
-    // we need a special value that behaves as the current context.
-    pub const SELF_REF: Self =
-        SyntaxContextId(unsafe { InternId::new_unchecked(InternId::MAX - 1) });
-
-    pub fn is_root(self) -> bool {
-        self == Self::ROOT
-    }
-
-    pub fn into_u32(self) -> u32 {
-        self.0.as_u32()
-    }
-
-    pub fn from_u32(u32: u32) -> Self {
-        Self(InternId::from(u32))
+        fmt::Debug::fmt(&self.anchor.file_id.index(), f)?;
+        f.write_char(':')?;
+        fmt::Debug::fmt(&self.anchor.ast_id.into_raw(), f)?;
+        f.write_char('@')?;
+        fmt::Debug::fmt(&self.range, f)?;
+        f.write_char('#')?;
+        self.ctx.fmt(f)
     }
 }
 
@@ -212,6 +254,7 @@ impl fmt::Debug for HirFileIdRepr {
 }
 
 impl From<FileId> for HirFileId {
+    #[allow(clippy::let_unit_value)]
     fn from(id: FileId) -> Self {
         _ = Self::ASSERT_MAX_FILE_ID_IS_SAME;
         assert!(id.index() <= Self::MAX_HIR_FILE_ID, "FileId index {} is too large", id.index());
@@ -220,6 +263,7 @@ impl From<FileId> for HirFileId {
 }
 
 impl From<MacroFileId> for HirFileId {
+    #[allow(clippy::let_unit_value)]
     fn from(MacroFileId { macro_call_id: MacroCallId(id) }: MacroFileId) -> Self {
         _ = Self::ASSERT_MAX_FILE_ID_IS_SAME;
         let id = id.as_u32();

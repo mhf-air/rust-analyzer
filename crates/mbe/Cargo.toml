@@ -26,3 +26,9 @@ span.workspace = true
 
 [dev-dependencies]
 test-utils.workspace = true
+
+[features]
+in-rust-tree = ["parser/in-rust-tree", "syntax/in-rust-tree"]
+
+[lints]
+workspace = true

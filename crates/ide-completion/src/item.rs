@@ -10,7 +10,7 @@ use ide_db::{
 use itertools::Itertools;
 use smallvec::SmallVec;
 use stdx::{impl_from, never};
-use syntax::{SmolStr, TextRange, TextSize};
+use syntax::{format_smolstr, SmolStr, TextRange, TextSize};
 use text_edit::TextEdit;
 
 use crate::{
@@ -152,6 +152,8 @@ pub struct CompletionRelevance {
     pub is_local: bool,
     /// This is set when trait items are completed in an impl of that trait.
     pub is_item_from_trait: bool,
+    /// This is set for when trait items are from traits with `#[doc(notable_trait)]`
+    pub is_item_from_notable_trait: bool,
     /// This is set when an import is suggested whose name is already imported.
     pub is_name_already_imported: bool,
     /// This is set for completions that will insert a `use` item.
@@ -164,6 +166,8 @@ pub struct CompletionRelevance {
     pub postfix_match: Option<CompletionRelevancePostfixMatch>,
     /// This is set for type inference results
     pub is_definite: bool,
+    /// This is set for items that are function (associated or method)
+    pub function: Option<CompletionRelevanceFn>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -205,6 +209,24 @@ pub enum CompletionRelevancePostfixMatch {
     Exact,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CompletionRelevanceFn {
+    pub has_params: bool,
+    pub has_self_param: bool,
+    pub return_type: CompletionRelevanceReturnType,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CompletionRelevanceReturnType {
+    Other,
+    /// Returns the Self type of the impl/trait
+    DirectConstructor,
+    /// Returns something that indirectly constructs the `Self` type of the impl/trait e.g. `Result<Self, ()>`, `Option<Self>`
+    Constructor,
+    /// Returns a possible builder for the type
+    Builder,
+}
+
 impl CompletionRelevance {
     /// Provides a relevance score. Higher values are more relevant.
     ///
@@ -228,6 +250,8 @@ impl CompletionRelevance {
             is_private_editable,
             postfix_match,
             is_definite,
+            is_item_from_notable_trait,
+            function,
         } = self;
 
         // lower rank private things
@@ -266,9 +290,39 @@ impl CompletionRelevance {
         if is_item_from_trait {
             score += 1;
         }
+        if is_item_from_notable_trait {
+            score += 1;
+        }
         if is_definite {
             score += 10;
         }
+
+        score += function
+            .map(|asf| {
+                let mut fn_score = match asf.return_type {
+                    CompletionRelevanceReturnType::DirectConstructor => 15,
+                    CompletionRelevanceReturnType::Builder => 10,
+                    CompletionRelevanceReturnType::Constructor => 5,
+                    CompletionRelevanceReturnType::Other => 0,
+                };
+
+                // When a fn is bumped due to return type:
+                // Bump Constructor or Builder methods with no arguments,
+                // over them than with self arguments
+                if fn_score > 0 {
+                    if !asf.has_params {
+                        // bump associated functions
+                        fn_score += 1;
+                    } else if asf.has_self_param {
+                        // downgrade methods (below Constructor)
+                        fn_score = 1;
+                    }
+                }
+
+                fn_score
+            })
+            .unwrap_or_default();
+
         score
     }
 
@@ -288,9 +342,9 @@ pub enum CompletionItemKind {
     BuiltinType,
     InferredType,
     Keyword,
-    Method,
     Snippet,
     UnresolvedReference,
+    Expression,
 }
 
 impl_from!(SymbolKind for CompletionItemKind);
@@ -314,6 +368,8 @@ impl CompletionItemKind {
                 SymbolKind::LifetimeParam => "lt",
                 SymbolKind::Local => "lc",
                 SymbolKind::Macro => "ma",
+                SymbolKind::Method => "me",
+                SymbolKind::ProcMacro => "pm",
                 SymbolKind::Module => "md",
                 SymbolKind::SelfParam => "sp",
                 SymbolKind::SelfType => "sy",
@@ -332,9 +388,9 @@ impl CompletionItemKind {
             CompletionItemKind::BuiltinType => "bt",
             CompletionItemKind::InferredType => "it",
             CompletionItemKind::Keyword => "kw",
-            CompletionItemKind::Method => "me",
             CompletionItemKind::Snippet => "sn",
             CompletionItemKind::UnresolvedReference => "??",
+            CompletionItemKind::Expression => "ex",
         }
     }
 }
@@ -427,7 +483,7 @@ impl Builder {
     }
 
     pub(crate) fn build(self, db: &RootDatabase) -> CompletionItem {
-        let _p = profile::span("item::Builder::build");
+        let _p = tracing::span!(tracing::Level::INFO, "item::Builder::build").entered();
 
         let label = self.label;
         let mut label_detail = None;
@@ -436,7 +492,7 @@ impl Builder {
 
         if !self.doc_aliases.is_empty() {
             let doc_aliases = self.doc_aliases.iter().join(", ");
-            label_detail.replace(SmolStr::from(format!(" (alias {doc_aliases})")));
+            label_detail.replace(format_smolstr!(" (alias {doc_aliases})"));
             let lookup_doc_aliases = self
                 .doc_aliases
                 .iter()
@@ -453,21 +509,21 @@ impl Builder {
                 // after typing a comma or space.
                 .join("");
             if !lookup_doc_aliases.is_empty() {
-                lookup = SmolStr::from(format!("{lookup}{lookup_doc_aliases}"));
+                lookup = format_smolstr!("{lookup}{lookup_doc_aliases}");
             }
         }
         if let [import_edit] = &*self.imports_to_add {
             // snippets can have multiple imports, but normal completions only have up to one
-            label_detail.replace(SmolStr::from(format!(
+            label_detail.replace(format_smolstr!(
                 "{} (use {})",
                 label_detail.as_deref().unwrap_or_default(),
                 import_edit.import_path.display(db)
-            )));
+            ));
         } else if let Some(trait_name) = self.trait_name {
-            label_detail.replace(SmolStr::from(format!(
+            label_detail.replace(format_smolstr!(
                 "{} (as {trait_name})",
                 label_detail.as_deref().unwrap_or_default(),
-            )));
+            ));
         }
 
         let text_edit = match self.text_edit {
@@ -547,7 +603,7 @@ impl Builder {
         self.detail = detail.map(Into::into);
         if let Some(detail) = &self.detail {
             if never!(detail.contains('\n'), "multiline detail:\n{}", detail) {
-                self.detail = Some(detail.splitn(2, '\n').next().unwrap().to_string());
+                self.detail = Some(detail.split('\n').next().unwrap().to_owned());
             }
         }
         self

@@ -2,21 +2,21 @@
 
 #![warn(rust_2018_idioms, unused_lifetimes)]
 
-mod input;
 mod change;
+mod input;
 
 use std::panic;
 
-use rustc_hash::FxHashSet;
+use salsa::Durability;
 use syntax::{ast, Parse, SourceFile};
 use triomphe::Arc;
 
 pub use crate::{
     change::FileChange,
     input::{
-        CrateData, CrateDisplayName, CrateGraph, CrateId, CrateName, CrateOrigin, Dependency,
-        DependencyKind, Edition, Env, LangCrateOrigin, ProcMacroPaths, ReleaseChannel, SourceRoot,
-        SourceRootId, TargetLayoutLoadResult,
+        CrateData, CrateDisplayName, CrateGraph, CrateId, CrateName, CrateOrigin, Dependency, Env,
+        LangCrateOrigin, ProcMacroPaths, ReleaseChannel, SourceRoot, SourceRootId,
+        TargetLayoutLoadResult,
     },
 };
 pub use salsa::{self, Cancelled};
@@ -43,13 +43,15 @@ pub trait Upcast<T: ?Sized> {
     fn upcast(&self) -> &T;
 }
 
+pub const DEFAULT_FILE_TEXT_LRU_CAP: usize = 16;
 pub const DEFAULT_PARSE_LRU_CAP: usize = 128;
+pub const DEFAULT_BORROWCK_LRU_CAP: usize = 1024;
 
 pub trait FileLoader {
     /// Text of the file.
     fn file_text(&self, file_id: FileId) -> Arc<str>;
     fn resolve_path(&self, path: AnchoredPath<'_>) -> Option<FileId>;
-    fn relevant_crates(&self, file_id: FileId) -> Arc<FxHashSet<CrateId>>;
+    fn relevant_crates(&self, file_id: FileId) -> Arc<[CrateId]>;
 }
 
 /// Database which stores all significant input facts: source code and project
@@ -62,10 +64,24 @@ pub trait SourceDatabase: FileLoader + std::fmt::Debug {
     /// The crate graph.
     #[salsa::input]
     fn crate_graph(&self) -> Arc<CrateGraph>;
+
+    // FIXME: Consider removing this, making HirDatabase::target_data_layout an input query
+    #[salsa::input]
+    fn data_layout(&self, krate: CrateId) -> TargetLayoutLoadResult;
+
+    #[salsa::input]
+    fn toolchain(&self, krate: CrateId) -> Option<Version>;
+
+    #[salsa::transparent]
+    fn toolchain_channel(&self, krate: CrateId) -> Option<ReleaseChannel>;
+}
+
+fn toolchain_channel(db: &dyn SourceDatabase, krate: CrateId) -> Option<ReleaseChannel> {
+    db.toolchain(krate).as_ref().and_then(|v| ReleaseChannel::from_str(&v.pre))
 }
 
 fn parse(db: &dyn SourceDatabase, file_id: FileId) -> Parse<ast::SourceFile> {
-    let _p = profile::span("parse_query").detail(|| format!("{file_id:?}"));
+    let _p = tracing::span!(tracing::Level::INFO, "parse_query", ?file_id).entered();
     let text = db.file_text(file_id);
     SourceFile::parse(&text)
 }
@@ -75,7 +91,10 @@ fn parse(db: &dyn SourceDatabase, file_id: FileId) -> Parse<ast::SourceFile> {
 #[salsa::query_group(SourceDatabaseExtStorage)]
 pub trait SourceDatabaseExt: SourceDatabase {
     #[salsa::input]
+    fn compressed_file_text(&self, file_id: FileId) -> Arc<[u8]>;
+
     fn file_text(&self, file_id: FileId) -> Arc<str>;
+
     /// Path to a file, relative to the root of its source root.
     /// Source root of the file.
     #[salsa::input]
@@ -84,19 +103,59 @@ pub trait SourceDatabaseExt: SourceDatabase {
     #[salsa::input]
     fn source_root(&self, id: SourceRootId) -> Arc<SourceRoot>;
 
-    fn source_root_crates(&self, id: SourceRootId) -> Arc<FxHashSet<CrateId>>;
+    fn source_root_crates(&self, id: SourceRootId) -> Arc<[CrateId]>;
 }
 
-fn source_root_crates(db: &dyn SourceDatabaseExt, id: SourceRootId) -> Arc<FxHashSet<CrateId>> {
+fn file_text(db: &dyn SourceDatabaseExt, file_id: FileId) -> Arc<str> {
+    let bytes = db.compressed_file_text(file_id);
+    let bytes =
+        lz4_flex::decompress_size_prepended(&bytes).expect("lz4 decompression should not fail");
+    let text = std::str::from_utf8(&bytes).expect("file contents should be valid UTF-8");
+    Arc::from(text)
+}
+
+pub trait SourceDatabaseExt2 {
+    fn set_file_text(&mut self, file_id: FileId, text: &str) {
+        self.set_file_text_with_durability(file_id, text, Durability::LOW);
+    }
+
+    fn set_file_text_with_durability(
+        &mut self,
+        file_id: FileId,
+        text: &str,
+        durability: Durability,
+    );
+}
+
+impl<Db: ?Sized + SourceDatabaseExt> SourceDatabaseExt2 for Db {
+    fn set_file_text_with_durability(
+        &mut self,
+        file_id: FileId,
+        text: &str,
+        durability: Durability,
+    ) {
+        let bytes = text.as_bytes();
+        let compressed = lz4_flex::compress_prepend_size(bytes);
+        self.set_compressed_file_text_with_durability(
+            file_id,
+            Arc::from(compressed.as_slice()),
+            durability,
+        )
+    }
+}
+
+fn source_root_crates(db: &dyn SourceDatabaseExt, id: SourceRootId) -> Arc<[CrateId]> {
     let graph = db.crate_graph();
-    let res = graph
+    let mut crates = graph
         .iter()
         .filter(|&krate| {
             let root_file = graph[krate].root_file_id;
             db.file_source_root(root_file) == id
         })
-        .collect();
-    Arc::new(res)
+        .collect::<Vec<_>>();
+    crates.sort();
+    crates.dedup();
+    crates.into_iter().collect()
 }
 
 /// Silly workaround for cyclic deps between the traits
@@ -113,8 +172,8 @@ impl<T: SourceDatabaseExt> FileLoader for FileLoaderDelegate<&'_ T> {
         source_root.resolve_path(path)
     }
 
-    fn relevant_crates(&self, file_id: FileId) -> Arc<FxHashSet<CrateId>> {
-        let _p = profile::span("relevant_crates");
+    fn relevant_crates(&self, file_id: FileId) -> Arc<[CrateId]> {
+        let _p = tracing::span!(tracing::Level::INFO, "relevant_crates").entered();
         let source_root = self.0.file_source_root(file_id);
         self.0.source_root_crates(source_root)
     }

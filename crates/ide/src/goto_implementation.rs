@@ -60,13 +60,13 @@ pub(crate) fn goto_implementation(
                     Definition::Function(f) => {
                         let assoc = f.as_assoc_item(sema.db)?;
                         let name = assoc.name(sema.db)?;
-                        let trait_ = assoc.containing_trait_or_trait_impl(sema.db)?;
+                        let trait_ = assoc.container_or_implemented_trait(sema.db)?;
                         impls_for_trait_item(&sema, trait_, name)
                     }
                     Definition::Const(c) => {
                         let assoc = c.as_assoc_item(sema.db)?;
                         let name = assoc.name(sema.db)?;
-                        let trait_ = assoc.containing_trait_or_trait_impl(sema.db)?;
+                        let trait_ = assoc.container_or_implemented_trait(sema.db)?;
                         impls_for_trait_item(&sema, trait_, name)
                     }
                     _ => return None,
@@ -336,6 +336,77 @@ struct S;
 impl Tr for S {
     const C: usize = 4;
         //^
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn goto_adt_implementation_inside_block() {
+        check(
+            r#"
+//- minicore: copy, derive
+trait Bar {}
+
+fn test() {
+    #[derive(Copy)]
+  //^^^^^^^^^^^^^^^
+    struct Foo$0;
+
+    impl Foo {}
+       //^^^
+
+    trait Baz {}
+
+    impl Bar for Foo {}
+               //^^^
+
+    impl Baz for Foo {}
+               //^^^
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn goto_trait_implementation_inside_block() {
+        check(
+            r#"
+struct Bar;
+
+fn test() {
+    trait Foo$0 {}
+
+    struct Baz;
+
+    impl Foo for Bar {}
+               //^^^
+
+    impl Foo for Baz {}
+               //^^^
+}
+"#,
+        );
+        check(
+            r#"
+struct Bar;
+
+fn test() {
+    trait Foo {
+        fn foo$0() {}
+    }
+
+    struct Baz;
+
+    impl Foo for Bar {
+        fn foo() {}
+         //^^^
+    }
+
+    impl Foo for Baz {
+        fn foo() {}
+         //^^^
+    }
 }
 "#,
         );

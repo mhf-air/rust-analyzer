@@ -13,17 +13,13 @@
 
 pub mod cli;
 
-#[allow(unused)]
-macro_rules! eprintln {
-    ($($tt:tt)*) => { stdx::eprintln!($($tt)*) };
-}
-
 mod caps;
 mod cargo_target_spec;
 mod diagnostics;
 mod diff;
 mod dispatch;
 mod global_state;
+mod hack_recover_crate_name;
 mod line_index;
 mod main_loop;
 mod mem_docs;
@@ -38,6 +34,12 @@ mod handlers {
     pub(crate) mod request;
 }
 
+pub mod tracing {
+    pub mod config;
+    pub use config::Config;
+    pub mod hprof;
+}
+
 pub mod config;
 pub mod lsp;
 use self::lsp::ext as lsp_ext;
@@ -47,7 +49,9 @@ mod integrated_benchmarks;
 
 use serde::de::DeserializeOwned;
 
-pub use crate::{caps::server_capabilities, main_loop::main_loop, version::version};
+pub use crate::{
+    caps::server_capabilities, main_loop::main_loop, reload::ws_to_crate_graph, version::version,
+};
 
 pub fn from_json<T: DeserializeOwned>(
     what: &'static str,

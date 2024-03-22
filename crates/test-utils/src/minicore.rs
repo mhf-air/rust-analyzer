@@ -25,13 +25,14 @@
 //!     derive:
 //!     discriminant:
 //!     drop:
+//!     env: option
 //!     eq: sized
 //!     error: fmt
-//!     fmt: result, transmute, coerce_unsized
+//!     fmt: option, result, transmute, coerce_unsized
 //!     fn:
 //!     from: sized
 //!     future: pin
-//!     generator: pin
+//!     coroutine: pin
 //!     hash:
 //!     include:
 //!     index: sized
@@ -59,6 +60,8 @@
 //!     try: infallible
 //!     unpin: sized
 //!     unsize: sized
+//!     todo: panic
+//!     unimplemented: panic
 
 #![rustc_coherence_is_core]
 
@@ -327,7 +330,6 @@ pub mod convert {
 }
 
 pub mod mem {
-    // region:drop
     // region:manually_drop
     #[lang = "manually_drop"]
     #[repr(transparent)]
@@ -352,6 +354,7 @@ pub mod mem {
 
     // endregion:manually_drop
 
+    // region:drop
     pub fn drop<T>(_x: T) {}
     pub const fn replace<T>(dest: &mut T, src: T) -> T {
         unsafe {
@@ -797,26 +800,26 @@ pub mod ops {
     // endregion:builtin_impls
     // endregion:add
 
-    // region:generator
-    mod generator {
+    // region:coroutine
+    mod coroutine {
         use crate::pin::Pin;
 
-        #[lang = "generator"]
-        pub trait Generator<R = ()> {
+        #[lang = "coroutine"]
+        pub trait Coroutine<R = ()> {
             type Yield;
-            #[lang = "generator_return"]
+            #[lang = "coroutine_return"]
             type Return;
-            fn resume(self: Pin<&mut Self>, arg: R) -> GeneratorState<Self::Yield, Self::Return>;
+            fn resume(self: Pin<&mut Self>, arg: R) -> CoroutineState<Self::Yield, Self::Return>;
         }
 
-        #[lang = "generator_state"]
-        pub enum GeneratorState<Y, R> {
+        #[lang = "coroutine_state"]
+        pub enum CoroutineState<Y, R> {
             Yielded(Y),
             Complete(R),
         }
     }
-    pub use self::generator::{Generator, GeneratorState};
-    // endregion:generator
+    pub use self::coroutine::{Coroutine, CoroutineState};
+    // endregion:coroutine
 }
 
 // region:eq
@@ -926,6 +929,10 @@ pub mod fmt {
                 use crate::mem::transmute;
                 unsafe { Argument { formatter: transmute(f), value: transmute(x) } }
             }
+
+            pub fn new_display<'b, T: Display>(x: &'b T) -> Argument<'_> {
+                Self::new(x, Display::fmt)
+            }
         }
 
         #[lang = "format_alignment"]
@@ -984,6 +991,10 @@ pub mod fmt {
     impl<'a> Arguments<'a> {
         pub const fn new_v1(pieces: &'a [&'static str], args: &'a [Argument<'a>]) -> Arguments<'a> {
             Arguments { pieces, fmt: None, args }
+        }
+
+        pub const fn new_const(pieces: &'a [&'static str]) -> Arguments<'a> {
+            Arguments { pieces, fmt: None, args: &[] }
         }
 
         pub fn new_v1_formatted(
@@ -1165,6 +1176,7 @@ pub mod future {
         task::{Context, Poll},
     };
 
+    #[doc(notable_trait)]
     #[lang = "future_trait"]
     pub trait Future {
         type Output;
@@ -1263,6 +1275,7 @@ pub mod iter {
 
     mod traits {
         mod iterator {
+            #[doc(notable_trait)]
             pub trait Iterator {
                 type Item;
                 #[lang = "next"]
@@ -1343,6 +1356,9 @@ pub mod iter {
 // region:panic
 mod panic {
     pub macro panic_2021 {
+        () => (
+            $crate::panicking::panic("explicit panic")
+        ),
         ($($t:tt)+) => (
             $crate::panicking::panic_fmt($crate::const_format_args!($($t)+))
         ),
@@ -1353,6 +1369,11 @@ mod panicking {
     #[lang = "panic_fmt"]
     pub const fn panic_fmt(_fmt: crate::fmt::Arguments<'_>) -> ! {
         loop {}
+    }
+
+    #[lang = "panic"]
+    pub const fn panic(expr: &'static str) -> ! {
+        panic_fmt(crate::fmt::Arguments::new_const(&[expr]))
     }
 }
 // endregion:panic
@@ -1423,6 +1444,33 @@ mod macros {
 
     // endregion:fmt
 
+    // region:todo
+    #[macro_export]
+    #[allow_internal_unstable(core_panic)]
+    macro_rules! todo {
+        () => {
+            $crate::panicking::panic("not yet implemented")
+        };
+        ($($arg:tt)+) => {
+            $crate::panic!("not yet implemented: {}", $crate::format_args!($($arg)+))
+        };
+    }
+    // endregion:todo
+
+    // region:unimplemented
+    #[macro_export]
+    #[allow_internal_unstable(core_panic)]
+    macro_rules! unimplemented {
+        () => {
+            $crate::panicking::panic("not implemented")
+        };
+        ($($arg:tt)+) => {
+            $crate::panic!("not implemented: {}", $crate::format_args!($($arg)+))
+        };
+    }
+    // endregion:unimplemented
+
+
     // region:derive
     pub(crate) mod builtin {
         #[rustc_builtin_macro]
@@ -1450,6 +1498,15 @@ mod macros {
     #[macro_export]
     macro_rules! concat {}
     // endregion:concat
+
+    // region:env
+    #[rustc_builtin_macro]
+    #[macro_export]
+    macro_rules! env {}
+    #[rustc_builtin_macro]
+    #[macro_export]
+    macro_rules! option_env {}
+    // endregion:env
 }
 
 // region:non_zero

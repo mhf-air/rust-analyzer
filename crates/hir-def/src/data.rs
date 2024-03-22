@@ -19,7 +19,7 @@ use crate::{
     macro_call_as_call_id,
     nameres::{
         attr_resolution::ResolvedAttr,
-        diagnostics::DefDiagnostic,
+        diagnostics::{DefDiagnostic, DefDiagnostics},
         proc_macro::{parse_macro_name_and_helper_attrs, ProcMacroKind},
         DefMap, MacroSubNs,
     },
@@ -233,6 +233,7 @@ pub struct TraitData {
 }
 
 impl TraitData {
+    #[inline]
     pub(crate) fn trait_data_query(db: &dyn DefDatabase, tr: TraitId) -> Arc<TraitData> {
         db.trait_data_with_diagnostics(tr).0
     }
@@ -240,13 +241,10 @@ impl TraitData {
     pub(crate) fn trait_data_with_diagnostics_query(
         db: &dyn DefDatabase,
         tr: TraitId,
-    ) -> (Arc<TraitData>, Arc<[DefDiagnostic]>) {
-        let tr_loc @ ItemLoc { container: module_id, id: tree_id } = tr.lookup(db);
+    ) -> (Arc<TraitData>, DefDiagnostics) {
+        let ItemLoc { container: module_id, id: tree_id } = tr.lookup(db);
         let item_tree = tree_id.item_tree(db);
         let tr_def = &item_tree[tree_id.value];
-        let _cx = stdx::panic_context::enter(format!(
-            "trait_data_query({tr:?} -> {tr_loc:?} -> {tr_def:?})"
-        ));
         let name = tr_def.name.clone();
         let is_auto = tr_def.is_auto;
         let is_unsafe = tr_def.is_unsafe;
@@ -274,7 +272,7 @@ impl TraitData {
                 rustc_has_incoherent_inherent_impls,
                 fundamental,
             }),
-            diagnostics.into(),
+            DefDiagnostics::new(diagnostics),
         )
     }
 
@@ -333,6 +331,7 @@ pub struct ImplData {
 }
 
 impl ImplData {
+    #[inline]
     pub(crate) fn impl_data_query(db: &dyn DefDatabase, id: ImplId) -> Arc<ImplData> {
         db.impl_data_with_diagnostics(id).0
     }
@@ -340,8 +339,8 @@ impl ImplData {
     pub(crate) fn impl_data_with_diagnostics_query(
         db: &dyn DefDatabase,
         id: ImplId,
-    ) -> (Arc<ImplData>, Arc<[DefDiagnostic]>) {
-        let _p = profile::span("impl_data_with_diagnostics_query");
+    ) -> (Arc<ImplData>, DefDiagnostics) {
+        let _p = tracing::span!(tracing::Level::INFO, "impl_data_with_diagnostics_query").entered();
         let ItemLoc { container: module_id, id: tree_id } = id.lookup(db);
 
         let item_tree = tree_id.item_tree(db);
@@ -367,7 +366,7 @@ impl ImplData {
                 is_unsafe,
                 attribute_calls,
             }),
-            diagnostics.into(),
+            DefDiagnostics::new(diagnostics),
         )
     }
 
@@ -635,7 +634,6 @@ impl<'a> AssocItemCollector<'a> {
                     attr,
                 ) {
                     Ok(ResolvedAttr::Macro(call_id)) => {
-                        self.attr_calls.push((ast_id, call_id));
                         // If proc attribute macro expansion is disabled, skip expanding it here
                         if !self.db.expand_proc_attr_macros() {
                             continue 'attrs;
@@ -648,9 +646,20 @@ impl<'a> AssocItemCollector<'a> {
                             // disabled. This is analogous to the handling in
                             // `DefCollector::collect_macros`.
                             if exp.is_dummy() {
+                                self.diagnostics.push(DefDiagnostic::unresolved_proc_macro(
+                                    self.module_id.local_id,
+                                    loc.kind,
+                                    loc.def.krate,
+                                ));
+
+                                continue 'attrs;
+                            }
+                            if exp.is_disabled() {
                                 continue 'attrs;
                             }
                         }
+
+                        self.attr_calls.push((ast_id, call_id));
 
                         let res =
                             self.expander.enter_expand_id::<ast::MacroItems>(self.db, call_id);
@@ -706,7 +715,7 @@ impl<'a> AssocItemCollector<'a> {
             }
             AssocItem::MacroCall(call) => {
                 let file_id = self.expander.current_file_id();
-                let MacroCall { ast_id, expand_to, call_site, ref path } = item_tree[call];
+                let MacroCall { ast_id, expand_to, ctxt, ref path } = item_tree[call];
                 let module = self.expander.module.local_id;
 
                 let resolver = |path| {
@@ -725,7 +734,7 @@ impl<'a> AssocItemCollector<'a> {
                 match macro_call_as_call_id(
                     self.db.upcast(),
                     &AstIdWithPath::new(file_id, ast_id, Clone::clone(path)),
-                    call_site,
+                    ctxt,
                     expand_to,
                     self.expander.module.krate(),
                     resolver,
@@ -736,6 +745,7 @@ impl<'a> AssocItemCollector<'a> {
                         self.collect_macro_items(res, &|| hir_expand::MacroCallKind::FnLike {
                             ast_id: InFile::new(file_id, ast_id),
                             expand_to: hir_expand::ExpandTo::Items,
+                            eager: None,
                         });
                     }
                     Ok(None) => (),
@@ -745,6 +755,7 @@ impl<'a> AssocItemCollector<'a> {
                             MacroCallKind::FnLike {
                                 ast_id: InFile::new(file_id, ast_id),
                                 expand_to,
+                                eager: None,
                             },
                             Clone::clone(path),
                         ));
@@ -779,11 +790,12 @@ impl<'a> AssocItemCollector<'a> {
             };
             self.diagnostics.push(diag);
         }
-        if let errors @ [_, ..] = parse.errors() {
+        let errors = parse.errors();
+        if !errors.is_empty() {
             self.diagnostics.push(DefDiagnostic::macro_expansion_parse_error(
                 self.module_id.local_id,
                 error_call_kind(),
-                errors.into(),
+                errors.into_boxed_slice(),
             ));
         }
 
