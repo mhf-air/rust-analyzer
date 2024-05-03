@@ -1,5 +1,5 @@
 //! Name resolution façade.
-use std::{fmt, hash::BuildHasherDefault, mem};
+use std::{fmt, hash::BuildHasherDefault, iter, mem};
 
 use base_db::CrateId;
 use hir_expand::{
@@ -24,6 +24,7 @@ use crate::{
     nameres::{DefMap, MacroSubNs},
     path::{ModPath, Path, PathKind},
     per_ns::PerNs,
+    type_ref::LifetimeRef,
     visibility::{RawVisibility, Visibility},
     AdtId, ConstId, ConstParamId, CrateRootModuleId, DefWithBodyId, EnumId, EnumVariantId,
     ExternBlockId, ExternCrateId, FunctionId, GenericDefId, GenericParamId, HasModule, ImplId,
@@ -118,6 +119,12 @@ pub enum ValueNs {
     StructId(StructId),
     EnumVariantId(EnumVariantId),
     GenericParam(ConstParamId),
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum LifetimeNs {
+    Static,
+    LifetimeParam(LifetimeParamId),
 }
 
 impl Resolver {
@@ -418,6 +425,19 @@ impl Resolver {
         self.resolve_path_as_macro(db, path, expected_macro_kind).map(|(it, _)| db.macro_def(it))
     }
 
+    pub fn resolve_lifetime(&self, lifetime: &LifetimeRef) -> Option<LifetimeNs> {
+        if lifetime.name == name::known::STATIC_LIFETIME {
+            return Some(LifetimeNs::Static);
+        }
+
+        self.scopes().find_map(|scope| match scope {
+            Scope::GenericParams { def, params } => {
+                params.find_lifetime_by_name(&lifetime.name, *def).map(LifetimeNs::LifetimeParam)
+            }
+            _ => None,
+        })
+    }
+
     /// Returns a set of names available in the current scope.
     ///
     /// Note that this is a somewhat fuzzy concept -- internally, the compiler
@@ -571,13 +591,13 @@ impl Resolver {
 
     pub fn where_predicates_in_scope(
         &self,
-    ) -> impl Iterator<Item = &crate::generics::WherePredicate> {
+    ) -> impl Iterator<Item = (&crate::generics::WherePredicate, &GenericDefId)> {
         self.scopes()
             .filter_map(|scope| match scope {
-                Scope::GenericParams { params, .. } => Some(params),
+                Scope::GenericParams { params, def } => Some((params, def)),
                 _ => None,
             })
-            .flat_map(|params| params.where_predicates.iter())
+            .flat_map(|(params, def)| params.where_predicates.iter().zip(iter::repeat(def)))
     }
 
     pub fn generic_def(&self) -> Option<GenericDefId> {

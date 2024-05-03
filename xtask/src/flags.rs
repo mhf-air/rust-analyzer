@@ -2,7 +2,7 @@
 
 use std::str::FromStr;
 
-use crate::install::{ClientOpt, Malloc, ServerOpt};
+use crate::install::{ClientOpt, ServerOpt};
 
 xflags::xflags! {
     src "./src/flags.rs"
@@ -14,16 +14,16 @@ xflags::xflags! {
         cmd install {
             /// Install only VS Code plugin.
             optional --client
-            /// One of 'code', 'code-exploration', 'code-insiders', 'codium', or 'code-oss'.
+            /// One of `code`, `code-exploration`, `code-insiders`, `codium`, or `code-oss`.
             optional --code-bin name: String
 
             /// Install only the language server.
             optional --server
-            /// Use mimalloc allocator for server
+            /// Use mimalloc allocator for server.
             optional --mimalloc
-            /// Use jemalloc allocator for server
+            /// Use jemalloc allocator for server.
             optional --jemalloc
-            /// build in release with debug info set to 2
+            /// build in release with debug info set to 2.
             optional --dev-rel
         }
 
@@ -32,10 +32,26 @@ xflags::xflags! {
         cmd release {
             optional --dry-run
         }
-        cmd promote {
-            optional --dry-run
+
+        cmd rustc-pull {
+            /// rustc commit to pull.
+            optional --commit refspec: String
         }
+
+        cmd rustc-push {
+            /// rust local path, e.g. `../rust-rust-analyzer`.
+            required --rust-path rust_path: String
+            /// rust fork name, e.g.  `matklad/rust`.
+            required --rust-fork rust_fork: String
+            /// branch name.
+            optional --branch branch: String
+        }
+
         cmd dist {
+            /// Use mimalloc allocator for server
+            optional --mimalloc
+            /// Use jemalloc allocator for server
+            optional --jemalloc
             optional --client-patch-version version: String
         }
         /// Read a changelog AsciiDoc file and update the GitHub Releases entry in Markdown.
@@ -73,7 +89,8 @@ pub enum XtaskCmd {
     Install(Install),
     FuzzTests(FuzzTests),
     Release(Release),
-    Promote(Promote),
+    RustcPull(RustcPull),
+    RustcPush(RustcPush),
     Dist(Dist),
     PublishReleaseNotes(PublishReleaseNotes),
     Metrics(Metrics),
@@ -82,10 +99,83 @@ pub enum XtaskCmd {
 }
 
 #[derive(Debug)]
-pub struct Codegen {
-    pub check: bool,
-    pub codegen_type: Option<CodegenType>,
+pub struct Install {
+    pub client: bool,
+    pub code_bin: Option<String>,
+    pub server: bool,
+    pub mimalloc: bool,
+    pub jemalloc: bool,
+    pub dev_rel: bool,
 }
+
+#[derive(Debug)]
+pub struct FuzzTests;
+
+#[derive(Debug)]
+pub struct Release {
+    pub dry_run: bool,
+}
+
+#[derive(Debug)]
+pub struct RustcPull {
+    pub commit: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct RustcPush {
+    pub rust_path: String,
+    pub rust_fork: String,
+    pub branch: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct Dist {
+    pub mimalloc: bool,
+    pub jemalloc: bool,
+    pub client_patch_version: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct PublishReleaseNotes {
+    pub changelog: String,
+
+    pub dry_run: bool,
+}
+
+#[derive(Debug)]
+pub struct Metrics {
+    pub measurement_type: Option<MeasurementType>,
+}
+
+#[derive(Debug)]
+pub struct Bb {
+    pub suffix: String,
+}
+
+#[derive(Debug)]
+pub struct Codegen {
+    pub codegen_type: Option<CodegenType>,
+
+    pub check: bool,
+}
+
+impl Xtask {
+    #[allow(dead_code)]
+    pub fn from_env_or_exit() -> Self {
+        Self::from_env_or_exit_()
+    }
+
+    #[allow(dead_code)]
+    pub fn from_env() -> xflags::Result<Self> {
+        Self::from_env_()
+    }
+
+    #[allow(dead_code)]
+    pub fn from_vec(args: Vec<std::ffi::OsString>) -> xflags::Result<Self> {
+        Self::from_vec_(args)
+    }
+}
+// generated end
 
 #[derive(Debug, Default)]
 pub enum CodegenType {
@@ -109,40 +199,6 @@ impl FromStr for CodegenType {
             _ => Err("Invalid option".to_owned()),
         }
     }
-}
-#[derive(Debug)]
-pub struct Install {
-    pub client: bool,
-    pub code_bin: Option<String>,
-    pub server: bool,
-    pub mimalloc: bool,
-    pub jemalloc: bool,
-    pub dev_rel: bool,
-}
-
-#[derive(Debug)]
-pub struct FuzzTests;
-
-#[derive(Debug)]
-pub struct Release {
-    pub dry_run: bool,
-}
-
-#[derive(Debug)]
-pub struct Promote {
-    pub dry_run: bool,
-}
-
-#[derive(Debug)]
-pub struct Dist {
-    pub client_patch_version: Option<String>,
-}
-
-#[derive(Debug)]
-pub struct PublishReleaseNotes {
-    pub changelog: String,
-
-    pub dry_run: bool,
 }
 
 #[derive(Debug)]
@@ -185,33 +241,22 @@ impl AsRef<str> for MeasurementType {
     }
 }
 
-#[derive(Debug)]
-pub struct Metrics {
-    pub measurement_type: Option<MeasurementType>,
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Malloc {
+    System,
+    Mimalloc,
+    Jemalloc,
 }
 
-#[derive(Debug)]
-pub struct Bb {
-    pub suffix: String,
-}
-
-impl Xtask {
-    #[allow(dead_code)]
-    pub fn from_env_or_exit() -> Self {
-        Self::from_env_or_exit_()
-    }
-
-    #[allow(dead_code)]
-    pub fn from_env() -> xflags::Result<Self> {
-        Self::from_env_()
-    }
-
-    #[allow(dead_code)]
-    pub fn from_vec(args: Vec<std::ffi::OsString>) -> xflags::Result<Self> {
-        Self::from_vec_(args)
+impl Malloc {
+    pub(crate) fn to_features(self) -> &'static [&'static str] {
+        match self {
+            Malloc::System => &[][..],
+            Malloc::Mimalloc => &["--features", "mimalloc"],
+            Malloc::Jemalloc => &["--features", "jemalloc"],
+        }
     }
 }
-// generated end
 
 impl Install {
     pub(crate) fn server(&self) -> Option<ServerOpt> {
@@ -232,5 +277,17 @@ impl Install {
             return None;
         }
         Some(ClientOpt { code_bin: self.code_bin.clone() })
+    }
+}
+
+impl Dist {
+    pub(crate) fn allocator(&self) -> Malloc {
+        if self.mimalloc {
+            Malloc::Mimalloc
+        } else if self.jemalloc {
+            Malloc::Jemalloc
+        } else {
+            Malloc::System
+        }
     }
 }

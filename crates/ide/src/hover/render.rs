@@ -101,7 +101,7 @@ pub(super) fn try_expr(
                 if let Some((inner, body)) = error_type_args {
                     inner_ty = inner;
                     body_ty = body;
-                    s = "Try Error".to_owned();
+                    "Try Error".clone_into(&mut s);
                 }
             }
         }
@@ -403,12 +403,36 @@ pub(super) fn definition(
     def: Definition,
     famous_defs: Option<&FamousDefs<'_, '_>>,
     notable_traits: &[(Trait, Vec<(Option<Type>, Name)>)],
+    macro_arm: Option<u32>,
     config: &HoverConfig,
 ) -> Markup {
     let mod_path = definition_mod_path(db, &def);
     let label = match def {
         Definition::Trait(trait_) => {
             trait_.display_limited(db, config.max_trait_assoc_items_count).to_string()
+        }
+        Definition::Adt(adt @ (Adt::Struct(_) | Adt::Union(_))) => {
+            adt.display_limited(db, config.max_fields_count).to_string()
+        }
+        Definition::Variant(variant) => {
+            variant.display_limited(db, config.max_fields_count).to_string()
+        }
+        Definition::Adt(adt @ Adt::Enum(_)) => {
+            adt.display_limited(db, config.max_enum_variants_count).to_string()
+        }
+        Definition::SelfType(impl_def) => {
+            let self_ty = &impl_def.self_ty(db);
+            match self_ty.as_adt() {
+                Some(adt) => adt.display_limited(db, config.max_fields_count).to_string(),
+                None => self_ty.display(db).to_string(),
+            }
+        }
+        Definition::Macro(it) => {
+            let mut label = it.display(db).to_string();
+            if let Some(macro_arm) = macro_arm {
+                format_to!(label, " // matched arm #{}", macro_arm);
+            }
+            label
         }
         _ => def.label(db),
     };
@@ -634,7 +658,7 @@ fn closure_ty(
         })
         .join("\n");
     if captures_rendered.trim().is_empty() {
-        captures_rendered = "This closure captures nothing".to_owned();
+        "This closure captures nothing".clone_into(&mut captures_rendered);
     }
     let mut targets: Vec<hir::ModuleDef> = Vec::new();
     let mut push_new_def = |item: hir::ModuleDef| {

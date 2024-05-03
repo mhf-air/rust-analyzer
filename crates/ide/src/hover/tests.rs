@@ -18,6 +18,8 @@ const HOVER_BASE_CONFIG: HoverConfig = HoverConfig {
     format: HoverDocFormat::Markdown,
     keywords: true,
     max_trait_assoc_items_count: None,
+    max_fields_count: Some(5),
+    max_enum_variants_count: Some(5),
 };
 
 fn check_hover_no_result(ra_fixture: &str) {
@@ -37,6 +39,58 @@ fn check(ra_fixture: &str, expect: Expect) {
     let hover = analysis
         .hover(
             &HoverConfig { links_in_hover: true, ..HOVER_BASE_CONFIG },
+            FileRange { file_id: position.file_id, range: TextRange::empty(position.offset) },
+        )
+        .unwrap()
+        .unwrap();
+
+    let content = analysis.db.file_text(position.file_id);
+    let hovered_element = &content[hover.range];
+
+    let actual = format!("*{hovered_element}*\n{}\n", hover.info.markup);
+    expect.assert_eq(&actual)
+}
+
+#[track_caller]
+fn check_hover_fields_limit(
+    fields_count: impl Into<Option<usize>>,
+    ra_fixture: &str,
+    expect: Expect,
+) {
+    let (analysis, position) = fixture::position(ra_fixture);
+    let hover = analysis
+        .hover(
+            &HoverConfig {
+                links_in_hover: true,
+                max_fields_count: fields_count.into(),
+                ..HOVER_BASE_CONFIG
+            },
+            FileRange { file_id: position.file_id, range: TextRange::empty(position.offset) },
+        )
+        .unwrap()
+        .unwrap();
+
+    let content = analysis.db.file_text(position.file_id);
+    let hovered_element = &content[hover.range];
+
+    let actual = format!("*{hovered_element}*\n{}\n", hover.info.markup);
+    expect.assert_eq(&actual)
+}
+
+#[track_caller]
+fn check_hover_enum_variants_limit(
+    variants_count: impl Into<Option<usize>>,
+    ra_fixture: &str,
+    expect: Expect,
+) {
+    let (analysis, position) = fixture::position(ra_fixture);
+    let hover = analysis
+        .hover(
+            &HoverConfig {
+                links_in_hover: true,
+                max_enum_variants_count: variants_count.into(),
+                ..HOVER_BASE_CONFIG
+            },
             FileRange { file_id: position.file_id, range: TextRange::empty(position.offset) },
         )
         .unwrap()
@@ -884,6 +938,407 @@ struct Foo$0 where u32: Copy { field: u32 }
 }
 
 #[test]
+fn hover_record_struct_limit() {
+    check_hover_fields_limit(
+        3,
+        r#"
+    struct Foo$0 { a: u32, b: i32, c: i32 }
+    "#,
+        expect![[r#"
+            *Foo*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 12 (0xC), align = 4
+            struct Foo {
+                a: u32,
+                b: i32,
+                c: i32,
+            }
+            ```
+        "#]],
+    );
+    check_hover_fields_limit(
+        3,
+        r#"
+    struct Foo$0 { a: u32 }
+    "#,
+        expect![[r#"
+            *Foo*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 4, align = 4
+            struct Foo {
+                a: u32,
+            }
+            ```
+        "#]],
+    );
+    check_hover_fields_limit(
+        3,
+        r#"
+    struct Foo$0 { a: u32, b: i32, c: i32, d: u32 }
+    "#,
+        expect![[r#"
+            *Foo*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 16 (0x10), align = 4
+            struct Foo {
+                a: u32,
+                b: i32,
+                c: i32,
+                /* … */
+            }
+            ```
+        "#]],
+    );
+    check_hover_fields_limit(
+        None,
+        r#"
+    struct Foo$0 { a: u32, b: i32, c: i32 }
+    "#,
+        expect![[r#"
+            *Foo*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 12 (0xC), align = 4
+            struct Foo
+            ```
+        "#]],
+    );
+    check_hover_fields_limit(
+        0,
+        r#"
+    struct Foo$0 { a: u32, b: i32, c: i32 }
+    "#,
+        expect![[r#"
+            *Foo*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 12 (0xC), align = 4
+            struct Foo { /* … */ }
+            ```
+        "#]],
+    );
+
+    // No extra spaces within `{}` when there are no fields
+    check_hover_fields_limit(
+        5,
+        r#"
+    struct Foo$0 {}
+    "#,
+        expect![[r#"
+            *Foo*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 0, align = 1
+            struct Foo {}
+            ```
+        "#]],
+    );
+}
+
+#[test]
+fn hover_record_variant_limit() {
+    check_hover_fields_limit(
+        3,
+        r#"
+    enum Foo { A$0 { a: u32, b: i32, c: i32 } }
+    "#,
+        expect![[r#"
+            *A*
+
+            ```rust
+            test::Foo
+            ```
+
+            ```rust
+            // size = 12 (0xC), align = 4
+            A { a: u32, b: i32, c: i32, }
+            ```
+        "#]],
+    );
+    check_hover_fields_limit(
+        3,
+        r#"
+    enum Foo { A$0 { a: u32 } }
+    "#,
+        expect![[r#"
+            *A*
+
+            ```rust
+            test::Foo
+            ```
+
+            ```rust
+            // size = 4, align = 4
+            A { a: u32, }
+            ```
+        "#]],
+    );
+    check_hover_fields_limit(
+        3,
+        r#"
+    enum Foo { A$0 { a: u32, b: i32, c: i32, d: u32 } }
+    "#,
+        expect![[r#"
+            *A*
+
+            ```rust
+            test::Foo
+            ```
+
+            ```rust
+            // size = 16 (0x10), align = 4
+            A { a: u32, b: i32, c: i32, /* … */ }
+            ```
+        "#]],
+    );
+    check_hover_fields_limit(
+        None,
+        r#"
+    enum Foo { A$0 { a: u32, b: i32, c: i32 } }
+    "#,
+        expect![[r#"
+            *A*
+
+            ```rust
+            test::Foo
+            ```
+
+            ```rust
+            // size = 12 (0xC), align = 4
+            A
+            ```
+        "#]],
+    );
+    check_hover_fields_limit(
+        0,
+        r#"
+    enum Foo { A$0 { a: u32, b: i32, c: i32 } }
+    "#,
+        expect![[r#"
+            *A*
+
+            ```rust
+            test::Foo
+            ```
+
+            ```rust
+            // size = 12 (0xC), align = 4
+            A { /* … */ }
+            ```
+        "#]],
+    );
+}
+
+#[test]
+fn hover_enum_limit() {
+    check_hover_enum_variants_limit(
+        5,
+        r#"enum Foo$0 { A, B }"#,
+        expect![[r#"
+            *Foo*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 1, align = 1, niches = 254
+            enum Foo {
+                A,
+                B,
+            }
+            ```
+        "#]],
+    );
+    check_hover_enum_variants_limit(
+        1,
+        r#"enum Foo$0 { A, B }"#,
+        expect![[r#"
+            *Foo*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 1, align = 1, niches = 254
+            enum Foo {
+                A,
+                /* … */
+            }
+            ```
+        "#]],
+    );
+    check_hover_enum_variants_limit(
+        0,
+        r#"enum Foo$0 { A, B }"#,
+        expect![[r#"
+            *Foo*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 1, align = 1, niches = 254
+            enum Foo { /* … */ }
+            ```
+        "#]],
+    );
+    check_hover_enum_variants_limit(
+        None,
+        r#"enum Foo$0 { A, B }"#,
+        expect![[r#"
+            *Foo*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 1, align = 1, niches = 254
+            enum Foo
+            ```
+        "#]],
+    );
+    check_hover_enum_variants_limit(
+        7,
+        r#"enum Enum$0 {
+               Variant {},
+               Variant2 { field: i32 },
+               Variant3 { field: i32, field2: i32 },
+               Variant4(),
+               Variant5(i32),
+               Variant6(i32, i32),
+               Variant7,
+               Variant8,
+           }"#,
+        expect![[r#"
+            *Enum*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 12 (0xC), align = 4, niches = 4294967288
+            enum Enum {
+                Variant {},
+                Variant2 { /* … */ },
+                Variant3 { /* … */ },
+                Variant4(),
+                Variant5( /* … */ ),
+                Variant6( /* … */ ),
+                Variant7,
+                /* … */
+            }
+            ```
+        "#]],
+    );
+}
+
+#[test]
+fn hover_union_limit() {
+    check_hover_fields_limit(
+        5,
+        r#"union Foo$0 { a: u32, b: i32 }"#,
+        expect![[r#"
+            *Foo*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 4, align = 4
+            union Foo {
+                a: u32,
+                b: i32,
+            }
+            ```
+        "#]],
+    );
+    check_hover_fields_limit(
+        1,
+        r#"union Foo$0 { a: u32, b: i32 }"#,
+        expect![[r#"
+            *Foo*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 4, align = 4
+            union Foo {
+                a: u32,
+                /* … */
+            }
+            ```
+        "#]],
+    );
+    check_hover_fields_limit(
+        0,
+        r#"union Foo$0 { a: u32, b: i32 }"#,
+        expect![[r#"
+            *Foo*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 4, align = 4
+            union Foo { /* … */ }
+            ```
+        "#]],
+    );
+    check_hover_fields_limit(
+        None,
+        r#"union Foo$0 { a: u32, b: i32 }"#,
+        expect![[r#"
+            *Foo*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 4, align = 4
+            union Foo
+            ```
+        "#]],
+    );
+}
+
+#[test]
 fn hover_unit_struct() {
     check(
         r#"
@@ -1350,6 +1805,26 @@ impl Thing {
                 ```
             "#]],
     );
+    check_hover_fields_limit(
+        None,
+        r#"
+struct Thing { x: u32 }
+impl Thing {
+    fn new() -> Self$0 { Self { x: 0 } }
+}
+"#,
+        expect![[r#"
+                *Self*
+
+                ```rust
+                test
+                ```
+
+                ```rust
+                struct Thing
+                ```
+            "#]],
+    );
     check(
         r#"
 struct Thing { x: u32 }
@@ -1379,18 +1854,18 @@ impl Thing {
 }
 "#,
         expect![[r#"
-                *Self*
+            *Self*
 
-                ```rust
-                test
-                ```
+            ```rust
+            test
+            ```
 
-                ```rust
-                enum Thing {
-                    A,
-                }
-                ```
-            "#]],
+            ```rust
+            enum Thing {
+                A,
+            }
+            ```
+        "#]],
     );
     check(
         r#"
@@ -1400,18 +1875,18 @@ impl Thing {
 }
 "#,
         expect![[r#"
-                *Self*
+            *Self*
 
-                ```rust
-                test
-                ```
+            ```rust
+            test
+            ```
 
-                ```rust
-                enum Thing {
-                    A,
-                }
-                ```
-            "#]],
+            ```rust
+            enum Thing {
+                A,
+            }
+            ```
+        "#]],
     );
     check(
         r#"
@@ -1477,21 +1952,21 @@ fn y() {
 fn test_hover_macro_invocation() {
     check(
         r#"
-macro_rules! foo { () => {} }
+macro_rules! foo { (a) => {}; () => {} }
 
 fn f() { fo$0o!(); }
 "#,
         expect![[r#"
-                *foo*
+            *foo*
 
-                ```rust
-                test
-                ```
+            ```rust
+            test
+            ```
 
-                ```rust
-                macro_rules! foo
-                ```
-            "#]],
+            ```rust
+            macro_rules! foo // matched arm #1
+            ```
+        "#]],
     )
 }
 
@@ -1507,22 +1982,22 @@ macro foo() {}
 fn f() { fo$0o!(); }
 "#,
         expect![[r#"
-                *foo*
+            *foo*
 
-                ```rust
-                test
-                ```
+            ```rust
+            test
+            ```
 
-                ```rust
-                macro foo
-                ```
+            ```rust
+            macro foo // matched arm #0
+            ```
 
-                ---
+            ---
 
-                foo bar
+            foo bar
 
-                foo bar baz
-            "#]],
+            foo bar baz
+        "#]],
     )
 }
 
@@ -2240,6 +2715,49 @@ fn test_hover_layout_of_variant() {
 }
 
 #[test]
+fn test_hover_layout_of_variant_generic() {
+    check(
+        r#"enum Option<T> {
+    Some(T),
+    None$0
+}"#,
+        expect![[r#"
+            *None*
+
+            ```rust
+            test::Option
+            ```
+
+            ```rust
+            None
+            ```
+        "#]],
+    );
+}
+
+#[test]
+fn test_hover_layout_generic_unused() {
+    check(
+        r#"
+//- minicore: phantom_data
+struct S$0<T>(core::marker::PhantomData<T>);
+"#,
+        expect![[r#"
+            *S*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 0, align = 1
+            struct S<T>(PhantomData<T>)
+            ```
+        "#]],
+    );
+}
+
+#[test]
 fn test_hover_layout_of_enum() {
     check(
         r#"enum $0Foo {
@@ -2256,8 +2774,8 @@ fn test_hover_layout_of_enum() {
             ```rust
             // size = 16 (0x10), align = 8, niches = 254
             enum Foo {
-                Variant1(u8, u16),
-                Variant2(i32, u8, i64),
+                Variant1( /* … */ ),
+                Variant2( /* … */ ),
             }
             ```
         "#]],
@@ -2599,7 +3117,7 @@ fn main() { let s$0t = S{ f1:0 }; }
                                     focus_range: 7..8,
                                     name: "S",
                                     kind: Struct,
-                                    description: "struct S {\n    f1: u32,\n}",
+                                    description: "struct S",
                                 },
                             },
                         ],
@@ -2645,7 +3163,7 @@ fn main() { let s$0t = S{ f1:Arg(0) }; }
                                 focus_range: 24..25,
                                 name: "S",
                                 kind: Struct,
-                                description: "struct S<T> {\n    f1: T,\n}",
+                                description: "struct S<T>",
                             },
                         },
                     ],
@@ -2704,7 +3222,7 @@ fn main() { let s$0t = S{ f1: S{ f1: Arg(0) } }; }
                                 focus_range: 24..25,
                                 name: "S",
                                 kind: Struct,
-                                description: "struct S<T> {\n    f1: T,\n}",
+                                description: "struct S<T>",
                             },
                         },
                     ],
@@ -2957,7 +3475,7 @@ fn main() { let s$0t = foo(); }
                                 focus_range: 39..41,
                                 name: "S1",
                                 kind: Struct,
-                                description: "struct S1 {}",
+                                description: "struct S1",
                             },
                         },
                         HoverGotoTypeData {
@@ -2970,7 +3488,7 @@ fn main() { let s$0t = foo(); }
                                 focus_range: 52..54,
                                 name: "S2",
                                 kind: Struct,
-                                description: "struct S2 {}",
+                                description: "struct S2",
                             },
                         },
                     ],
@@ -3061,7 +3579,7 @@ fn foo(ar$0g: &impl Foo + Bar<S>) {}
                                 focus_range: 36..37,
                                 name: "S",
                                 kind: Struct,
-                                description: "struct S {}",
+                                description: "struct S",
                             },
                         },
                     ],
@@ -3161,7 +3679,7 @@ fn foo(ar$0g: &impl Foo<S>) {}
                                 focus_range: 23..24,
                                 name: "S",
                                 kind: Struct,
-                                description: "struct S {}",
+                                description: "struct S",
                             },
                         },
                     ],
@@ -3175,12 +3693,12 @@ fn foo(ar$0g: &impl Foo<S>) {}
 fn test_hover_dyn_return_has_goto_type_action() {
     check_actions(
         r#"
-trait Foo {}
+trait Foo<T> {}
 struct S;
-impl Foo for S {}
+impl Foo<S> for S {}
 
 struct B<T>{}
-fn foo() -> B<dyn Foo> {}
+fn foo() -> B<dyn Foo<S>> {}
 
 fn main() { let s$0t = foo(); }
 "#,
@@ -3194,11 +3712,11 @@ fn main() { let s$0t = foo(); }
                                 file_id: FileId(
                                     0,
                                 ),
-                                full_range: 42..55,
-                                focus_range: 49..50,
+                                full_range: 48..61,
+                                focus_range: 55..56,
                                 name: "B",
                                 kind: Struct,
-                                description: "struct B<T> {}",
+                                description: "struct B<T>",
                             },
                         },
                         HoverGotoTypeData {
@@ -3207,11 +3725,24 @@ fn main() { let s$0t = foo(); }
                                 file_id: FileId(
                                     0,
                                 ),
-                                full_range: 0..12,
+                                full_range: 0..15,
                                 focus_range: 6..9,
                                 name: "Foo",
                                 kind: Trait,
-                                description: "trait Foo",
+                                description: "trait Foo<T>",
+                            },
+                        },
+                        HoverGotoTypeData {
+                            mod_path: "test::S",
+                            nav: NavigationTarget {
+                                file_id: FileId(
+                                    0,
+                                ),
+                                full_range: 16..25,
+                                focus_range: 23..24,
+                                name: "S",
+                                kind: Struct,
+                                description: "struct S",
                             },
                         },
                     ],
@@ -3287,7 +3818,7 @@ fn foo(ar$0g: &dyn Foo<S>) {}
                                 focus_range: 23..24,
                                 name: "S",
                                 kind: Struct,
-                                description: "struct S {}",
+                                description: "struct S",
                             },
                         },
                     ],
@@ -3322,7 +3853,7 @@ fn foo(a$0rg: &impl ImplTrait<B<dyn DynTrait<B<S>>>>) {}
                                 focus_range: 50..51,
                                 name: "B",
                                 kind: Struct,
-                                description: "struct B<T> {}",
+                                description: "struct B<T>",
                             },
                         },
                         HoverGotoTypeData {
@@ -3361,7 +3892,7 @@ fn foo(a$0rg: &impl ImplTrait<B<dyn DynTrait<B<S>>>>) {}
                                 focus_range: 65..66,
                                 name: "S",
                                 kind: Struct,
-                                description: "struct S {}",
+                                description: "struct S",
                             },
                         },
                     ],
@@ -3590,6 +4121,7 @@ struct S$0T<const C: usize = 1, T = Foo>(T);
             ```
 
             ```rust
+            // size = 0, align = 1
             struct ST<const C: usize = 1, T = Foo>(T)
             ```
         "#]],
@@ -3611,6 +4143,7 @@ struct S$0T<const C: usize = {40 + 2}, T = Foo>(T);
             ```
 
             ```rust
+            // size = 0, align = 1
             struct ST<const C: usize = {const}, T = Foo>(T)
             ```
         "#]],
@@ -3633,6 +4166,7 @@ struct S$0T<const C: usize = VAL, T = Foo>(T);
             ```
 
             ```rust
+            // size = 0, align = 1
             struct ST<const C: usize = VAL, T = Foo>(T)
             ```
         "#]],
@@ -3957,7 +4491,6 @@ impl<T> Foo<T$0> {}
             ```
         "#]],
     );
-    // lifetimes bounds arent being tracked yet
     check(
         r#"
 //- minicore: sized
@@ -3968,7 +4501,7 @@ impl<T: 'static> Foo<T$0> {}
             *T*
 
             ```rust
-            T
+            T: 'static
             ```
         "#]],
     );
@@ -4132,6 +4665,10 @@ fn foo<T$0: ?Sized + Sized + Sized>() {}
                 ```
             "#]],
         );
+    }
+
+    #[test]
+    fn mixed2() {
         check(
             r#"
 //- minicore: sized
@@ -5101,6 +5638,32 @@ fn foo(e: E) {
             ---
 
             This is a doc
+        "#]],
+    );
+}
+
+#[test]
+fn hover_const_value() {
+    check(
+        r#"
+pub enum AA {
+    BB,
+}
+const CONST: AA = AA::BB;
+pub fn the_function() -> AA {
+    CON$0ST
+}
+"#,
+        expect![[r#"
+            *CONST*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            const CONST: AA = BB
+            ```
         "#]],
     );
 }
@@ -6383,7 +6946,7 @@ enum Enum {
 
             ```rust
             // size = 4, align = 4
-            RecordV { field: u32 }
+            RecordV { field: u32, }
             ```
         "#]],
     );
@@ -7693,8 +8256,8 @@ impl Iterator for S {
                                 file_id: FileId(
                                     1,
                                 ),
-                                full_range: 6290..6498,
-                                focus_range: 6355..6361,
+                                full_range: 7791..7999,
+                                focus_range: 7856..7862,
                                 name: "Future",
                                 kind: Trait,
                                 container_name: "future",
@@ -7707,8 +8270,8 @@ impl Iterator for S {
                                 file_id: FileId(
                                     1,
                                 ),
-                                full_range: 7128..7594,
-                                focus_range: 7172..7180,
+                                full_range: 8629..9095,
+                                focus_range: 8673..8681,
                                 name: "Iterator",
                                 kind: Trait,
                                 container_name: "iterator",
@@ -7744,6 +8307,66 @@ impl Iterator for S {
                     ],
                 ),
             ]
+        "#]],
+    );
+}
+
+#[test]
+fn hover_lifetime_regression_16963() {
+    check(
+        r#"
+struct Pedro$0<'a> {
+    hola: &'a str
+}
+"#,
+        expect![[r#"
+            *Pedro*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            // size = 16 (0x10), align = 8, niches = 1
+            struct Pedro<'a> {
+                hola: &str,
+            }
+            ```
+        "#]],
+    )
+}
+
+#[test]
+fn hover_impl_trait_arg_self() {
+    check(
+        r#"
+trait T<Rhs = Self> {}
+fn main(a$0: impl T) {}
+"#,
+        expect![[r#"
+            *a*
+
+            ```rust
+            a: impl T + ?Sized
+            ```
+        "#]],
+    );
+}
+
+#[test]
+fn hover_struct_default_arg_self() {
+    check(
+        r#"
+struct T<Rhs = Self> {}
+fn main(a$0: T) {}
+"#,
+        expect![[r#"
+            *a*
+
+            ```rust
+            // size = 0, align = 1
+            a: T
+            ```
         "#]],
     );
 }

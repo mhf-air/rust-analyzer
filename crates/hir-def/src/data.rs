@@ -453,8 +453,8 @@ impl ProcMacroData {
             (
                 def.name,
                 match def.kind {
-                    ProcMacroKind::CustomDerive { helpers } => Some(helpers),
-                    ProcMacroKind::FnLike | ProcMacroKind::Attr => None,
+                    ProcMacroKind::Derive { helpers } => Some(helpers),
+                    ProcMacroKind::Bang | ProcMacroKind::Attr => None,
                 },
             )
         } else {
@@ -484,10 +484,11 @@ impl ExternCrateDeclData {
         let extern_crate = &item_tree[loc.id.value];
 
         let name = extern_crate.name.clone();
+        let krate = loc.container.krate();
         let crate_id = if name == hir_expand::name![self] {
-            Some(loc.container.krate())
+            Some(krate)
         } else {
-            db.crate_def_map(loc.container.krate())
+            db.crate_def_map(krate)
                 .extern_prelude()
                 .find(|&(prelude_name, ..)| *prelude_name == name)
                 .map(|(_, (root, _))| root.krate())
@@ -509,6 +510,7 @@ pub struct ConstData {
     pub type_ref: Interned<TypeRef>,
     pub visibility: RawVisibility,
     pub rustc_allow_incoherent_impl: bool,
+    pub has_body: bool,
 }
 
 impl ConstData {
@@ -532,6 +534,7 @@ impl ConstData {
             type_ref: konst.type_ref.clone(),
             visibility,
             rustc_allow_incoherent_impl,
+            has_body: konst.has_body,
         })
     }
 }
@@ -695,9 +698,14 @@ impl<'a> AssocItemCollector<'a> {
         match item {
             AssocItem::Function(id) => {
                 let item = &item_tree[id];
-
                 let def =
                     FunctionLoc { container, id: ItemTreeId::new(tree_id, id) }.intern(self.db);
+                self.items.push((item.name.clone(), def.into()));
+            }
+            AssocItem::TypeAlias(id) => {
+                let item = &item_tree[id];
+                let def =
+                    TypeAliasLoc { container, id: ItemTreeId::new(tree_id, id) }.intern(self.db);
                 self.items.push((item.name.clone(), def.into()));
             }
             AssocItem::Const(id) => {
@@ -705,13 +713,6 @@ impl<'a> AssocItemCollector<'a> {
                 let Some(name) = item.name.clone() else { return };
                 let def = ConstLoc { container, id: ItemTreeId::new(tree_id, id) }.intern(self.db);
                 self.items.push((name, def.into()));
-            }
-            AssocItem::TypeAlias(id) => {
-                let item = &item_tree[id];
-
-                let def =
-                    TypeAliasLoc { container, id: ItemTreeId::new(tree_id, id) }.intern(self.db);
-                self.items.push((item.name.clone(), def.into()));
             }
             AssocItem::MacroCall(call) => {
                 let file_id = self.expander.current_file_id();
@@ -736,7 +737,7 @@ impl<'a> AssocItemCollector<'a> {
                     &AstIdWithPath::new(file_id, ast_id, Clone::clone(path)),
                     ctxt,
                     expand_to,
-                    self.expander.module.krate(),
+                    self.expander.krate(),
                     resolver,
                 ) {
                     Ok(Some(call_id)) => {

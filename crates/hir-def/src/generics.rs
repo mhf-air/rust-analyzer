@@ -3,13 +3,15 @@
 //! generic parameters. See also the `Generics` type and the `generics_of` query
 //! in rustc.
 
+use std::ops;
+
 use either::Either;
 use hir_expand::{
     name::{AsName, Name},
     ExpandResult,
 };
 use intern::Interned;
-use la_arena::{Arena, Idx};
+use la_arena::Arena;
 use once_cell::unsync::Lazy;
 use stdx::impl_from;
 use syntax::ast::{self, HasGenericParams, HasName, HasTypeBounds};
@@ -18,17 +20,19 @@ use triomphe::Arc;
 use crate::{
     db::DefDatabase,
     expander::Expander,
-    item_tree::{GenericsItemTreeNode, ItemTree},
+    item_tree::{AttrOwner, FileItemTreeId, GenericModItem, GenericsItemTreeNode, ItemTree},
     lower::LowerCtx,
     nameres::{DefMap, MacroSubNs},
     type_ref::{ConstRef, LifetimeRef, TypeBound, TypeRef},
-    AdtId, ConstParamId, GenericDefId, HasModule, ItemTreeLoc, LocalTypeOrConstParamId, Lookup,
-    TypeOrConstParamId, TypeParamId,
+    AdtId, ConstParamId, GenericDefId, HasModule, ItemTreeLoc, LifetimeParamId,
+    LocalLifetimeParamId, LocalTypeOrConstParamId, Lookup, TypeOrConstParamId, TypeParamId,
 };
 
 /// Data about a generic type parameter (to a function, struct, impl, ...).
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub struct TypeParamData {
+    /// [`None`] only if the type ref is an [`TypeRef::ImplTrait`]. FIXME: Might be better to just
+    /// make it always be a value, giving impl trait a special name.
     pub name: Option<Name>,
     pub default: Option<Interned<TypeRef>>,
     pub provenance: TypeParamProvenance,
@@ -102,12 +106,72 @@ impl TypeOrConstParamData {
 
 impl_from!(TypeParamData, ConstParamData for TypeOrConstParamData);
 
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub enum GenericParamData {
+    TypeParamData(TypeParamData),
+    ConstParamData(ConstParamData),
+    LifetimeParamData(LifetimeParamData),
+}
+
+impl GenericParamData {
+    pub fn name(&self) -> Option<&Name> {
+        match self {
+            GenericParamData::TypeParamData(it) => it.name.as_ref(),
+            GenericParamData::ConstParamData(it) => Some(&it.name),
+            GenericParamData::LifetimeParamData(it) => Some(&it.name),
+        }
+    }
+
+    pub fn type_param(&self) -> Option<&TypeParamData> {
+        match self {
+            GenericParamData::TypeParamData(it) => Some(it),
+            _ => None,
+        }
+    }
+
+    pub fn const_param(&self) -> Option<&ConstParamData> {
+        match self {
+            GenericParamData::ConstParamData(it) => Some(it),
+            _ => None,
+        }
+    }
+
+    pub fn lifetime_param(&self) -> Option<&LifetimeParamData> {
+        match self {
+            GenericParamData::LifetimeParamData(it) => Some(it),
+            _ => None,
+        }
+    }
+}
+
+impl_from!(TypeParamData, ConstParamData, LifetimeParamData for GenericParamData);
+
+pub enum GenericParamDataRef<'a> {
+    TypeParamData(&'a TypeParamData),
+    ConstParamData(&'a ConstParamData),
+    LifetimeParamData(&'a LifetimeParamData),
+}
+
 /// Data about the generic parameters of a function, struct, impl, etc.
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub struct GenericParams {
     pub type_or_consts: Arena<TypeOrConstParamData>,
     pub lifetimes: Arena<LifetimeParamData>,
     pub where_predicates: Box<[WherePredicate]>,
+}
+
+impl ops::Index<LocalTypeOrConstParamId> for GenericParams {
+    type Output = TypeOrConstParamData;
+    fn index(&self, index: LocalTypeOrConstParamId) -> &TypeOrConstParamData {
+        &self.type_or_consts[index]
+    }
+}
+
+impl ops::Index<LocalLifetimeParamId> for GenericParams {
+    type Output = LifetimeParamData;
+    fn index(&self, index: LocalLifetimeParamId) -> &LifetimeParamData {
+        &self.lifetimes[index]
+    }
 }
 
 /// A single predicate from a where clause, i.e. `where Type: Trait`. Combined
@@ -151,7 +215,7 @@ impl GenericParamsCollector {
         lower_ctx: &LowerCtx<'_>,
         node: &dyn HasGenericParams,
         add_param_attrs: impl FnMut(
-            Either<Idx<TypeOrConstParamData>, Idx<LifetimeParamData>>,
+            Either<LocalTypeOrConstParamId, LocalLifetimeParamId>,
             ast::GenericParam,
         ),
     ) {
@@ -179,7 +243,7 @@ impl GenericParamsCollector {
         lower_ctx: &LowerCtx<'_>,
         params: ast::GenericParamList,
         mut add_param_attrs: impl FnMut(
-            Either<Idx<TypeOrConstParamData>, Idx<LifetimeParamData>>,
+            Either<LocalTypeOrConstParamId, LocalLifetimeParamId>,
             ast::GenericParam,
         ),
     ) {
@@ -275,6 +339,7 @@ impl GenericParamsCollector {
         target: Either<TypeRef, LifetimeRef>,
     ) {
         let bound = TypeBound::from_ast(lower_ctx, bound);
+        self.fill_impl_trait_bounds(lower_ctx.take_impl_traits_bounds());
         let predicate = match (target, bound) {
             (Either::Left(type_ref), bound) => match hrtb_lifetimes {
                 Some(hrtb_lifetimes) => WherePredicate::ForLifetime {
@@ -295,7 +360,24 @@ impl GenericParamsCollector {
         self.where_predicates.push(predicate);
     }
 
-    pub(crate) fn fill_implicit_impl_trait_args(
+    fn fill_impl_trait_bounds(&mut self, impl_bounds: Vec<Vec<Interned<TypeBound>>>) {
+        for bounds in impl_bounds {
+            let param = TypeParamData {
+                name: None,
+                default: None,
+                provenance: TypeParamProvenance::ArgumentImplTrait,
+            };
+            let param_id = self.type_or_consts.alloc(param.into());
+            for bound in bounds {
+                self.where_predicates.push(WherePredicate::TypeBound {
+                    target: WherePredicateTypeTarget::TypeOrConstParam(param_id),
+                    bound,
+                });
+            }
+        }
+    }
+
+    fn fill_implicit_impl_trait_args(
         &mut self,
         db: &dyn DefDatabase,
         exp: &mut Lazy<(Arc<DefMap>, Expander), impl FnOnce() -> (Arc<DefMap>, Expander)>,
@@ -358,11 +440,27 @@ impl GenericParamsCollector {
 }
 
 impl GenericParams {
+    /// Number of Generic parameters (type_or_consts + lifetimes)
+    pub fn len(&self) -> usize {
+        self.type_or_consts.len() + self.lifetimes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Iterator of type_or_consts field
-    pub fn iter(
+    pub fn iter_type_or_consts(
         &self,
-    ) -> impl DoubleEndedIterator<Item = (Idx<TypeOrConstParamData>, &TypeOrConstParamData)> {
+    ) -> impl DoubleEndedIterator<Item = (LocalTypeOrConstParamId, &TypeOrConstParamData)> {
         self.type_or_consts.iter()
+    }
+
+    /// Iterator of lifetimes field
+    pub fn iter_lt(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (LocalLifetimeParamId, &LifetimeParamData)> {
+        self.lifetimes.iter()
     }
 
     pub(crate) fn generic_params_query(
@@ -376,56 +474,67 @@ impl GenericParams {
         let cfg_options = &cfg_options[krate].cfg_options;
 
         // Returns the generic parameters that are enabled under the current `#[cfg]` options
-        let enabled_params = |params: &Interned<GenericParams>, item_tree: &ItemTree| {
-            let enabled = |param| item_tree.attrs(db, krate, param).is_cfg_enabled(cfg_options);
+        let enabled_params =
+            |params: &Interned<GenericParams>, item_tree: &ItemTree, parent: GenericModItem| {
+                let enabled = |param| item_tree.attrs(db, krate, param).is_cfg_enabled(cfg_options);
+                let attr_owner_ct = |param| AttrOwner::TypeOrConstParamData(parent, param);
+                let attr_owner_lt = |param| AttrOwner::LifetimeParamData(parent, param);
 
-            // In the common case, no parameters will by disabled by `#[cfg]` attributes.
-            // Therefore, make a first pass to check if all parameters are enabled and, if so,
-            // clone the `Interned<GenericParams>` instead of recreating an identical copy.
-            let all_type_or_consts_enabled =
-                params.type_or_consts.iter().all(|(idx, _)| enabled(idx.into()));
-            let all_lifetimes_enabled = params.lifetimes.iter().all(|(idx, _)| enabled(idx.into()));
+                // In the common case, no parameters will by disabled by `#[cfg]` attributes.
+                // Therefore, make a first pass to check if all parameters are enabled and, if so,
+                // clone the `Interned<GenericParams>` instead of recreating an identical copy.
+                let all_type_or_consts_enabled =
+                    params.type_or_consts.iter().all(|(idx, _)| enabled(attr_owner_ct(idx)));
+                let all_lifetimes_enabled =
+                    params.lifetimes.iter().all(|(idx, _)| enabled(attr_owner_lt(idx)));
 
-            if all_type_or_consts_enabled && all_lifetimes_enabled {
-                params.clone()
-            } else {
-                Interned::new(GenericParams {
-                    type_or_consts: all_type_or_consts_enabled
-                        .then(|| params.type_or_consts.clone())
-                        .unwrap_or_else(|| {
-                            params
-                                .type_or_consts
-                                .iter()
-                                .filter(|(idx, _)| enabled((*idx).into()))
-                                .map(|(_, param)| param.clone())
-                                .collect()
-                        }),
-                    lifetimes: all_lifetimes_enabled
-                        .then(|| params.lifetimes.clone())
-                        .unwrap_or_else(|| {
-                            params
-                                .lifetimes
-                                .iter()
-                                .filter(|(idx, _)| enabled((*idx).into()))
-                                .map(|(_, param)| param.clone())
-                                .collect()
-                        }),
-                    where_predicates: params.where_predicates.clone(),
-                })
-            }
-        };
+                if all_type_or_consts_enabled && all_lifetimes_enabled {
+                    params.clone()
+                } else {
+                    Interned::new(GenericParams {
+                        type_or_consts: all_type_or_consts_enabled
+                            .then(|| params.type_or_consts.clone())
+                            .unwrap_or_else(|| {
+                                params
+                                    .type_or_consts
+                                    .iter()
+                                    .filter(|&(idx, _)| enabled(attr_owner_ct(idx)))
+                                    .map(|(_, param)| param.clone())
+                                    .collect()
+                            }),
+                        lifetimes: all_lifetimes_enabled
+                            .then(|| params.lifetimes.clone())
+                            .unwrap_or_else(|| {
+                                params
+                                    .lifetimes
+                                    .iter()
+                                    .filter(|&(idx, _)| enabled(attr_owner_lt(idx)))
+                                    .map(|(_, param)| param.clone())
+                                    .collect()
+                            }),
+                        where_predicates: params.where_predicates.clone(),
+                    })
+                }
+            };
         fn id_to_generics<Id: GenericsItemTreeNode>(
             db: &dyn DefDatabase,
             id: impl for<'db> Lookup<
                 Database<'db> = dyn DefDatabase + 'db,
                 Data = impl ItemTreeLoc<Id = Id>,
             >,
-            enabled_params: impl Fn(&Interned<GenericParams>, &ItemTree) -> Interned<GenericParams>,
-        ) -> Interned<GenericParams> {
+            enabled_params: impl Fn(
+                &Interned<GenericParams>,
+                &ItemTree,
+                GenericModItem,
+            ) -> Interned<GenericParams>,
+        ) -> Interned<GenericParams>
+        where
+            FileItemTreeId<Id>: Into<GenericModItem>,
+        {
             let id = id.lookup(db).item_tree_id();
             let tree = id.item_tree(db);
             let item = &tree[id.value];
-            enabled_params(item.generic_params(), &tree)
+            enabled_params(item.generic_params(), &tree, id.value.into())
         }
 
         match def {
@@ -434,7 +543,8 @@ impl GenericParams {
                 let tree = loc.id.item_tree(db);
                 let item = &tree[loc.id.value];
 
-                let enabled_params = enabled_params(&item.explicit_generic_params, &tree);
+                let enabled_params =
+                    enabled_params(&item.explicit_generic_params, &tree, loc.id.value.into());
 
                 let module = loc.container.module(db);
                 let func_data = db.function_data(id);
@@ -505,6 +615,20 @@ impl GenericParams {
                 })
             )
             .then(|| id)
+        })
+    }
+
+    pub fn find_lifetime_by_name(
+        &self,
+        name: &Name,
+        parent: GenericDefId,
+    ) -> Option<LifetimeParamId> {
+        self.lifetimes.iter().find_map(|(id, p)| {
+            if &p.name == name {
+                Some(LifetimeParamId { local_id: id, parent })
+            } else {
+                None
+            }
         })
     }
 }

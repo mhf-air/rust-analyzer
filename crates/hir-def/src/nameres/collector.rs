@@ -5,7 +5,7 @@
 
 use std::{cmp::Ordering, iter, mem, ops::Not};
 
-use base_db::{CrateId, Dependency, FileId};
+use base_db::{CrateId, CrateOrigin, Dependency, FileId, LangCrateOrigin};
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
 use hir_expand::{
@@ -279,7 +279,8 @@ impl DefCollector<'_> {
     fn seed_with_top_level(&mut self) {
         let _p = tracing::span!(tracing::Level::INFO, "seed_with_top_level").entered();
 
-        let file_id = self.db.crate_graph()[self.def_map.krate].root_file_id;
+        let crate_graph = self.db.crate_graph();
+        let file_id = crate_graph[self.def_map.krate].root_file_id;
         let item_tree = self.db.file_item_tree(file_id.into());
         let attrs = item_tree.top_level_attrs(self.db, self.def_map.krate);
         let crate_data = Arc::get_mut(&mut self.def_map.data).unwrap();
@@ -288,19 +289,14 @@ impl DefCollector<'_> {
             crate_data.proc_macro_loading_error = Some(e.clone());
         }
 
-        for (name, dep) in &self.deps {
-            if dep.is_prelude() {
-                crate_data
-                    .extern_prelude
-                    .insert(name.clone(), (CrateRootModuleId { krate: dep.crate_id }, None));
-            }
-        }
+        let mut process = true;
 
         // Process other crate-level attributes.
         for attr in &*attrs {
             if let Some(cfg) = attr.cfg() {
                 if self.cfg_options.check(&cfg) == Some(false) {
-                    return;
+                    process = false;
+                    break;
                 }
             }
             let Some(attr_name) = attr.path.as_ident() else { continue };
@@ -350,8 +346,37 @@ impl DefCollector<'_> {
             }
         }
 
-        crate_data.shrink_to_fit();
+        for (name, dep) in &self.deps {
+            if dep.is_prelude() {
+                // This is a bit confusing but the gist is that `no_core` and `no_std` remove the
+                // sysroot dependence on `core` and `std` respectively. Our `CrateGraph` is eagerly
+                // constructed with them in place no matter what though, since at that point we
+                // don't do pre-configured attribute resolution yet.
+                // So here check if we are no_core / no_std and we are trying to add the
+                // corresponding dep from the sysroot
+                let skip = match crate_graph[dep.crate_id].origin {
+                    CrateOrigin::Lang(LangCrateOrigin::Core) => {
+                        crate_data.no_core && dep.is_sysroot()
+                    }
+                    CrateOrigin::Lang(LangCrateOrigin::Std) => {
+                        crate_data.no_std && dep.is_sysroot()
+                    }
+                    _ => false,
+                };
+                if skip {
+                    continue;
+                }
+                crate_data
+                    .extern_prelude
+                    .insert(name.clone(), (CrateRootModuleId { krate: dep.crate_id }, None));
+            }
+        }
+
         self.inject_prelude();
+
+        if !process {
+            return;
+        }
 
         ModCollector {
             def_collector: self,
@@ -362,6 +387,7 @@ impl DefCollector<'_> {
             mod_dir: ModDir::root(),
         }
         .collect_in_top_module(item_tree.top_level_items());
+        Arc::get_mut(&mut self.def_map.data).unwrap().shrink_to_fit();
     }
 
     fn seed_with_inner(&mut self, tree_id: TreeId) {
@@ -519,23 +545,19 @@ impl DefCollector<'_> {
 
         let krate = if self.def_map.data.no_std {
             name![core]
+        } else if self.def_map.extern_prelude().any(|(name, _)| *name == name![std]) {
+            name![std]
         } else {
-            let std = name![std];
-            if self.def_map.extern_prelude().any(|(name, _)| *name == std) {
-                std
-            } else {
-                // If `std` does not exist for some reason, fall back to core. This mostly helps
-                // keep r-a's own tests minimal.
-                name![core]
-            }
+            // If `std` does not exist for some reason, fall back to core. This mostly helps
+            // keep r-a's own tests minimal.
+            name![core]
         };
 
         let edition = match self.def_map.data.edition {
             Edition::Edition2015 => name![rust_2015],
             Edition::Edition2018 => name![rust_2018],
             Edition::Edition2021 => name![rust_2021],
-            // FIXME: update this when rust_2024 exists
-            Edition::Edition2024 => name![rust_2021],
+            Edition::Edition2024 => name![rust_2024],
         };
 
         let path_kind = match self.def_map.data.edition {
@@ -604,7 +626,7 @@ impl DefCollector<'_> {
         .intern(self.db);
         self.define_proc_macro(def.name.clone(), proc_macro_id);
         let crate_data = Arc::get_mut(&mut self.def_map.data).unwrap();
-        if let ProcMacroKind::CustomDerive { helpers } = def.kind {
+        if let ProcMacroKind::Derive { helpers } = def.kind {
             crate_data.exported_derives.insert(self.db.macro_def(proc_macro_id.into()), helpers);
         }
         crate_data.fn_proc_macro_mapping.insert(fn_id, proc_macro_id);
@@ -1918,7 +1940,7 @@ impl ModCollector<'_, '_> {
     }
 
     fn collect_module(&mut self, module_id: FileItemTreeId<Mod>, attrs: &Attrs) {
-        let path_attr = attrs.by_key("path").string_value();
+        let path_attr = attrs.by_key("path").string_value_unescape();
         let is_macro_use = attrs.by_key("macro_use").exists();
         let module = &self.item_tree[module_id];
         match &module.kind {
@@ -1932,7 +1954,8 @@ impl ModCollector<'_, '_> {
                     module_id,
                 );
 
-                let Some(mod_dir) = self.mod_dir.descend_into_definition(&module.name, path_attr)
+                let Some(mod_dir) =
+                    self.mod_dir.descend_into_definition(&module.name, path_attr.as_deref())
                 else {
                     return;
                 };
@@ -1953,8 +1976,12 @@ impl ModCollector<'_, '_> {
             ModKind::Outline => {
                 let ast_id = AstId::new(self.file_id(), module.ast_id);
                 let db = self.def_collector.db;
-                match self.mod_dir.resolve_declaration(db, self.file_id(), &module.name, path_attr)
-                {
+                match self.mod_dir.resolve_declaration(
+                    db,
+                    self.file_id(),
+                    &module.name,
+                    path_attr.as_deref(),
+                ) {
                     Ok((file_id, is_mod_rs, mod_dir)) => {
                         let item_tree = db.file_item_tree(file_id.into());
                         let krate = self.def_collector.def_map.krate;

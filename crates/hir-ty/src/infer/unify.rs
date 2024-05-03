@@ -16,12 +16,12 @@ use triomphe::Arc;
 
 use super::{InferOk, InferResult, InferenceContext, TypeError};
 use crate::{
-    consteval::unknown_const, db::HirDatabase, fold_tys_and_consts, static_lifetime,
-    to_chalk_trait_id, traits::FnTrait, AliasEq, AliasTy, BoundVar, Canonical, Const, ConstValue,
-    DebruijnIndex, DomainGoal, GenericArg, GenericArgData, Goal, GoalData, Guidance, InEnvironment,
-    InferenceVar, Interner, Lifetime, OpaqueTyId, ParamKind, ProjectionTy, ProjectionTyExt, Scalar,
-    Solution, Substitution, TraitEnvironment, Ty, TyBuilder, TyExt, TyKind, VariableKind,
-    WhereClause,
+    consteval::unknown_const, db::HirDatabase, error_lifetime, fold_generic_args,
+    fold_tys_and_consts, to_chalk_trait_id, traits::FnTrait, AliasEq, AliasTy, BoundVar, Canonical,
+    Const, ConstValue, DebruijnIndex, DomainGoal, GenericArg, GenericArgData, Goal, GoalData,
+    Guidance, InEnvironment, InferenceVar, Interner, Lifetime, OpaqueTyId, ParamKind, ProjectionTy,
+    ProjectionTyExt, Scalar, Solution, Substitution, TraitEnvironment, Ty, TyBuilder, TyExt,
+    TyKind, VariableKind, WhereClause,
 };
 
 impl InferenceContext<'_> {
@@ -43,40 +43,21 @@ impl InferenceContext<'_> {
         let obligations = pending_obligations
             .iter()
             .filter_map(|obligation| match obligation.value.value.goal.data(Interner) {
-                GoalData::DomainGoal(DomainGoal::Holds(
-                    clause @ WhereClause::AliasEq(AliasEq {
-                        alias: AliasTy::Projection(projection),
-                        ..
-                    }),
-                )) => {
-                    let projection_self = projection.self_type_parameter(self.db);
-                    let uncanonical = chalk_ir::Substitute::apply(
-                        &obligation.free_vars,
-                        projection_self,
-                        Interner,
-                    );
-                    if matches!(
-                        self.resolve_ty_shallow(&uncanonical).kind(Interner),
-                        TyKind::InferenceVar(iv, TyVariableKind::General) if *iv == root,
-                    ) {
-                        Some(chalk_ir::Substitute::apply(
-                            &obligation.free_vars,
-                            clause.clone(),
-                            Interner,
-                        ))
-                    } else {
-                        None
-                    }
-                }
-                GoalData::DomainGoal(DomainGoal::Holds(
-                    clause @ WhereClause::Implemented(trait_ref),
-                )) => {
-                    let trait_ref_self = trait_ref.self_type_parameter(Interner);
-                    let uncanonical = chalk_ir::Substitute::apply(
-                        &obligation.free_vars,
-                        trait_ref_self,
-                        Interner,
-                    );
+                GoalData::DomainGoal(DomainGoal::Holds(clause)) => {
+                    let ty = match clause {
+                        WhereClause::AliasEq(AliasEq {
+                            alias: AliasTy::Projection(projection),
+                            ..
+                        }) => projection.self_type_parameter(self.db),
+                        WhereClause::Implemented(trait_ref) => {
+                            trait_ref.self_type_parameter(Interner)
+                        }
+                        WhereClause::TypeOutlives(to) => to.ty.clone(),
+                        _ => return None,
+                    };
+
+                    let uncanonical =
+                        chalk_ir::Substitute::apply(&obligation.free_vars, ty, Interner);
                     if matches!(
                         self.resolve_ty_shallow(&uncanonical).kind(Interner),
                         TyKind::InferenceVar(iv, TyVariableKind::General) if *iv == root,
@@ -121,8 +102,9 @@ impl<T: HasInterner<Interner = Interner>> Canonicalized<T> {
                 VariableKind::Ty(TyVariableKind::General) => ctx.new_type_var().cast(Interner),
                 VariableKind::Ty(TyVariableKind::Integer) => ctx.new_integer_var().cast(Interner),
                 VariableKind::Ty(TyVariableKind::Float) => ctx.new_float_var().cast(Interner),
-                // Chalk can sometimes return new lifetime variables. We just use the static lifetime everywhere
-                VariableKind::Lifetime => static_lifetime().cast(Interner),
+                // Chalk can sometimes return new lifetime variables. We just replace them by errors
+                // for now.
+                VariableKind::Lifetime => error_lifetime().cast(Interner),
                 VariableKind::Const(ty) => ctx.new_const_var(ty.clone()).cast(Interner),
             }),
         );
@@ -807,6 +789,7 @@ impl<'a> InferenceTable<'a> {
             .fill(|it| {
                 let arg = match it {
                     ParamKind::Type => self.new_type_var(),
+                    ParamKind::Lifetime => unreachable!("Tuple with lifetime parameter"),
                     ParamKind::Const(_) => unreachable!("Tuple with const parameter"),
                 };
                 arg_tys.push(arg.clone());
@@ -861,11 +844,16 @@ impl<'a> InferenceTable<'a> {
     where
         T: HasInterner<Interner = Interner> + TypeFoldable<Interner>,
     {
-        fold_tys_and_consts(
+        fold_generic_args(
             ty,
-            |it, _| match it {
-                Either::Left(ty) => Either::Left(self.insert_type_vars_shallow(ty)),
-                Either::Right(c) => Either::Right(self.insert_const_vars_shallow(c)),
+            |arg, _| match arg {
+                GenericArgData::Ty(ty) => GenericArgData::Ty(self.insert_type_vars_shallow(ty)),
+                // FIXME: insert lifetime vars once LifetimeData::InferenceVar
+                // and specific error variant for lifetimes start being constructed
+                GenericArgData::Lifetime(lt) => GenericArgData::Lifetime(lt),
+                GenericArgData::Const(c) => {
+                    GenericArgData::Const(self.insert_const_vars_shallow(c))
+                }
             },
             DebruijnIndex::INNERMOST,
         )
@@ -1014,11 +1002,11 @@ mod resolve {
             _var: InferenceVar,
             _outer_binder: DebruijnIndex,
         ) -> Lifetime {
-            // fall back all lifetimes to 'static -- currently we don't deal
+            // fall back all lifetimes to 'error -- currently we don't deal
             // with any lifetimes, but we can sometimes get some lifetime
             // variables through Chalk's unification, and this at least makes
             // sure we don't leak them outside of inference
-            crate::static_lifetime()
+            crate::error_lifetime()
         }
     }
 }
