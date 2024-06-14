@@ -64,8 +64,10 @@ impl WorkspaceBuildScripts {
         config: &CargoConfig,
         allowed_features: &FxHashSet<String>,
         manifest_path: &ManifestPath,
-        sysroot: Option<&Sysroot>,
+        toolchain: Option<&Version>,
+        sysroot: &Sysroot,
     ) -> io::Result<Command> {
+        const RUST_1_75: Version = Version::new(1, 75, 0);
         let mut cmd = match config.run_build_script_command.as_deref() {
             Some([program, args @ ..]) => {
                 let mut cmd = Command::new(program);
@@ -73,7 +75,7 @@ impl WorkspaceBuildScripts {
                 cmd
             }
             _ => {
-                let mut cmd = Sysroot::tool(sysroot, Tool::Cargo);
+                let mut cmd = sysroot.tool(Tool::Cargo);
 
                 cmd.args(["check", "--quiet", "--workspace", "--message-format=json"]);
                 cmd.args(&config.extra_args);
@@ -120,6 +122,10 @@ impl WorkspaceBuildScripts {
                     cmd.arg("-Zscript");
                 }
 
+                if toolchain.map_or(false, |it| *it >= RUST_1_75) {
+                    cmd.arg("--keep-going");
+                }
+
                 cmd
             }
         };
@@ -142,11 +148,9 @@ impl WorkspaceBuildScripts {
         config: &CargoConfig,
         workspace: &CargoWorkspace,
         progress: &dyn Fn(String),
-        toolchain: &Option<Version>,
-        sysroot: Option<&Sysroot>,
+        toolchain: Option<&Version>,
+        sysroot: &Sysroot,
     ) -> io::Result<WorkspaceBuildScripts> {
-        const RUST_1_75: Version = Version::new(1, 75, 0);
-
         let current_dir = match &config.invocation_location {
             InvocationLocation::Root(root) if config.run_build_script_command.is_some() => {
                 root.as_path()
@@ -156,11 +160,13 @@ impl WorkspaceBuildScripts {
         .as_ref();
 
         let allowed_features = workspace.workspace_features();
-        let mut cmd =
-            Self::build_command(config, &allowed_features, workspace.manifest_path(), sysroot)?;
-        if toolchain.as_ref().map_or(false, |it| *it >= RUST_1_75) {
-            cmd.args(["--keep-going"]);
-        }
+        let cmd = Self::build_command(
+            config,
+            &allowed_features,
+            workspace.manifest_path(),
+            toolchain,
+            sysroot,
+        )?;
         Self::run_per_ws(cmd, workspace, current_dir, progress)
     }
 
@@ -189,6 +195,7 @@ impl WorkspaceBuildScripts {
             // This is not gonna be used anyways, so just construct a dummy here
             &ManifestPath::try_from(workspace_root.clone()).unwrap(),
             None,
+            &Sysroot::empty(),
         )?;
         // NB: Cargo.toml could have been modified between `cargo metadata` and
         // `cargo check`. We shouldn't assume that package ids we see here are
@@ -405,7 +412,7 @@ impl WorkspaceBuildScripts {
         rustc: &CargoWorkspace,
         current_dir: &AbsPath,
         extra_env: &FxHashMap<String, String>,
-        sysroot: Option<&Sysroot>,
+        sysroot: &Sysroot,
     ) -> Self {
         let mut bs = WorkspaceBuildScripts::default();
         for p in rustc.packages() {
@@ -413,7 +420,7 @@ impl WorkspaceBuildScripts {
         }
         let res = (|| {
             let target_libdir = (|| {
-                let mut cargo_config = Sysroot::tool(sysroot, Tool::Cargo);
+                let mut cargo_config = sysroot.tool(Tool::Cargo);
                 cargo_config.envs(extra_env);
                 cargo_config
                     .current_dir(current_dir)
@@ -422,7 +429,7 @@ impl WorkspaceBuildScripts {
                 if let Ok(it) = utf8_stdout(cargo_config) {
                     return Ok(it);
                 }
-                let mut cmd = Sysroot::tool(sysroot, Tool::Rustc);
+                let mut cmd = sysroot.tool(Tool::Rustc);
                 cmd.envs(extra_env);
                 cmd.args(["--print", "target-libdir"]);
                 utf8_stdout(cmd)

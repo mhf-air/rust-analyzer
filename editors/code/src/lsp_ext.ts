@@ -223,16 +223,27 @@ export type OpenCargoTomlParams = {
 export type Runnable = {
     label: string;
     location?: lc.LocationLink;
-    kind: "cargo";
-    args: {
-        workspaceRoot?: string;
-        cargoArgs: string[];
-        cargoExtraArgs: string[];
-        executableArgs: string[];
-        expectTest?: boolean;
-        overrideCargo?: string;
-    };
+    kind: "cargo" | "shell";
+    args: CargoRunnableArgs | ShellRunnableArgs;
 };
+
+export type ShellRunnableArgs = {
+    kind: string;
+    program: string;
+    args: string[];
+    cwd: string;
+};
+
+export type CargoRunnableArgs = {
+    workspaceRoot?: string;
+    cargoArgs: string[];
+    cwd: string;
+    cargoExtraArgs: string[];
+    executableArgs: string[];
+    expectTest?: boolean;
+    overrideCargo?: string;
+};
+
 export type RunnablesParams = {
     textDocument: lc.TextDocumentIdentifier;
     position: lc.Position | null;
@@ -241,7 +252,6 @@ export type ServerStatusParams = {
     health: "ok" | "warning" | "error";
     quiescent: boolean;
     message?: string;
-    workspaceInfo?: string;
 };
 export type SsrParams = {
     query: string;

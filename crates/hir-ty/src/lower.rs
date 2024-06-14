@@ -416,9 +416,9 @@ impl<'a> TyLoweringContext<'a> {
                 };
                 let ty = {
                     let macro_call = macro_call.to_node(self.db.upcast());
-                    let resolver = |path| {
+                    let resolver = |path: &_| {
                         self.resolver
-                            .resolve_path_as_macro(self.db.upcast(), &path, Some(MacroSubNs::Bang))
+                            .resolve_path_as_macro(self.db.upcast(), path, Some(MacroSubNs::Bang))
                             .map(|(it, _)| it)
                     };
                     match expander.enter_expand::<ast::Type>(self.db.upcast(), macro_call, resolver)
@@ -1311,11 +1311,10 @@ impl<'a> TyLoweringContext<'a> {
                 bounds,
                 lifetime: match lifetime {
                     Some(it) => match it.bound_var(Interner) {
-                        Some(bound_var) => LifetimeData::BoundVar(BoundVar::new(
-                            DebruijnIndex::INNERMOST,
-                            bound_var.index,
-                        ))
-                        .intern(Interner),
+                        Some(bound_var) => bound_var
+                            .shifted_out_to(DebruijnIndex::new(2))
+                            .map(|bound_var| LifetimeData::BoundVar(bound_var).intern(Interner))
+                            .unwrap_or(it),
                         None => it,
                     },
                     None => static_lifetime(),

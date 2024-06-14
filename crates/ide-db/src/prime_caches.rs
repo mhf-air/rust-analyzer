@@ -29,10 +29,10 @@ pub struct ParallelPrimeCachesProgress {
 
 pub fn parallel_prime_caches(
     db: &RootDatabase,
-    num_worker_threads: u8,
+    num_worker_threads: usize,
     cb: &(dyn Fn(ParallelPrimeCachesProgress) + Sync),
 ) {
-    let _p = tracing::span!(tracing::Level::INFO, "parallel_prime_caches").entered();
+    let _p = tracing::info_span!("parallel_prime_caches").entered();
 
     let graph = db.crate_graph();
     let mut crates_to_prime = {

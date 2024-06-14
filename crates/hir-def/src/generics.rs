@@ -403,12 +403,12 @@ impl GenericParamsCollector {
                 let (def_map, expander) = &mut **exp;
 
                 let module = expander.module.local_id;
-                let resolver = |path| {
+                let resolver = |path: &_| {
                     def_map
                         .resolve_path(
                             db,
                             module,
-                            &path,
+                            path,
                             crate::item_scope::BuiltinShadowMode::Other,
                             Some(MacroSubNs::Bang),
                         )
@@ -467,7 +467,7 @@ impl GenericParams {
         db: &dyn DefDatabase,
         def: GenericDefId,
     ) -> Interned<GenericParams> {
-        let _p = tracing::span!(tracing::Level::INFO, "generic_params_query").entered();
+        let _p = tracing::info_span!("generic_params_query").entered();
 
         let krate = def.module(db).krate;
         let cfg_options = db.crate_graph();

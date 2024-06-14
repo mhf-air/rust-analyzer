@@ -12,9 +12,6 @@ use std::sync::OnceLock;
 
 use rustc_hash::FxHashMap;
 
-/// Ignored attribute namespaces used by tools.
-pub const TOOL_MODULES: &[&str] = &["rustfmt", "clippy"];
-
 pub struct BuiltinAttribute {
     pub name: &'static str,
     pub template: AttributeTemplate,
@@ -38,11 +35,6 @@ pub fn find_builtin_attr_idx(name: &str) -> Option<usize> {
         .get(name)
         .copied()
 }
-
-// impl AttributeTemplate {
-//     const DEFAULT: AttributeTemplate =
-//         AttributeTemplate { word: false, list: None, name_value_str: None };
-// }
 
 /// A convenience macro for constructing attribute templates.
 /// E.g., `template!(Word, List: "description")` means that the attribute
@@ -207,7 +199,6 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
     ),
 
     // Entry point:
-    gated!(unix_sigpipe, Normal, template!(Word, NameValueStr: "inherit|sig_ign|sig_dfl"), ErrorFollowing, experimental!(unix_sigpipe)),
     ungated!(start, Normal, template!(Word), WarnFollowing),
     ungated!(no_start, CrateLevel, template!(Word), WarnFollowing),
     ungated!(no_main, CrateLevel, template!(Word), WarnFollowing),
@@ -631,6 +622,10 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
     rustc_attr!(
         rustc_safe_intrinsic, Normal, template!(Word), WarnFollowing,
         "the `#[rustc_safe_intrinsic]` attribute is used internally to mark intrinsics as safe"
+    ),
+    rustc_attr!(
+        rustc_deprecated_safe_2024, Normal, template!(Word), WarnFollowing,
+        "the `#[rustc_safe_intrinsic]` marks functions as unsafe in Rust 2024",
     ),
 
     // ==========================================================================

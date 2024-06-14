@@ -9,11 +9,11 @@ import {
     applySnippetTextEdits,
     type SnippetTextDocumentEdit,
 } from "./snippets";
-import { spawnSync } from "child_process";
-import { type RunnableQuickPick, selectRunnable, createTask, createArgs } from "./run";
+import { type RunnableQuickPick, selectRunnable, createTask, createCargoArgs } from "./run";
 import { AstInspector } from "./ast_inspector";
 import {
     isRustDocument,
+    isCargoRunnableArgs,
     isCargoTomlDocument,
     sleep,
     isRustEditor,
@@ -415,10 +415,9 @@ export function serverVersion(ctx: CtxInit): Cmd {
             void vscode.window.showWarningMessage(`rust-analyzer server is not running`);
             return;
         }
-        const { stdout } = spawnSync(ctx.serverPath, ["--version"], { encoding: "utf8" });
-        const versionString = stdout.slice(`rust-analyzer `.length).trim();
-
-        void vscode.window.showInformationMessage(`rust-analyzer version: ${versionString}`);
+        void vscode.window.showInformationMessage(
+            `rust-analyzer version: ${ctx.serverVersion} [${ctx.serverPath}]`,
+        );
     };
 }
 
@@ -1156,8 +1155,8 @@ export function copyRunCommandLine(ctx: CtxInit) {
     let prevRunnable: RunnableQuickPick | undefined;
     return async () => {
         const item = await selectRunnable(ctx, prevRunnable);
-        if (!item) return;
-        const args = createArgs(item.runnable);
+        if (!item || !isCargoRunnableArgs(item.runnable.args)) return;
+        const args = createCargoArgs(item.runnable.args);
         const commandLine = ["cargo", ...args].join(" ");
         await vscode.env.clipboard.writeText(commandLine);
         await vscode.window.showInformationMessage("Cargo invocation copied to the clipboard.");
