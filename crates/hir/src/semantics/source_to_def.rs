@@ -26,19 +26,19 @@
 //!
 //! The actual algorithm to resolve syntax to def is curious in two aspects:
 //!
-//!     * It is recursive
-//!     * It uses the inverse algorithm (what is the syntax for this def?)
+//! * It is recursive
+//! * It uses the inverse algorithm (what is the syntax for this def?)
 //!
 //! Specifically, the algorithm goes like this:
 //!
-//!     1. Find the syntactic container for the syntax. For example, field's
-//!        container is the struct, and structs container is a module.
-//!     2. Recursively get the def corresponding to container.
-//!     3. Ask the container def for all child defs. These child defs contain
-//!        the answer and answer's siblings.
-//!     4. For each child def, ask for it's source.
-//!     5. The child def whose source is the syntax node we've started with
-//!        is the answer.
+//! 1. Find the syntactic container for the syntax. For example, field's
+//!    container is the struct, and structs container is a module.
+//! 2. Recursively get the def corresponding to container.
+//! 3. Ask the container def for all child defs. These child defs contain
+//!    the answer and answer's siblings.
+//! 4. For each child def, ask for it's source.
+//! 5. The child def whose source is the syntax node we've started with
+//!    is the answer.
 //!
 //! It's interesting that both Roslyn and Kotlin contain very similar code
 //! shape.
@@ -85,7 +85,6 @@
 //! active crate for a given position, and then provide an API to resolve all
 //! syntax nodes against this specific crate.
 
-use base_db::FileId;
 use either::Either;
 use hir_def::{
     child_by_source::ChildBySource,
@@ -103,7 +102,7 @@ use hir_expand::{
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use span::MacroFileId;
+use span::{FileId, MacroFileId};
 use stdx::impl_from;
 use syntax::{
     ast::{self, HasName},
@@ -162,7 +161,7 @@ impl SourceToDefCtx<'_, '_> {
             }
             None => {
                 let file_id = src.file_id.original_file(self.db.upcast());
-                self.file_to_def(file_id).first().copied()
+                self.file_to_def(file_id.file_id()).first().copied()
             }
         }?;
 
@@ -175,7 +174,7 @@ impl SourceToDefCtx<'_, '_> {
     pub(super) fn source_file_to_def(&mut self, src: InFile<&ast::SourceFile>) -> Option<ModuleId> {
         let _p = tracing::info_span!("source_file_to_def").entered();
         let file_id = src.file_id.original_file(self.db.upcast());
-        self.file_to_def(file_id).first().copied()
+        self.file_to_def(file_id.file_id()).first().copied()
     }
 
     pub(super) fn trait_to_def(&mut self, src: InFile<&ast::Trait>) -> Option<TraitId> {
@@ -412,7 +411,10 @@ impl SourceToDefCtx<'_, '_> {
             return Some(def);
         }
 
-        let def = self.file_to_def(src.file_id.original_file(self.db.upcast())).first().copied()?;
+        let def = self
+            .file_to_def(src.file_id.original_file(self.db.upcast()).file_id())
+            .first()
+            .copied()?;
         Some(def.into())
     }
 
@@ -434,7 +436,7 @@ impl SourceToDefCtx<'_, '_> {
                     .entry(macro_file)
                     .or_insert_with(|| macro_file.expansion_info(this.db.upcast()));
 
-                expansion_info.call_node().map(|node| node?.parent()).transpose()
+                expansion_info.arg().map(|node| node?.parent()).transpose()
             }
         };
         let mut node = node.cloned();

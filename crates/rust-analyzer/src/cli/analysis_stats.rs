@@ -25,7 +25,7 @@ use ide_db::{
         salsa::{self, debug::DebugQueryTable, ParallelDatabase},
         SourceDatabase, SourceDatabaseExt,
     },
-    LineIndexDatabase, SnippetCap,
+    EditionedFileId, LineIndexDatabase, SnippetCap,
 };
 use itertools::Itertools;
 use load_cargo::{load_workspace, LoadCargoConfig, ProcMacroServerChoice};
@@ -35,7 +35,7 @@ use project_model::{CargoConfig, ProjectManifest, ProjectWorkspace, RustLibSourc
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{AstNode, SyntaxNode};
-use vfs::{AbsPathBuf, FileId, Vfs, VfsPath};
+use vfs::{AbsPathBuf, Vfs, VfsPath};
 
 use crate::cli::{
     flags::{self, OutputFormat},
@@ -120,7 +120,7 @@ impl flags::AnalysisStats {
                 for file_id in source_root.iter() {
                     if let Some(p) = source_root.path_for_file(&file_id) {
                         if let Some((_, Some("rs"))) = p.name_and_extension() {
-                            db.file_item_tree(file_id.into());
+                            db.file_item_tree(EditionedFileId::current_edition(file_id).into());
                             num_item_trees += 1;
                         }
                     }
@@ -140,7 +140,7 @@ impl flags::AnalysisStats {
             let module = krate.root_module();
             let file_id = module.definition_source_file_id(db);
             let file_id = file_id.original_file(db);
-            let source_root = db.file_source_root(file_id);
+            let source_root = db.file_source_root(file_id.into());
             let source_root = db.source_root(source_root);
             if !source_root.is_library || self.with_deps {
                 num_crates += 1;
@@ -250,10 +250,6 @@ impl flags::AnalysisStats {
         }
         report_metric("total memory", total_span.memory.allocated.megabytes() as u64, "MB");
 
-        if env::var("RA_COUNT").is_ok() {
-            eprintln!("{}", profile::countme::get_all());
-        }
-
         if self.source_stats {
             let mut total_file_size = Bytes::default();
             for e in ide_db::base_db::ParseQuery.in_db(db).entries::<Vec<_>>() {
@@ -336,7 +332,7 @@ impl flags::AnalysisStats {
         ws: &ProjectWorkspace,
         db: &RootDatabase,
         vfs: &Vfs,
-        mut file_ids: Vec<FileId>,
+        mut file_ids: Vec<EditionedFileId>,
         verbosity: Verbosity,
     ) {
         let cargo_config = CargoConfig {
@@ -371,11 +367,10 @@ impl flags::AnalysisStats {
 
         for &file_id in &file_ids {
             let sema = hir::Semantics::new(db);
-            let _ = db.parse(file_id);
 
-            let parse = sema.parse(file_id);
-            let file_txt = db.file_text(file_id);
-            let path = vfs.file_path(file_id).as_path().unwrap();
+            let parse = sema.parse_guess_edition(file_id.into());
+            let file_txt = db.file_text(file_id.into());
+            let path = vfs.file_path(file_id.into()).as_path().unwrap();
 
             for node in parse.syntax().descendants() {
                 let expr = match syntax::ast::Expr::cast(node.clone()) {
@@ -402,7 +397,7 @@ impl flags::AnalysisStats {
 
                 let range = sema.original_range(expected_tail.syntax()).range;
                 let original_text: String = db
-                    .file_text(file_id)
+                    .file_text(file_id.into())
                     .chars()
                     .skip(usize::from(range.start()))
                     .take(usize::from(range.end()) - usize::from(range.start()))
@@ -427,7 +422,7 @@ impl flags::AnalysisStats {
                 if found_terms.is_empty() {
                     acc.tail_expr_no_term += 1;
                     acc.total_tail_exprs += 1;
-                    // println!("\n{}\n", &original_text);
+                    // println!("\n{original_text}\n");
                     continue;
                 };
 
@@ -443,7 +438,11 @@ impl flags::AnalysisStats {
                         .gen_source_code(
                             &scope,
                             &mut formatter,
-                            ImportPathConfig { prefer_no_std: false, prefer_prelude: true },
+                            ImportPathConfig {
+                                prefer_no_std: false,
+                                prefer_prelude: true,
+                                prefer_absolute: false,
+                            },
                         )
                         .unwrap();
                     syntax_hit_found |= trim(&original_text) == trim(&generated);
@@ -621,7 +620,7 @@ impl flags::AnalysisStats {
                 module
                     .krate()
                     .display_name(db)
-                    .map(|it| it.canonical_name().to_owned())
+                    .map(|it| it.canonical_name().as_str().to_owned())
                     .into_iter()
                     .chain(
                         module
@@ -650,8 +649,8 @@ impl flags::AnalysisStats {
                     };
                     if let Some(src) = source {
                         let original_file = src.file_id.original_file(db);
-                        let path = vfs.file_path(original_file);
-                        let syntax_range = src.value.text_range();
+                        let path = vfs.file_path(original_file.into());
+                        let syntax_range = src.text_range();
                         format!("processing: {} ({} {:?})", full_name(), path, syntax_range)
                     } else {
                         format!("processing: {}", full_name())
@@ -664,8 +663,10 @@ impl flags::AnalysisStats {
                 bar.println(msg());
             }
             bar.set_message(msg);
-            let (body, sm) = db.body_with_source_map(body_id.into());
+            let body = db.body(body_id.into());
             let inference_result = db.infer(body_id.into());
+            // This query is LRU'd, so actually calling it will skew the timing results.
+            let sm = || db.body_with_source_map(body_id.into()).1;
 
             // region:expressions
             let (previous_exprs, previous_unknown, previous_partially_unknown) =
@@ -676,7 +677,8 @@ impl flags::AnalysisStats {
                 let unknown_or_partial = if ty.is_unknown() {
                     num_exprs_unknown += 1;
                     if verbosity.is_spammy() {
-                        if let Some((path, start, end)) = expr_syntax_range(db, vfs, &sm, expr_id) {
+                        if let Some((path, start, end)) = expr_syntax_range(db, vfs, &sm(), expr_id)
+                        {
                             bar.println(format!(
                                 "{} {}:{}-{}:{}: Unknown type",
                                 path,
@@ -700,7 +702,7 @@ impl flags::AnalysisStats {
                 };
                 if self.only.is_some() && verbosity.is_spammy() {
                     // in super-verbose mode for just one function, we print every single expression
-                    if let Some((_, start, end)) = expr_syntax_range(db, vfs, &sm, expr_id) {
+                    if let Some((_, start, end)) = expr_syntax_range(db, vfs, &sm(), expr_id) {
                         bar.println(format!(
                             "{}:{}-{}:{}: {}",
                             start.line + 1,
@@ -716,14 +718,15 @@ impl flags::AnalysisStats {
                 if unknown_or_partial && self.output == Some(OutputFormat::Csv) {
                     println!(
                         r#"{},type,"{}""#,
-                        location_csv_expr(db, vfs, &sm, expr_id),
+                        location_csv_expr(db, vfs, &sm(), expr_id),
                         ty.display(db)
                     );
                 }
                 if let Some(mismatch) = inference_result.type_mismatch_for_expr(expr_id) {
                     num_expr_type_mismatches += 1;
                     if verbosity.is_verbose() {
-                        if let Some((path, start, end)) = expr_syntax_range(db, vfs, &sm, expr_id) {
+                        if let Some((path, start, end)) = expr_syntax_range(db, vfs, &sm(), expr_id)
+                        {
                             bar.println(format!(
                                 "{} {}:{}-{}:{}: Expected {}, got {}",
                                 path,
@@ -746,7 +749,7 @@ impl flags::AnalysisStats {
                     if self.output == Some(OutputFormat::Csv) {
                         println!(
                             r#"{},mismatch,"{}","{}""#,
-                            location_csv_expr(db, vfs, &sm, expr_id),
+                            location_csv_expr(db, vfs, &sm(), expr_id),
                             mismatch.expected.display(db),
                             mismatch.actual.display(db)
                         );
@@ -773,7 +776,7 @@ impl flags::AnalysisStats {
                 let unknown_or_partial = if ty.is_unknown() {
                     num_pats_unknown += 1;
                     if verbosity.is_spammy() {
-                        if let Some((path, start, end)) = pat_syntax_range(db, vfs, &sm, pat_id) {
+                        if let Some((path, start, end)) = pat_syntax_range(db, vfs, &sm(), pat_id) {
                             bar.println(format!(
                                 "{} {}:{}-{}:{}: Unknown type",
                                 path,
@@ -797,7 +800,7 @@ impl flags::AnalysisStats {
                 };
                 if self.only.is_some() && verbosity.is_spammy() {
                     // in super-verbose mode for just one function, we print every single pattern
-                    if let Some((_, start, end)) = pat_syntax_range(db, vfs, &sm, pat_id) {
+                    if let Some((_, start, end)) = pat_syntax_range(db, vfs, &sm(), pat_id) {
                         bar.println(format!(
                             "{}:{}-{}:{}: {}",
                             start.line + 1,
@@ -813,14 +816,14 @@ impl flags::AnalysisStats {
                 if unknown_or_partial && self.output == Some(OutputFormat::Csv) {
                     println!(
                         r#"{},type,"{}""#,
-                        location_csv_pat(db, vfs, &sm, pat_id),
+                        location_csv_pat(db, vfs, &sm(), pat_id),
                         ty.display(db)
                     );
                 }
                 if let Some(mismatch) = inference_result.type_mismatch_for_pat(pat_id) {
                     num_pat_type_mismatches += 1;
                     if verbosity.is_verbose() {
-                        if let Some((path, start, end)) = pat_syntax_range(db, vfs, &sm, pat_id) {
+                        if let Some((path, start, end)) = pat_syntax_range(db, vfs, &sm(), pat_id) {
                             bar.println(format!(
                                 "{} {}:{}-{}:{}: Expected {}, got {}",
                                 path,
@@ -843,7 +846,7 @@ impl flags::AnalysisStats {
                     if self.output == Some(OutputFormat::Csv) {
                         println!(
                             r#"{},mismatch,"{}","{}""#,
-                            location_csv_pat(db, vfs, &sm, pat_id),
+                            location_csv_pat(db, vfs, &sm(), pat_id),
                             mismatch.expected.display(db),
                             mismatch.actual.display(db)
                         );
@@ -912,7 +915,7 @@ impl flags::AnalysisStats {
                 module
                     .krate()
                     .display_name(db)
-                    .map(|it| it.canonical_name().to_owned())
+                    .map(|it| it.canonical_name().as_str().to_owned())
                     .into_iter()
                     .chain(
                         module
@@ -944,8 +947,8 @@ impl flags::AnalysisStats {
                     };
                     if let Some(src) = source {
                         let original_file = src.file_id.original_file(db);
-                        let path = vfs.file_path(original_file);
-                        let syntax_range = src.value.text_range();
+                        let path = vfs.file_path(original_file.into());
+                        let syntax_range = src.text_range();
                         format!("processing: {} ({} {:?})", full_name(), path, syntax_range)
                     } else {
                         format!("processing: {}", full_name())
@@ -958,7 +961,7 @@ impl flags::AnalysisStats {
                 bar.println(msg());
             }
             bar.set_message(msg);
-            db.body_with_source_map(body_id.into());
+            db.body(body_id.into());
             bar.inc(1);
         }
 
@@ -968,7 +971,7 @@ impl flags::AnalysisStats {
         report_metric("body lowering time", body_lowering_time.time.as_millis() as u64, "ms");
     }
 
-    fn run_ide_things(&self, analysis: Analysis, mut file_ids: Vec<FileId>) {
+    fn run_ide_things(&self, analysis: Analysis, mut file_ids: Vec<EditionedFileId>) {
         file_ids.sort();
         file_ids.dedup();
         let mut sw = self.stop_watch();
@@ -992,11 +995,13 @@ impl flags::AnalysisStats {
                     },
                     prefer_no_std: false,
                     prefer_prelude: true,
+                    prefer_absolute: false,
                     style_lints: false,
                     term_search_fuel: 400,
+                    term_search_borrowck: true,
                 },
                 ide::AssistResolveStrategy::All,
-                file_id,
+                file_id.into(),
             );
         }
         for &file_id in &file_ids {
@@ -1006,6 +1011,11 @@ impl flags::AnalysisStats {
                     type_hints: true,
                     discriminant_hints: ide::DiscriminantHints::Always,
                     parameter_hints: true,
+                    generic_parameter_hints: ide::GenericParameterHints {
+                        type_hints: true,
+                        lifetime_hints: true,
+                        const_hints: true,
+                    },
                     chaining_hints: true,
                     adjustment_hints: ide::AdjustmentHints::Always,
                     adjustment_hints_mode: ide::AdjustmentHintsMode::Postfix,
@@ -1024,7 +1034,7 @@ impl flags::AnalysisStats {
                     fields_to_resolve: InlayFieldsToResolve::empty(),
                     range_exclusive_hints: true,
                 },
-                file_id,
+                file_id.into(),
                 None,
             );
         }
@@ -1040,7 +1050,7 @@ impl flags::AnalysisStats {
                         annotate_enum_variant_references: false,
                         location: ide::AnnotationLocation::AboveName,
                     },
-                    file_id,
+                    file_id.into(),
                 )
                 .unwrap()
                 .into_iter()
@@ -1065,8 +1075,8 @@ fn location_csv_expr(db: &RootDatabase, vfs: &Vfs, sm: &BodySourceMap, expr_id: 
     let root = db.parse_or_expand(src.file_id);
     let node = src.map(|e| e.to_node(&root).syntax().clone());
     let original_range = node.as_ref().original_file_range_rooted(db);
-    let path = vfs.file_path(original_range.file_id);
-    let line_index = db.line_index(original_range.file_id);
+    let path = vfs.file_path(original_range.file_id.into());
+    let line_index = db.line_index(original_range.file_id.into());
     let text_range = original_range.range;
     let (start, end) =
         (line_index.line_col(text_range.start()), line_index.line_col(text_range.end()));
@@ -1081,8 +1091,8 @@ fn location_csv_pat(db: &RootDatabase, vfs: &Vfs, sm: &BodySourceMap, pat_id: Pa
     let root = db.parse_or_expand(src.file_id);
     let node = src.map(|e| e.to_node(&root).syntax().clone());
     let original_range = node.as_ref().original_file_range_rooted(db);
-    let path = vfs.file_path(original_range.file_id);
-    let line_index = db.line_index(original_range.file_id);
+    let path = vfs.file_path(original_range.file_id.into());
+    let line_index = db.line_index(original_range.file_id.into());
     let text_range = original_range.range;
     let (start, end) =
         (line_index.line_col(text_range.start()), line_index.line_col(text_range.end()));
@@ -1100,8 +1110,8 @@ fn expr_syntax_range<'a>(
         let root = db.parse_or_expand(src.file_id);
         let node = src.map(|e| e.to_node(&root).syntax().clone());
         let original_range = node.as_ref().original_file_range_rooted(db);
-        let path = vfs.file_path(original_range.file_id);
-        let line_index = db.line_index(original_range.file_id);
+        let path = vfs.file_path(original_range.file_id.into());
+        let line_index = db.line_index(original_range.file_id.into());
         let text_range = original_range.range;
         let (start, end) =
             (line_index.line_col(text_range.start()), line_index.line_col(text_range.end()));
@@ -1121,8 +1131,8 @@ fn pat_syntax_range<'a>(
         let root = db.parse_or_expand(src.file_id);
         let node = src.map(|e| e.to_node(&root).syntax().clone());
         let original_range = node.as_ref().original_file_range_rooted(db);
-        let path = vfs.file_path(original_range.file_id);
-        let line_index = db.line_index(original_range.file_id);
+        let path = vfs.file_path(original_range.file_id.into());
+        let line_index = db.line_index(original_range.file_id.into());
         let text_range = original_range.range;
         let (start, end) =
             (line_index.line_col(text_range.start()), line_index.line_col(text_range.end()));

@@ -47,7 +47,12 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::TypedHole) -> Option<Vec<Assist>
         sema: &ctx.sema,
         scope: &scope,
         goal: d.expected.clone(),
-        config: TermSearchConfig { fuel: ctx.config.term_search_fuel, ..Default::default() },
+        config: TermSearchConfig {
+            fuel: ctx.config.term_search_fuel,
+            enable_borrowcheck: ctx.config.term_search_borrowck,
+
+            ..Default::default()
+        },
     };
     let paths = term_search(&term_search_ctx);
 
@@ -62,6 +67,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::TypedHole) -> Option<Vec<Assist>
                 ImportPathConfig {
                     prefer_no_std: ctx.config.prefer_no_std,
                     prefer_prelude: ctx.config.prefer_prelude,
+                    prefer_absolute: ctx.config.prefer_absolute,
                 },
             )
             .ok()
@@ -69,14 +75,14 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::TypedHole) -> Option<Vec<Assist>
         .unique()
         .map(|code| Assist {
             id: AssistId("typed-hole", AssistKind::QuickFix),
-            label: Label::new(format!("Replace `_` with `{}`", &code)),
+            label: Label::new(format!("Replace `_` with `{code}`")),
             group: Some(GroupLabel("Replace `_` with a term".to_owned())),
             target: original_range.range,
             source_change: Some(SourceChange::from_text_edit(
                 original_range.file_id,
                 TextEdit::replace(original_range.range, code),
             )),
-            trigger_signature_help: false,
+            command: None,
         })
         .collect();
 
@@ -276,7 +282,7 @@ impl Foo for Baz {
 }
 fn asd() -> Bar {
     let a = Baz;
-    Foo::foo(_)
+    Foo::foo(a)
 }
 ",
         );
@@ -365,7 +371,7 @@ impl Foo for A {
 }
 fn main() {
     let a = A;
-    let c: Bar = Foo::foo(_);
+    let c: Bar = Foo::foo(&a);
 }"#,
         );
     }

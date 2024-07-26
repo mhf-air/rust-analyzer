@@ -767,8 +767,8 @@ fn main() {
 }
 "#,
         expect![[r#"
-            fn weird_function() (use dep::test_mod::TestTrait) fn() DEPRECATED
             ct SPECIAL_CONST (use dep::test_mod::TestTrait) u8 DEPRECATED
+            fn weird_function() (use dep::test_mod::TestTrait) fn() DEPRECATED
             me random_method(…) (use dep::test_mod::TestTrait) fn(&self) DEPRECATED
         "#]],
     );
@@ -863,6 +863,38 @@ mod foo {
 use foo::bar::Item;
 
 use crate::foo::bar;
+
+fn main() {
+    Item
+}"#,
+    );
+}
+
+#[test]
+fn config_prefer_absolute() {
+    let fixture = r#"
+//- /lib.rs crate:dep
+pub mod foo {
+    pub mod bar {
+        pub struct Item;
+    }
+}
+
+//- /main.rs crate:main deps:dep
+use ::dep::foo::bar;
+
+fn main() {
+    Ite$0
+}"#;
+    let mut config = TEST_CONFIG;
+    config.prefer_absolute = true;
+
+    check_edit_with_config(
+        config.clone(),
+        "Item",
+        fixture,
+        r#"
+use ::dep::foo::bar::{self, Item};
 
 fn main() {
     Item
@@ -1583,6 +1615,21 @@ pub struct FooStruct;
 "#,
         expect![[r#"
             tt FooTrait (use dep::FooTrait)
+        "#]],
+    );
+}
+
+#[test]
+fn primitive_mod() {
+    check(
+        r#"
+//- minicore: str
+fn main() {
+    str::from$0
+}
+"#,
+        expect![[r#"
+            fn from_utf8_unchecked(…) (use core::str) const unsafe fn(&[u8]) -> &str
         "#]],
     );
 }

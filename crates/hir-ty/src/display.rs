@@ -21,13 +21,17 @@ use hir_def::{
     path::{Path, PathKind},
     type_ref::{TraitBoundModifier, TypeBound, TypeRef},
     visibility::Visibility,
-    HasModule, ImportPathConfig, ItemContainerId, LocalFieldId, Lookup, ModuleDefId, ModuleId,
-    TraitId,
+    GenericDefId, HasModule, ImportPathConfig, ItemContainerId, LocalFieldId, Lookup, ModuleDefId,
+    ModuleId, TraitId,
 };
 use hir_expand::name::Name;
-use intern::{Internable, Interned};
+use intern::{sym, Internable, Interned};
 use itertools::Itertools;
 use la_arena::ArenaMap;
+use rustc_apfloat::{
+    ieee::{Half as f16, Quad as f128},
+    Float,
+};
 use smallvec::SmallVec;
 use stdx::{never, IsNoneOr};
 use triomphe::Arc;
@@ -36,12 +40,13 @@ use crate::{
     consteval::try_const_usize,
     db::{HirDatabase, InternedClosure},
     from_assoc_type_id, from_foreign_def_id, from_placeholder_idx,
+    generics::generics,
     layout::Layout,
     lt_from_placeholder_idx,
     mapping::from_chalk,
     mir::pad16,
     primitive, to_assoc_type_id,
-    utils::{self, detect_variant_from_bytes, generics, ClosureSubst},
+    utils::{self, detect_variant_from_bytes, ClosureSubst},
     AdtId, AliasEq, AliasTy, Binders, CallableDefId, CallableSig, ConcreteConst, Const,
     ConstScalar, ConstValue, DomainGoal, FnAbi, GenericArg, ImplTraitId, Interner, Lifetime,
     LifetimeData, LifetimeOutlives, MemoryMap, Mutability, OpaqueTy, ProjectionTy, ProjectionTyExt,
@@ -493,7 +498,7 @@ impl HirDisplay for Const {
             ConstValue::Placeholder(idx) => {
                 let id = from_placeholder_idx(f.db, *idx);
                 let generics = generics(f.db.upcast(), id.parent);
-                let param_data = &generics.params[id.local_id];
+                let param_data = &generics[id.local_id];
                 write!(f, "{}", param_data.name().unwrap().display(f.db.upcast()))?;
                 Ok(())
             }
@@ -544,6 +549,17 @@ fn render_const_scalar(
                 write!(f, "{it}")
             }
             Scalar::Float(fl) => match fl {
+                chalk_ir::FloatTy::F16 => {
+                    // FIXME(#17451): Replace with builtins once they are stabilised.
+                    let it = f16::from_bits(u16::from_le_bytes(b.try_into().unwrap()).into());
+                    let s = it.to_string();
+                    if s.strip_prefix('-').unwrap_or(&s).chars().all(|c| c.is_ascii_digit()) {
+                        // Match Rust debug formatting
+                        write!(f, "{s}.0")
+                    } else {
+                        write!(f, "{s}")
+                    }
+                }
                 chalk_ir::FloatTy::F32 => {
                     let it = f32::from_le_bytes(b.try_into().unwrap());
                     write!(f, "{it:?}")
@@ -551,6 +567,17 @@ fn render_const_scalar(
                 chalk_ir::FloatTy::F64 => {
                     let it = f64::from_le_bytes(b.try_into().unwrap());
                     write!(f, "{it:?}")
+                }
+                chalk_ir::FloatTy::F128 => {
+                    // FIXME(#17451): Replace with builtins once they are stabilised.
+                    let it = f128::from_bits(u128::from_le_bytes(b.try_into().unwrap()));
+                    let s = it.to_string();
+                    if s.strip_prefix('-').unwrap_or(&s).chars().all(|c| c.is_ascii_digit()) {
+                        // Match Rust debug formatting
+                        write!(f, "{s}.0")
+                    } else {
+                        write!(f, "{s}")
+                    }
                 }
             },
         },
@@ -987,8 +1014,9 @@ impl HirDisplay for Ty {
                 f.end_location_link();
 
                 if parameters.len(Interner) > 0 {
-                    let generics = generics(db.upcast(), def.into());
-                    let (parent_len, self_, type_, const_, impl_, lifetime) =
+                    let generic_def_id = GenericDefId::from_callable(db.upcast(), def);
+                    let generics = generics(db.upcast(), generic_def_id);
+                    let (parent_len, self_param, type_, const_, impl_, lifetime) =
                         generics.provenance_split();
                     let parameters = parameters.as_slice(Interner);
                     // We print all params except implicit impl Trait params. Still a bit weird; should we leave out parent and self?
@@ -996,13 +1024,14 @@ impl HirDisplay for Ty {
                         // `parameters` are in the order of fn's params (including impl traits), fn's lifetimes
                         // parent's params (those from enclosing impl or trait, if any).
                         let (fn_params, other) =
-                            parameters.split_at(self_ + type_ + const_ + lifetime);
+                            parameters.split_at(self_param as usize + type_ + const_ + lifetime);
                         let (_impl, parent_params) = other.split_at(impl_);
                         debug_assert_eq!(parent_params.len(), parent_len);
 
                         let parent_params =
-                            generic_args_sans_defaults(f, Some(def.into()), parent_params);
-                        let fn_params = generic_args_sans_defaults(f, Some(def.into()), fn_params);
+                            generic_args_sans_defaults(f, Some(generic_def_id), parent_params);
+                        let fn_params =
+                            generic_args_sans_defaults(f, Some(generic_def_id), fn_params);
 
                         write!(f, "<")?;
                         hir_fmt_generic_arguments(f, parent_params, None)?;
@@ -1040,7 +1069,11 @@ impl HirDisplay for Ty {
                             module_id,
                             PrefixKind::Plain,
                             false,
-                            ImportPathConfig { prefer_no_std: false, prefer_prelude: true },
+                            ImportPathConfig {
+                                prefer_no_std: false,
+                                prefer_prelude: true,
+                                prefer_absolute: false,
+                            },
                         ) {
                             write!(f, "{}", path.display(f.db.upcast()))?;
                         } else {
@@ -1138,7 +1171,9 @@ impl HirDisplay for Ty {
                             .lang_item(body.module(db.upcast()).krate(), LangItem::Future)
                             .and_then(LangItemTarget::as_trait);
                         let output = future_trait.and_then(|t| {
-                            db.trait_data(t).associated_type_by_name(&hir_expand::name!(Output))
+                            db.trait_data(t).associated_type_by_name(&Name::new_symbol_root(
+                                sym::Output.clone(),
+                            ))
                         });
                         write!(f, "impl ")?;
                         if let Some(t) = future_trait {
@@ -1215,7 +1250,7 @@ impl HirDisplay for Ty {
             TyKind::Placeholder(idx) => {
                 let id = from_placeholder_idx(db, *idx);
                 let generics = generics(db.upcast(), id.parent);
-                let param_data = &generics.params[id.local_id];
+                let param_data = &generics[id.local_id];
                 match param_data {
                     TypeOrConstParamData::TypeParamData(p) => match p.provenance {
                         TypeParamProvenance::TypeParamList | TypeParamProvenance::TraitSelf => {
@@ -1426,6 +1461,7 @@ fn generic_args_sans_defaults<'ga>(
                     }
                     // otherwise, if the arg is equal to the param default, hide it (unless the
                     // default is an error which can happen for the trait Self type)
+                    #[allow(unstable_name_collisions)]
                     default_parameters.get(i).is_none_or(|default_parameter| {
                         // !is_err(default_parameter.skip_binders())
                         //     &&
@@ -1796,7 +1832,7 @@ impl HirDisplay for LifetimeData {
             LifetimeData::Placeholder(idx) => {
                 let id = lt_from_placeholder_idx(f.db, *idx);
                 let generics = generics(f.db.upcast(), id.parent);
-                let param_data = &generics.params[id.local_id];
+                let param_data = &generics[id.local_id];
                 write!(f, "{}", param_data.name.display(f.db.upcast()))?;
                 Ok(())
             }
@@ -1899,7 +1935,7 @@ impl HirDisplay for TypeRef {
                 }
                 if let Some(abi) = abi {
                     f.write_str("extern \"")?;
-                    f.write_str(abi)?;
+                    f.write_str(abi.as_str())?;
                     f.write_str("\" ")?;
                 }
                 write!(f, "fn(")?;
@@ -2008,7 +2044,7 @@ impl HirDisplay for Path {
                     .display_name
                     .as_ref()
                     .map(|name| name.canonical_name())
-                    .unwrap_or("$crate");
+                    .unwrap_or(&sym::dollar_crate);
                 write!(f, "{name}")?
             }
         }

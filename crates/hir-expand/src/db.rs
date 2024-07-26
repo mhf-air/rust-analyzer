@@ -1,11 +1,11 @@
 //! Defines database & queries for macro expansion.
 
-use base_db::{salsa, CrateId, FileId, SourceDatabase};
+use base_db::{salsa, CrateId, SourceDatabase};
 use either::Either;
 use limit::Limit;
 use mbe::{syntax_node_to_token_tree, DocCommentDesugarMode, MatchedArmIndex};
 use rustc_hash::FxHashSet;
-use span::{AstIdMap, Span, SyntaxContextData, SyntaxContextId};
+use span::{AstIdMap, EditionedFileId, Span, SyntaxContextData, SyntaxContextId};
 use syntax::{ast, AstNode, Parse, SyntaxElement, SyntaxError, SyntaxNode, SyntaxToken, T};
 use triomphe::Arc;
 
@@ -21,8 +21,8 @@ use crate::{
     span_map::{RealSpanMap, SpanMap, SpanMapRef},
     tt, AstId, BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander,
     CustomProcMacroExpander, EagerCallInfo, ExpandError, ExpandResult, ExpandTo, ExpansionSpanMap,
-    HirFileId, HirFileIdRepr, MacroCallId, MacroCallKind, MacroCallLoc, MacroDefId, MacroDefKind,
-    MacroFileId,
+    HirFileId, HirFileIdRepr, Lookup, MacroCallId, MacroCallKind, MacroCallLoc, MacroDefId,
+    MacroDefKind, MacroFileId,
 };
 /// This is just to ensure the types of smart_macro_arg and macro_arg are the same
 type MacroArgResult = (Arc<tt::Subtree>, SyntaxFixupUndoInfo, Span);
@@ -62,10 +62,8 @@ pub trait ExpandDatabase: SourceDatabase {
     /// file or a macro expansion.
     #[salsa::transparent]
     fn parse_or_expand(&self, file_id: HirFileId) -> SyntaxNode;
-    #[salsa::transparent]
-    fn parse_or_expand_with_err(&self, file_id: HirFileId) -> ExpandResult<Parse<SyntaxNode>>;
     /// Implementation for the macro case.
-    // This query is LRU cached
+    #[salsa::lru]
     fn parse_macro_expansion(
         &self,
         macro_file: MacroFileId,
@@ -78,7 +76,7 @@ pub trait ExpandDatabase: SourceDatabase {
     #[salsa::invoke(crate::span_map::expansion_span_map)]
     fn expansion_span_map(&self, file_id: MacroFileId) -> Arc<ExpansionSpanMap>;
     #[salsa::invoke(crate::span_map::real_span_map)]
-    fn real_span_map(&self, file_id: FileId) -> Arc<RealSpanMap>;
+    fn real_span_map(&self, file_id: EditionedFileId) -> Arc<RealSpanMap>;
 
     /// Macro ids. That's probably the tricksiest bit in rust-analyzer, and the
     /// reason why we use salsa at all.
@@ -99,6 +97,7 @@ pub trait ExpandDatabase: SourceDatabase {
     /// Lowers syntactic macro call to a token tree representation. That's a firewall
     /// query, only typing in the macro call itself changes the returned
     /// subtree.
+    #[deprecated = "calling this is incorrect, call `macro_arg_considering_derives` instead"]
     fn macro_arg(&self, id: MacroCallId) -> MacroArgResult;
     #[salsa::transparent]
     fn macro_arg_considering_derives(
@@ -133,6 +132,19 @@ pub trait ExpandDatabase: SourceDatabase {
         &self,
         macro_call: MacroCallId,
     ) -> Option<Arc<ExpandResult<Arc<[SyntaxError]>>>>;
+    #[salsa::transparent]
+    fn syntax_context(&self, file: HirFileId) -> SyntaxContextId;
+}
+
+fn syntax_context(db: &dyn ExpandDatabase, file: HirFileId) -> SyntaxContextId {
+    match file.repr() {
+        HirFileIdRepr::FileId(_) => SyntaxContextId::ROOT,
+        HirFileIdRepr::MacroFile(m) => {
+            db.macro_arg_considering_derives(m.macro_call_id, &m.macro_call_id.lookup(db).kind)
+                .2
+                .ctx
+        }
+    }
 }
 
 /// This expands the given macro call, but with different arguments. This is
@@ -314,18 +326,6 @@ fn parse_or_expand(db: &dyn ExpandDatabase, file_id: HirFileId) -> SyntaxNode {
     }
 }
 
-fn parse_or_expand_with_err(
-    db: &dyn ExpandDatabase,
-    file_id: HirFileId,
-) -> ExpandResult<Parse<SyntaxNode>> {
-    match file_id.repr() {
-        HirFileIdRepr::FileId(file_id) => ExpandResult::ok(db.parse(file_id).to_syntax()),
-        HirFileIdRepr::MacroFile(macro_file) => {
-            db.parse_macro_expansion(macro_file).map(|(it, _)| it)
-        }
-    }
-}
-
 // FIXME: We should verify that the parsed node is one of the many macro node variants we expect
 // instead of having it be untyped
 fn parse_macro_expansion(
@@ -334,7 +334,7 @@ fn parse_macro_expansion(
 ) -> ExpandResult<(Parse<SyntaxNode>, Arc<ExpansionSpanMap>)> {
     let _p = tracing::info_span!("parse_macro_expansion").entered();
     let loc = db.lookup_intern_macro_call(macro_file.macro_call_id);
-    let edition = loc.def.edition;
+    let def_edition = loc.def.edition;
     let expand_to = loc.expand_to();
     let mbe::ValueResult { value: (tt, matched_arm), err } =
         macro_expand(db, macro_file.macro_call_id, loc);
@@ -345,7 +345,7 @@ fn parse_macro_expansion(
             CowArc::Owned(it) => it,
         },
         expand_to,
-        edition,
+        def_edition,
     );
     rev_token_map.matched_arm = matched_arm;
 
@@ -384,6 +384,7 @@ pub(crate) fn parse_with_map(
 /// Other wise return the [macro_arg] for the macro_call_id.
 ///
 /// This is not connected to the database so it does not cached the result. However, the inner [macro_arg] query is
+#[allow(deprecated)] // we are macro_arg_considering_derives
 fn macro_arg_considering_derives(
     db: &dyn ExpandDatabase,
     id: MacroCallId,

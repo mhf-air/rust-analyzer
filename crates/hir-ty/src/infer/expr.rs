@@ -13,9 +13,10 @@ use hir_def::{
     },
     lang_item::{LangItem, LangItemTarget},
     path::{GenericArgs, Path},
-    BlockId, FieldId, GenericParamId, ItemContainerId, Lookup, TupleFieldId, TupleId,
+    BlockId, FieldId, GenericDefId, GenericParamId, ItemContainerId, Lookup, TupleFieldId, TupleId,
 };
-use hir_expand::name::{name, Name};
+use hir_expand::name::Name;
+use intern::sym;
 use stdx::always;
 use syntax::ast::RangeOp;
 
@@ -24,6 +25,7 @@ use crate::{
     consteval,
     db::{InternedClosure, InternedCoroutine},
     error_lifetime,
+    generics::{generics, Generics},
     infer::{
         coerce::{CoerceMany, CoercionCause},
         find_continuable,
@@ -39,7 +41,6 @@ use crate::{
     primitive::{self, UintTy},
     static_lifetime, to_chalk_trait_id,
     traits::FnTrait,
-    utils::{generics, Generics},
     Adjust, Adjustment, AdtId, AutoBorrow, Binders, CallableDefId, FnAbi, FnPointer, FnSig,
     FnSubst, Interner, Rawness, Scalar, Substitution, TraitEnvironment, TraitRef, Ty, TyBuilder,
     TyExt, TyKind,
@@ -440,7 +441,8 @@ impl InferenceContext<'_> {
                 let ty = match self.infer_path(p, tgt_expr.into()) {
                     Some(ty) => ty,
                     None => {
-                        if matches!(p, Path::Normal { mod_path, .. } if mod_path.is_ident()) {
+                        if matches!(p, Path::Normal { mod_path, .. } if mod_path.is_ident() || mod_path.is_self())
+                        {
                             self.push_diagnostic(InferenceDiagnostic::UnresolvedIdent {
                                 expr: tgt_expr,
                             });
@@ -645,8 +647,10 @@ impl InferenceContext<'_> {
                 match op {
                     UnaryOp::Deref => {
                         if let Some(deref_trait) = self.resolve_lang_trait(LangItem::Deref) {
-                            if let Some(deref_fn) =
-                                self.db.trait_data(deref_trait).method_by_name(&name![deref])
+                            if let Some(deref_fn) = self
+                                .db
+                                .trait_data(deref_trait)
+                                .method_by_name(&Name::new_symbol_root(sym::deref.clone()))
                             {
                                 // FIXME: this is wrong in multiple ways, subst is empty, and we emit it even for builtin deref (note that
                                 // the mutability is not wrong, and will be fixed in `self.infer_mut`).
@@ -784,8 +788,10 @@ impl InferenceContext<'_> {
                     // mutability will be fixed up in `InferenceContext::infer_mut`;
                     adj.push(Adjustment::borrow(Mutability::Not, self_ty.clone()));
                     self.write_expr_adj(*base, adj);
-                    if let Some(func) =
-                        self.db.trait_data(index_trait).method_by_name(&name!(index))
+                    if let Some(func) = self
+                        .db
+                        .trait_data(index_trait)
+                        .method_by_name(&Name::new_symbol_root(sym::index.clone()))
                     {
                         let substs = TyBuilder::subst_for_def(self.db, index_trait, None)
                             .push(self_ty.clone())
@@ -1164,7 +1170,7 @@ impl InferenceContext<'_> {
             Expr::Tuple { exprs, .. } => {
                 // We don't consider multiple ellipses. This is analogous to
                 // `hir_def::body::lower::ExprCollector::collect_tuple_pat()`.
-                let ellipsis = exprs.iter().position(|e| is_rest_expr(*e));
+                let ellipsis = exprs.iter().position(|e| is_rest_expr(*e)).map(|it| it as u32);
                 let exprs: Vec<_> = exprs.iter().filter(|e| !is_rest_expr(**e)).copied().collect();
 
                 self.infer_tuple_pat_like(&rhs_ty, (), ellipsis, &exprs)
@@ -1178,7 +1184,7 @@ impl InferenceContext<'_> {
 
                 // We don't consider multiple ellipses. This is analogous to
                 // `hir_def::body::lower::ExprCollector::collect_tuple_pat()`.
-                let ellipsis = args.iter().position(|e| is_rest_expr(*e));
+                let ellipsis = args.iter().position(|e| is_rest_expr(*e)).map(|it| it as u32);
                 let args: Vec<_> = args.iter().filter(|e| !is_rest_expr(**e)).copied().collect();
 
                 self.infer_tuple_struct_pat_like(path, &rhs_ty, (), lhs, ellipsis, &args)
@@ -1830,13 +1836,13 @@ impl InferenceContext<'_> {
     ) -> Substitution {
         let (
             parent_params,
-            self_params,
+            has_self_param,
             type_params,
             const_params,
             impl_trait_params,
             lifetime_params,
         ) = def_generics.provenance_split();
-        assert_eq!(self_params, 0); // method shouldn't have another Self param
+        assert!(!has_self_param); // method shouldn't have another Self param
         let total_len =
             parent_params + type_params + const_params + impl_trait_params + lifetime_params;
         let mut substs = Vec::with_capacity(total_len);
@@ -1844,13 +1850,11 @@ impl InferenceContext<'_> {
         // handle provided arguments
         if let Some(generic_args) = generic_args {
             // if args are provided, it should be all of them, but we can't rely on that
-            for (arg, kind_id) in generic_args
-                .args
-                .iter()
-                .take(type_params + const_params + lifetime_params)
-                .zip(def_generics.iter_id())
+            let self_params = type_params + const_params + lifetime_params;
+            for (arg, kind_id) in
+                generic_args.args.iter().zip(def_generics.iter_self_id()).take(self_params)
             {
-                if let Some(g) = generic_arg_to_chalk(
+                let arg = generic_arg_to_chalk(
                     self.db,
                     kind_id,
                     arg,
@@ -1869,9 +1873,8 @@ impl InferenceContext<'_> {
                         )
                     },
                     |this, lt_ref| this.make_lifetime(lt_ref),
-                ) {
-                    substs.push(g);
-                }
+                );
+                substs.push(arg);
             }
         };
 
@@ -1898,7 +1901,8 @@ impl InferenceContext<'_> {
         let callable_ty = self.resolve_ty_shallow(callable_ty);
         if let TyKind::FnDef(fn_def, parameters) = callable_ty.kind(Interner) {
             let def: CallableDefId = from_chalk(self.db, *fn_def);
-            let generic_predicates = self.db.generic_predicates(def.into());
+            let generic_predicates =
+                self.db.generic_predicates(GenericDefId::from_callable(self.db.upcast(), def));
             for predicate in generic_predicates.iter() {
                 let (predicate, binders) = predicate
                     .clone()
@@ -1946,25 +1950,25 @@ impl InferenceContext<'_> {
         };
 
         let data = self.db.function_data(func);
-        if data.legacy_const_generics_indices.is_empty() {
+        let Some(legacy_const_generics_indices) = &data.legacy_const_generics_indices else {
             return Default::default();
-        }
+        };
 
         // only use legacy const generics if the param count matches with them
-        if data.params.len() + data.legacy_const_generics_indices.len() != args.len() {
+        if data.params.len() + legacy_const_generics_indices.len() != args.len() {
             if args.len() <= data.params.len() {
                 return Default::default();
             } else {
                 // there are more parameters than there should be without legacy
                 // const params; use them
-                let mut indices = data.legacy_const_generics_indices.clone();
+                let mut indices = legacy_const_generics_indices.as_ref().clone();
                 indices.sort();
                 return indices;
             }
         }
 
         // check legacy const parameters
-        for (subst_idx, arg_idx) in data.legacy_const_generics_indices.iter().copied().enumerate() {
+        for (subst_idx, arg_idx) in legacy_const_generics_indices.iter().copied().enumerate() {
             let arg = match subst.at(Interner, subst_idx).constant(Interner) {
                 Some(c) => c,
                 None => continue, // not a const parameter?
@@ -1977,7 +1981,7 @@ impl InferenceContext<'_> {
             self.infer_expr(args[arg_idx as usize], &expected);
             // FIXME: evaluate and unify with the const
         }
-        let mut indices = data.legacy_const_generics_indices.clone();
+        let mut indices = legacy_const_generics_indices.as_ref().clone();
         indices.sort();
         indices
     }

@@ -4,6 +4,7 @@ use ide_db::{
     label::Label,
     source_change::SourceChangeBuilder,
 };
+use syntax::ToSmolStr;
 use text_edit::TextRange;
 
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
@@ -21,17 +22,14 @@ pub(crate) fn trait_impl_redundant_assoc_item(
     let assoc_item = d.assoc_item.1;
 
     let default_range = d.impl_.syntax_node_ptr().text_range();
-    let trait_name = d.trait_.name(db).to_smol_str();
+    let trait_name = d.trait_.name(db).display_no_db().to_smolstr();
 
     let (redundant_item_name, diagnostic_range, redundant_item_def) = match assoc_item {
         hir::AssocItem::Function(id) => {
             let function = id;
             (
                 format!("`fn {redundant_assoc_item_name}`"),
-                function
-                    .source(db)
-                    .map(|it| it.syntax().value.text_range())
-                    .unwrap_or(default_range),
+                function.source(db).map(|it| it.syntax().text_range()).unwrap_or(default_range),
                 format!("\n    {};", function.display(db)),
             )
         }
@@ -39,10 +37,7 @@ pub(crate) fn trait_impl_redundant_assoc_item(
             let constant = id;
             (
                 format!("`const {redundant_assoc_item_name}`"),
-                constant
-                    .source(db)
-                    .map(|it| it.syntax().value.text_range())
-                    .unwrap_or(default_range),
+                constant.source(db).map(|it| it.syntax().text_range()).unwrap_or(default_range),
                 format!("\n    {};", constant.display(db)),
             )
         }
@@ -50,11 +45,11 @@ pub(crate) fn trait_impl_redundant_assoc_item(
             let type_alias = id;
             (
                 format!("`type {redundant_assoc_item_name}`"),
-                type_alias
-                    .source(db)
-                    .map(|it| it.syntax().value.text_range())
-                    .unwrap_or(default_range),
-                format!("\n    type {};", type_alias.name(ctx.sema.db).to_smol_str()),
+                type_alias.source(db).map(|it| it.syntax().text_range()).unwrap_or(default_range),
+                format!(
+                    "\n    type {};",
+                    type_alias.name(ctx.sema.db).display_no_db().to_smolstr()
+                ),
             )
         }
     };
@@ -107,7 +102,7 @@ fn quickfix_for_redundant_assoc_item(
         group: None,
         target: range,
         source_change: Some(source_change_builder.finish()),
-        trigger_signature_help: false,
+        command: None,
     }])
 }
 

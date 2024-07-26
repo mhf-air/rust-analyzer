@@ -256,40 +256,6 @@ impl Server {
         self.send_notification(r)
     }
 
-    pub(crate) fn expect_notification<N>(&self, expected: Value)
-    where
-        N: lsp_types::notification::Notification,
-        N::Params: Serialize,
-    {
-        while let Some(Message::Notification(actual)) =
-            recv_timeout(&self.client.receiver).unwrap_or_else(|_| panic!("timed out"))
-        {
-            if actual.method == N::METHOD {
-                let actual = actual
-                    .clone()
-                    .extract::<Value>(N::METHOD)
-                    .expect("was not able to extract notification");
-
-                tracing::debug!(?actual, "got notification");
-                if let Some((expected_part, actual_part)) = find_mismatch(&expected, &actual) {
-                    panic!(
-                            "JSON mismatch\nExpected:\n{}\nWas:\n{}\nExpected part:\n{}\nActual part:\n{}\n",
-                            to_string_pretty(&expected).unwrap(),
-                            to_string_pretty(&actual).unwrap(),
-                            to_string_pretty(expected_part).unwrap(),
-                            to_string_pretty(actual_part).unwrap(),
-                        );
-                } else {
-                    tracing::debug!("successfully matched notification");
-                    return;
-                }
-            } else {
-                continue;
-            }
-        }
-        panic!("never got expected notification");
-    }
-
     #[track_caller]
     pub(crate) fn request<R>(&self, params: R::Params, expected_resp: Value)
     where
@@ -388,9 +354,8 @@ impl Server {
     }
     fn recv(&self) -> Result<Option<Message>, Timeout> {
         let msg = recv_timeout(&self.client.receiver)?;
-        let msg = msg.map(|msg| {
+        let msg = msg.inspect(|msg| {
             self.messages.borrow_mut().push(msg.clone());
-            msg
         });
         Ok(msg)
     }

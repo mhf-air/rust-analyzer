@@ -4,18 +4,15 @@
 
 use std::ops;
 
-use ide_db::line_index::WideEncoding;
 use lsp_types::request::Request;
+use lsp_types::Url;
 use lsp_types::{
     notification::Notification, CodeActionKind, DocumentOnTypeFormattingParams,
     PartialResultParams, Position, Range, TextDocumentIdentifier, WorkDoneProgressParams,
 };
-use lsp_types::{PositionEncodingKind, Url};
 use paths::Utf8PathBuf;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-
-use crate::line_index::PositionEncoding;
 
 pub enum InternalTestingFetchConfig {}
 
@@ -460,28 +457,27 @@ pub enum RunnableKind {
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct CargoRunnableArgs {
-    // command to be executed instead of cargo
+    #[serde(skip_serializing_if = "FxHashMap::is_empty")]
+    pub environment: FxHashMap<String, String>,
+    pub cwd: Utf8PathBuf,
+    /// Command to be executed instead of cargo
     pub override_cargo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<Utf8PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<Utf8PathBuf>,
     // command, --package and --lib stuff
     pub cargo_args: Vec<String>,
-    // user-specified additional cargo args, like `--release`.
-    pub cargo_extra_args: Vec<String>,
     // stuff after --
     pub executable_args: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expect_test: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ShellRunnableArgs {
+    #[serde(skip_serializing_if = "FxHashMap::is_empty")]
+    pub environment: FxHashMap<String, String>,
+    pub cwd: Utf8PathBuf,
     pub program: String,
     pub args: Vec<String>,
-    pub cwd: Utf8PathBuf,
 }
 
 pub enum RelatedTests {}
@@ -535,7 +531,7 @@ pub struct ServerStatusParams {
     pub message: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "camelCase")]
 pub enum Health {
     Ok,
@@ -738,24 +734,6 @@ pub enum CodeLensResolveDataKind {
     References(lsp_types::TextDocumentPositionParams),
 }
 
-pub fn negotiated_encoding(caps: &lsp_types::ClientCapabilities) -> PositionEncoding {
-    let client_encodings = match &caps.general {
-        Some(general) => general.position_encodings.as_deref().unwrap_or_default(),
-        None => &[],
-    };
-
-    for enc in client_encodings {
-        if enc == &PositionEncodingKind::UTF8 {
-            return PositionEncoding::Utf8;
-        } else if enc == &PositionEncodingKind::UTF32 {
-            return PositionEncoding::Wide(WideEncoding::Utf32);
-        }
-        // NB: intentionally prefer just about anything else to utf-16.
-    }
-
-    PositionEncoding::Wide(WideEncoding::Utf16)
-}
-
 pub enum MoveItem {}
 
 impl Request for MoveItem {
@@ -855,17 +833,4 @@ pub struct CompletionImport {
 #[derive(Debug, Deserialize, Default)]
 pub struct ClientCommandOptions {
     pub commands: Vec<String>,
-}
-
-pub enum UnindexedProject {}
-
-impl Notification for UnindexedProject {
-    type Params = UnindexedProjectParams;
-    const METHOD: &'static str = "rust-analyzer/unindexedProject";
-}
-
-#[derive(Deserialize, Serialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct UnindexedProjectParams {
-    pub text_documents: Vec<TextDocumentIdentifier>,
 }

@@ -6,7 +6,10 @@ use ide_db::{active_parameter::ActiveParameter, RootDatabase};
 use itertools::Either;
 use syntax::{
     algo::{ancestors_at_offset, find_node_at_offset, non_trivia_sibling},
-    ast::{self, AttrKind, HasArgList, HasGenericParams, HasLoopBody, HasName, NameOrNameRef},
+    ast::{
+        self, AttrKind, HasArgList, HasGenericArgs, HasGenericParams, HasLoopBody, HasName,
+        NameOrNameRef,
+    },
     match_ast, AstNode, AstToken, Direction, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode,
     SyntaxToken, TextRange, TextSize, T,
 };
@@ -820,13 +823,13 @@ fn classify_name_ref(
                                             for item in trait_.items_with_supertraits(sema.db) {
                                                 match item {
                                                     hir::AssocItem::TypeAlias(assoc_ty) => {
-                                                        if assoc_ty.name(sema.db).as_str()? == arg_name {
+                                                        if assoc_ty.name(sema.db).as_str() == arg_name {
                                                             override_location = Some(TypeLocation::AssocTypeEq);
                                                             return None;
                                                         }
                                                     },
                                                     hir::AssocItem::Const(const_) => {
-                                                        if const_.name(sema.db)?.as_str()? == arg_name {
+                                                        if const_.name(sema.db)?.as_str() == arg_name {
                                                             override_location =  Some(TypeLocation::AssocConstEq);
                                                             return None;
                                                         }
@@ -864,7 +867,7 @@ fn classify_name_ref(
                                         let trait_items = trait_.items_with_supertraits(sema.db);
                                         let assoc_ty = trait_items.iter().find_map(|item| match item {
                                             hir::AssocItem::TypeAlias(assoc_ty) => {
-                                                (assoc_ty.name(sema.db).as_str()? == arg_name)
+                                                (assoc_ty.name(sema.db).as_str() == arg_name)
                                                     .then_some(assoc_ty)
                                             },
                                             _ => None,
@@ -1287,10 +1290,15 @@ fn classify_name_ref(
                 syntax::algo::non_trivia_sibling(top.clone().into(), syntax::Direction::Prev)
             {
                 if error_node.kind() == SyntaxKind::ERROR {
-                    qualifier_ctx.unsafe_tok = error_node
-                        .children_with_tokens()
-                        .filter_map(NodeOrToken::into_token)
-                        .find(|it| it.kind() == T![unsafe]);
+                    for token in
+                        error_node.children_with_tokens().filter_map(NodeOrToken::into_token)
+                    {
+                        match token.kind() {
+                            SyntaxKind::UNSAFE_KW => qualifier_ctx.unsafe_tok = Some(token),
+                            SyntaxKind::ASYNC_KW => qualifier_ctx.async_tok = Some(token),
+                            _ => {}
+                        }
+                    }
                     qualifier_ctx.vis_node = error_node.children().find_map(ast::Visibility::cast);
                 }
             }
@@ -1334,7 +1342,7 @@ fn pattern_context_for(
         .map_or((PatternRefutability::Irrefutable, false), |node| {
             let refutability = match_ast! {
                 match node {
-                    ast::LetStmt(let_) => return (PatternRefutability::Irrefutable, let_.ty().is_some()),
+                    ast::LetStmt(let_) => return (PatternRefutability::Refutable, let_.ty().is_some()),
                     ast::Param(param) => {
                         let has_type_ascription = param.ty().is_some();
                         param_ctx = (|| {

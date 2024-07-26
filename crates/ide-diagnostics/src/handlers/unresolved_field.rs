@@ -1,9 +1,8 @@
 use std::iter;
 
-use hir::{db::ExpandDatabase, Adt, HasSource, HirDisplay, InFile, Struct, Union};
+use hir::{db::ExpandDatabase, Adt, FileRange, HasSource, HirDisplay, InFile, Struct, Union};
 use ide_db::{
     assists::{Assist, AssistId, AssistKind},
-    base_db::FileRange,
     helpers::is_editable_crate,
     label::Label,
     source_change::{SourceChange, SourceChangeBuilder},
@@ -76,7 +75,7 @@ fn field_fix(ctx: &DiagnosticsContext<'_>, d: &hir::UnresolvedField) -> Option<A
     let expr = d.expr.value.to_node(&root);
 
     let error_range = ctx.sema.original_range_opt(expr.syntax())?;
-    let field_name = d.name.as_str()?;
+    let field_name = d.name.as_str();
     // Convert the receiver to an ADT
     let adt = d.receiver.strip_references().as_adt()?;
     let target_module = adt.module(ctx.sema.db);
@@ -130,7 +129,7 @@ fn add_variant_to_union(
         group: None,
         target: error_range.range,
         source_change: Some(src_change_builder.finish()),
-        trigger_signature_help: false,
+        command: None,
     })
 }
 
@@ -173,7 +172,7 @@ fn add_field_to_struct_fix(
                 group: None,
                 target: error_range.range,
                 source_change: Some(src_change_builder.finish()),
-                trigger_signature_help: false,
+                command: None,
             })
         }
         None => {
@@ -204,7 +203,7 @@ fn add_field_to_struct_fix(
                 group: None,
                 target: error_range.range,
                 source_change: Some(src_change_builder.finish()),
-                trigger_signature_help: false,
+                command: None,
             })
         }
         Some(FieldList::TupleFieldList(_tuple)) => {
@@ -266,7 +265,7 @@ fn method_fix(
             file_id,
             TextEdit::insert(range.end(), "()".to_owned()),
         )),
-        trigger_signature_help: false,
+        command: None,
     })
 }
 #[cfg(test)]

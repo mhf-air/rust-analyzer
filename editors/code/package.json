@@ -300,6 +300,16 @@
                 "command": "rust-analyzer.toggleCheckOnSave",
                 "title": "Toggle Check on Save",
                 "category": "rust-analyzer"
+            },
+            {
+                "command": "rust-analyzer.toggleLSPLogs",
+                "title": "Toggle LSP Logs",
+                "category": "rust-analyzer"
+            },
+            {
+                "command": "rust-analyzer.openWalkthrough",
+                "title": "Open Walkthrough",
+                "category": "rust-analyzer"
             }
         ],
         "keybindings": [
@@ -318,14 +328,6 @@
             {
                 "title": "general",
                 "properties": {
-                    "rust-analyzer.cargoRunner": {
-                        "type": [
-                            "null",
-                            "string"
-                        ],
-                        "default": null,
-                        "description": "Custom cargo runner extension ID."
-                    },
                     "rust-analyzer.restartServerOnConfigChange": {
                         "markdownDescription": "Whether to restart the server automatically when certain settings that require a restart are changed.",
                         "default": false,
@@ -586,9 +588,19 @@
             {
                 "title": "assist",
                 "properties": {
+                    "rust-analyzer.assist.termSearch.borrowcheck": {
+                        "markdownDescription": "Enable borrow checking for term search code assists. If set to false, also there will be more suggestions, but some of them may not borrow-check.",
+                        "default": true,
+                        "type": "boolean"
+                    }
+                }
+            },
+            {
+                "title": "assist",
+                "properties": {
                     "rust-analyzer.assist.termSearch.fuel": {
-                        "markdownDescription": "Term search fuel in \"units of work\" for assists (Defaults to 400).",
-                        "default": 400,
+                        "markdownDescription": "Term search fuel in \"units of work\" for assists (Defaults to 1800).",
+                        "default": 1800,
                         "type": "integer",
                         "minimum": 0
                     }
@@ -701,7 +713,7 @@
                 "title": "cargo",
                 "properties": {
                     "rust-analyzer.cargo.buildScripts.overrideCommand": {
-                        "markdownDescription": "Override the command rust-analyzer uses to run build scripts and\nbuild procedural macros. The command is required to output json\nand should therefore include `--message-format=json` or a similar\noption.\n\nIf there are multiple linked projects/workspaces, this command is invoked for\neach of them, with the working directory being the workspace root\n(i.e., the folder containing the `Cargo.toml`). This can be overwritten\nby changing `#rust-analyzer.cargo.buildScripts.invocationStrategy#` and\n`#rust-analyzer.cargo.buildScripts.invocationLocation#`.\n\nBy default, a cargo invocation will be constructed for the configured\ntargets and features, with the following base command line:\n\n```bash\ncargo check --quiet --workspace --message-format=json --all-targets\n```\n.",
+                        "markdownDescription": "Override the command rust-analyzer uses to run build scripts and\nbuild procedural macros. The command is required to output json\nand should therefore include `--message-format=json` or a similar\noption.\n\nIf there are multiple linked projects/workspaces, this command is invoked for\neach of them, with the working directory being the workspace root\n(i.e., the folder containing the `Cargo.toml`). This can be overwritten\nby changing `#rust-analyzer.cargo.buildScripts.invocationStrategy#` and\n`#rust-analyzer.cargo.buildScripts.invocationLocation#`.\n\nBy default, a cargo invocation will be constructed for the configured\ntargets and features, with the following base command line:\n\n```bash\ncargo check --quiet --workspace --message-format=json --all-targets --keep-going\n```\n.",
                         "default": null,
                         "type": [
                             "null",
@@ -1182,12 +1194,6 @@
                                 "description": "Put the expression into a pinned `Box`",
                                 "scope": "expr"
                             },
-                            "Ok": {
-                                "postfix": "ok",
-                                "body": "Ok(${receiver})",
-                                "description": "Wrap the expression in a `Result::Ok`",
-                                "scope": "expr"
-                            },
                             "Err": {
                                 "postfix": "err",
                                 "body": "Err(${receiver})",
@@ -1198,6 +1204,12 @@
                                 "postfix": "some",
                                 "body": "Some(${receiver})",
                                 "description": "Wrap the expression in an `Option::Some`",
+                                "scope": "expr"
+                            },
+                            "Ok": {
+                                "postfix": "ok",
+                                "body": "Ok(${receiver})",
+                                "description": "Wrap the expression in a `Result::Ok`",
                                 "scope": "expr"
                             }
                         },
@@ -1219,8 +1231,8 @@
                 "title": "completion",
                 "properties": {
                     "rust-analyzer.completion.termSearch.fuel": {
-                        "markdownDescription": "Term search fuel in \"units of work\" for autocompletion (Defaults to 200).",
-                        "default": 200,
+                        "markdownDescription": "Term search fuel in \"units of work\" for autocompletion (Defaults to 1000).",
+                        "default": 1000,
                         "type": "integer",
                         "minimum": 0
                     }
@@ -1718,6 +1730,16 @@
                 }
             },
             {
+                "title": "imports",
+                "properties": {
+                    "rust-analyzer.imports.prefixExternPrelude": {
+                        "markdownDescription": "Whether to prefix external (including std, core) crate imports with `::`. e.g. \"use ::std::io::Read;\".",
+                        "default": false,
+                        "type": "boolean"
+                    }
+                }
+            },
+            {
                 "title": "inlayHints",
                 "properties": {
                     "rust-analyzer.inlayHints.bindingModeHints.enable": {
@@ -1879,6 +1901,36 @@
                             "Show prefix or postfix depending on which uses less parenthesis, preferring prefix.",
                             "Show prefix or postfix depending on which uses less parenthesis, preferring postfix."
                         ]
+                    }
+                }
+            },
+            {
+                "title": "inlayHints",
+                "properties": {
+                    "rust-analyzer.inlayHints.genericParameterHints.const.enable": {
+                        "markdownDescription": "Whether to show const generic parameter name inlay hints.",
+                        "default": true,
+                        "type": "boolean"
+                    }
+                }
+            },
+            {
+                "title": "inlayHints",
+                "properties": {
+                    "rust-analyzer.inlayHints.genericParameterHints.lifetime.enable": {
+                        "markdownDescription": "Whether to show generic lifetime parameter name inlay hints.",
+                        "default": false,
+                        "type": "boolean"
+                    }
+                }
+            },
+            {
+                "title": "inlayHints",
+                "properties": {
+                    "rust-analyzer.inlayHints.genericParameterHints.type.enable": {
+                        "markdownDescription": "Whether to show generic type parameter name inlay hints.",
+                        "default": false,
+                        "type": "boolean"
                     }
                 }
             },
@@ -2089,16 +2141,6 @@
             {
                 "title": "lens",
                 "properties": {
-                    "rust-analyzer.lens.forceCustomCommands": {
-                        "markdownDescription": "Internal config: use custom client-side commands even when the\nclient doesn't set the corresponding capability.",
-                        "default": true,
-                        "type": "boolean"
-                    }
-                }
-            },
-            {
-                "title": "lens",
-                "properties": {
                     "rust-analyzer.lens.implementations.enable": {
                         "markdownDescription": "Whether to show `Implementations` lens. Only applies when\n`#rust-analyzer.lens.enable#` is set.",
                         "default": true,
@@ -2200,7 +2242,8 @@
                             "null",
                             "integer"
                         ],
-                        "minimum": 0
+                        "minimum": 0,
+                        "maximum": 65535
                     }
                 }
             },
@@ -2220,16 +2263,6 @@
                     "rust-analyzer.notifications.cargoTomlNotFound": {
                         "markdownDescription": "Whether to show `can't find Cargo.toml` error message.",
                         "default": true,
-                        "type": "boolean"
-                    }
-                }
-            },
-            {
-                "title": "notifications",
-                "properties": {
-                    "rust-analyzer.notifications.unindexedProject": {
-                        "markdownDescription": "Whether to send an UnindexedProject notification to the client.",
-                        "default": false,
                         "type": "boolean"
                     }
                 }
@@ -2535,6 +2568,40 @@
                         "markdownDescription": "Whether to insert closing angle brackets when typing an opening angle bracket of a generic argument list.",
                         "default": false,
                         "type": "boolean"
+                    }
+                }
+            },
+            {
+                "title": "workspace",
+                "properties": {
+                    "rust-analyzer.workspace.discoverConfig": {
+                        "markdownDescription": "Enables automatic discovery of projects using [`DiscoverWorkspaceConfig::command`].\n\n[`DiscoverWorkspaceConfig`] also requires setting `progress_label` and `files_to_watch`.\n`progress_label` is used for the title in progress indicators, whereas `files_to_watch`\nis used to determine which build system-specific files should be watched in order to\nreload rust-analyzer.\n\nBelow is an example of a valid configuration:\n```json\n\"rust-analyzer.workspace.discoverConfig\": {\n        \"command\": [\n                \"rust-project\",\n                \"develop-json\",\n                {arg}\n        ],\n        \"progressLabel\": \"rust-analyzer\",\n        \"filesToWatch\": [\n                \"BUCK\",\n        ],\n}\n```\n\n## On `DiscoverWorkspaceConfig::command`\n\n**Warning**: This format is provisional and subject to change.\n\n[`DiscoverWorkspaceConfig::command`] *must* return a JSON object\ncorresponding to `DiscoverProjectData::Finished`:\n\n```norun\n#[derive(Debug, Clone, Deserialize, Serialize)]\n#[serde(tag = \"kind\")]\n#[serde(rename_all = \"snake_case\")]\nenum DiscoverProjectData {\n        Finished { buildfile: Utf8PathBuf, project: ProjectJsonData },\n        Error { error: String, source: Option<String> },\n        Progress { message: String },\n}\n```\n\nAs JSON, `DiscoverProjectData::Finished` is:\n\n```json\n{\n        // the internally-tagged representation of the enum.\n        \"kind\": \"finished\",\n        // the file used by a non-Cargo build system to define\n        // a package or target.\n        \"buildfile\": \"rust-analyzer/BUILD\",\n        // the contents of a rust-project.json, elided for brevity\n        \"project\": {\n                \"sysroot\": \"foo\",\n                \"crates\": []\n        }\n}\n```\n\nIt is encouraged, but not required, to use the other variants on\n`DiscoverProjectData` to provide a more polished end-user experience.\n\n`DiscoverWorkspaceConfig::command` may *optionally* include an `{arg}`,\nwhich will be substituted with the JSON-serialized form of the following\nenum:\n\n```norun\n#[derive(PartialEq, Clone, Debug, Serialize)]\n#[serde(rename_all = \"camelCase\")]\npub enum DiscoverArgument {\n     Path(AbsPathBuf),\n     Buildfile(AbsPathBuf),\n}\n```\n\nThe JSON representation of `DiscoverArgument::Path` is:\n\n```json\n{\n        \"path\": \"src/main.rs\"\n}\n```\n\nSimilarly, the JSON representation of `DiscoverArgument::Buildfile` is:\n\n```\n{\n        \"buildfile\": \"BUILD\"\n}\n```\n\n`DiscoverArgument::Path` is used to find and generate a `rust-project.json`,\nand therefore, a workspace, whereas `DiscoverArgument::buildfile` is used to\nto update an existing workspace. As a reference for implementors,\nbuck2's `rust-project` will likely be useful:\nhttps://github.com/facebook/buck2/tree/main/integrations/rust-project.",
+                        "default": null,
+                        "anyOf": [
+                            {
+                                "type": "null"
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "command": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "string"
+                                        }
+                                    },
+                                    "progressLabel": {
+                                        "type": "string"
+                                    },
+                                    "filesToWatch": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "string"
+                                        }
+                                    }
+                                }
+                            }
+                        ]
                     }
                 }
             },
@@ -3123,6 +3190,13 @@
                 {
                     "command": "rust-analyzer.viewMemoryLayout",
                     "when": "inRustProject"
+                },
+                {
+                    "command": "rust-analyzer.toggleLSPLogs",
+                    "when": "inRustProject"
+                },
+                {
+                    "command": "rust-analyzer.openWalkthrough"
                 }
             ],
             "editor/context": [
@@ -3151,6 +3225,57 @@
             {
                 "fileMatch": "rust-project.json",
                 "url": "https://json.schemastore.org/rust-project.json"
+            }
+        ],
+        "walkthroughs": [
+            {
+                "id": "landing",
+                "title": "Learn about rust-analyzer",
+                "description": "A brief introduction to get started with rust-analyzer. Learn about key features and resources to help you get the most out of the extension.",
+                "steps": [
+                    {
+                        "id": "setup",
+                        "title": "Useful Setup Tips",
+                        "description": "There are a couple of things you might want to configure upfront to your tastes. We'll name a few here but be sure to check out the docs linked below!\n\n**Marking library sources as readonly**\n\nAdding the following to your settings.json will mark all Rust library sources as readonly:\n```json\n\"files.readonlyInclude\": {\n    \"**/.cargo/registry/src/**/*.rs\": true,\n    \"**/lib/rustlib/src/rust/library/**/*.rs\": true,\n},\n```\n\n**Check on Save**\n\nBy default, rust-analyzer will run `cargo check` on your codebase when you save a file, rendering diagnostics emitted by `cargo check` within your code. This can potentially collide with other `cargo` commands running concurrently, blocking them from running for a certain amount of time. In these cases it is recommended to disable the `rust-analyzer.checkOnSave` configuration and running the `rust-analyzer: Run flycheck` command on-demand instead.",
+                        "media": {
+                            "image": "./icon.png",
+                            "altText": "rust-analyzer logo"
+                        }
+                    },
+                    {
+                        "id": "docs",
+                        "title": "Visit the docs!",
+                        "description": "Confused about configurations? Want to learn more about rust-analyzer? Visit the [User Manual](https://rust-analyzer.github.io/manual.html)!",
+                        "media": {
+                            "image": "./icon.png",
+                            "altText": "rust-analyzer logo"
+                        },
+                        "completionEvents": [
+                            "onLink:https://rust-analyzer.github.io/manual.html"
+                        ]
+                    },
+                    {
+                        "id": "faq",
+                        "title": "FAQ",
+                        "description": "What are these code hints that are being inserted into my code?\n\nThese hints are called inlay hints which rust-analyzer support and are enabled by default in VSCode. If you wish to disable them you can do so via the `editor.inlayHints.enabled` setting.",
+                        "media": {
+                            "image": "icon.png",
+                            "altText": "rust-analyzer logo"
+                        }
+                    },
+                    {
+                        "id": "changelog",
+                        "title": "Changelog",
+                        "description": "Stay up-to-date with the latest changes in rust-analyzer. Check out the changelog [here](https://rust-analyzer.github.io/thisweek)!",
+                        "media": {
+                            "image": "icon.png",
+                            "altText": "rust-analyzer logo"
+                        },
+                        "completionEvents": [
+                            "onLink:https://rust-analyzer.github.io/thisweek"
+                        ]
+                    }
+                ]
             }
         ]
     }

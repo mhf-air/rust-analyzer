@@ -223,26 +223,55 @@ export type OpenCargoTomlParams = {
 export type Runnable = {
     label: string;
     location?: lc.LocationLink;
-    kind: "cargo" | "shell";
-    args: CargoRunnableArgs | ShellRunnableArgs;
+} & (RunnableCargo | RunnableShell);
+
+type RunnableCargo = {
+    kind: "cargo";
+    args: CargoRunnableArgs;
+};
+
+type RunnableShell = {
+    kind: "shell";
+    args: ShellRunnableArgs;
+};
+
+export type CommonRunnableArgs = {
+    /**
+     * Environment variables to set before running the command.
+     */
+    environment?: Record<string, string>;
+    /**
+     * The working directory to run the command in.
+     */
+    cwd: string;
 };
 
 export type ShellRunnableArgs = {
     kind: string;
     program: string;
     args: string[];
-    cwd: string;
-};
+} & CommonRunnableArgs;
 
 export type CargoRunnableArgs = {
+    /**
+     * The workspace root directory of the cargo project.
+     */
     workspaceRoot?: string;
-    cargoArgs: string[];
-    cwd: string;
-    cargoExtraArgs: string[];
+    /**
+     * Arguments to pass to the executable, these will be passed to the command after a `--` argument.
+     */
     executableArgs: string[];
-    expectTest?: boolean;
+    /**
+     * Arguments to pass to cargo.
+     */
+    cargoArgs: string[];
+    /**
+     * Command to execute instead of `cargo`.
+     */
+    // This is supplied by the user via config. We could pull this through the client config in the
+    // extension directly, but that would prevent us from honoring the rust-analyzer.toml for it.
     overrideCargo?: string;
-};
+} & CommonRunnableArgs;
 
 export type RunnablesParams = {
     textDocument: lc.TextDocumentIdentifier;
@@ -274,9 +303,3 @@ export type RecursiveMemoryLayoutNode = {
 export type RecursiveMemoryLayout = {
     nodes: RecursiveMemoryLayoutNode[];
 };
-
-export const unindexedProject = new lc.NotificationType<UnindexedProjectParams>(
-    "rust-analyzer/unindexedProject",
-);
-
-export type UnindexedProjectParams = { textDocuments: lc.TextDocumentIdentifier[] };

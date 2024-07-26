@@ -10,16 +10,15 @@ use hir::{
 };
 use ide_db::{
     active_parameter::{callable_for_node, generic_def_for_node},
-    base_db::FilePosition,
     documentation::{Documentation, HasDocs},
-    FxIndexMap,
+    FilePosition, FxIndexMap,
 };
 use stdx::format_to;
 use syntax::{
     algo,
     ast::{self, AstChildren, HasArgList},
     match_ast, AstNode, Direction, NodeOrToken, SyntaxElementChildren, SyntaxNode, SyntaxToken,
-    TextRange, TextSize, T,
+    TextRange, TextSize, ToSmolStr, T,
 };
 
 use crate::RootDatabase;
@@ -74,7 +73,7 @@ pub(crate) fn signature_help(
     FilePosition { file_id, offset }: FilePosition,
 ) -> Option<SignatureHelp> {
     let sema = Semantics::new(db);
-    let file = sema.parse(file_id);
+    let file = sema.parse_guess_edition(file_id);
     let file = file.syntax();
     let token = file
         .token_at_offset(offset)
@@ -272,7 +271,7 @@ fn signature_help_for_generics(
     arg_list: ast::GenericArgList,
     token: SyntaxToken,
 ) -> Option<SignatureHelp> {
-    let (mut generics_def, mut active_parameter, first_arg_is_non_lifetime) =
+    let (generics_def, mut active_parameter, first_arg_is_non_lifetime, variant) =
         generic_def_for_node(sema, &arg_list, &token)?;
     let mut res = SignatureHelp {
         doc: None,
@@ -290,6 +289,12 @@ fn signature_help_for_generics(
         hir::GenericDef::Adt(hir::Adt::Enum(it)) => {
             res.doc = it.docs(db);
             format_to!(res.signature, "enum {}", it.name(db).display(db));
+            if let Some(variant) = variant {
+                // In paths, generics of an enum can be specified *after* one of its variants.
+                // eg. `None::<u8>`
+                // We'll use the signature of the enum, but include the docs of the variant.
+                res.doc = variant.docs(db);
+            }
         }
         hir::GenericDef::Adt(hir::Adt::Struct(it)) => {
             res.doc = it.docs(db);
@@ -310,15 +315,6 @@ fn signature_help_for_generics(
         hir::GenericDef::TypeAlias(it) => {
             res.doc = it.docs(db);
             format_to!(res.signature, "type {}", it.name(db).display(db));
-        }
-        hir::GenericDef::Variant(it) => {
-            // In paths, generics of an enum can be specified *after* one of its variants.
-            // eg. `None::<u8>`
-            // We'll use the signature of the enum, but include the docs of the variant.
-            res.doc = it.docs(db);
-            let enum_ = it.parent_enum(db);
-            format_to!(res.signature, "enum {}", enum_.name(db).display(db));
-            generics_def = enum_.into();
         }
         // These don't have generic args that can be specified
         hir::GenericDef::Impl(_) | hir::GenericDef::Const(_) => return None,
@@ -382,7 +378,7 @@ fn add_assoc_type_bindings(
 
     for item in tr.items_with_supertraits(db) {
         if let AssocItem::TypeAlias(ty) = item {
-            let name = ty.name(db).to_smol_str();
+            let name = ty.name(db).display_no_db().to_smolstr();
             if !present_bindings.contains(&*name) {
                 buf.clear();
                 format_to!(buf, "{} = …", name);
@@ -663,7 +659,7 @@ mod tests {
     use std::iter;
 
     use expect_test::{expect, Expect};
-    use ide_db::base_db::FilePosition;
+    use ide_db::FilePosition;
     use stdx::format_to;
     use test_fixture::ChangeFixture;
 
@@ -677,7 +673,7 @@ mod tests {
         let (file_id, range_or_offset) =
             change_fixture.file_position.expect("expected a marker ($0)");
         let offset = range_or_offset.expect_offset();
-        (database, FilePosition { file_id, offset })
+        (database, FilePosition { file_id: file_id.into(), offset })
     }
 
     #[track_caller]

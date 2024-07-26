@@ -13,7 +13,7 @@ use ide::{
     NavigationTarget, ReferenceCategory, RenameError, Runnable, Severity, SignatureHelp,
     SnippetEdit, SourceChange, StructureNodeKind, SymbolKind, TextEdit, TextRange, TextSize,
 };
-use ide_db::{rust_doc::format_docs, FxHasher};
+use ide_db::{assists, rust_doc::format_docs, FxHasher};
 use itertools::Itertools;
 use paths::{Utf8Component, Utf8Prefix};
 use semver::VersionReq;
@@ -501,7 +501,9 @@ pub(crate) fn inlay_hint(
         padding_left: Some(inlay_hint.pad_left),
         padding_right: Some(inlay_hint.pad_right),
         kind: match inlay_hint.kind {
-            InlayKind::Parameter => Some(lsp_types::InlayHintKind::PARAMETER),
+            InlayKind::Parameter | InlayKind::GenericParameter => {
+                Some(lsp_types::InlayHintKind::PARAMETER)
+            }
             InlayKind::Type | InlayKind::Chaining => Some(lsp_types::InlayHintKind::TYPE),
             _ => None,
         },
@@ -1334,9 +1336,14 @@ pub(crate) fn code_action(
         command: None,
     };
 
-    if assist.trigger_signature_help && snap.config.client_commands().trigger_parameter_hints {
-        res.command = Some(command::trigger_parameter_hints());
-    }
+    let commands = snap.config.client_commands();
+    res.command = match assist.command {
+        Some(assists::Command::TriggerParameterHints) if commands.trigger_parameter_hints => {
+            Some(command::trigger_parameter_hints())
+        }
+        Some(assists::Command::Rename) if commands.rename => Some(command::rename()),
+        _ => None,
+    };
 
     match (assist.source_change, resolve_data) {
         (Some(it), _) => res.edit = Some(snippet_workspace_edit(snap, it)?),
@@ -1390,10 +1397,13 @@ pub(crate) fn runnable(
                     workspace_root: Some(workspace_root.into()),
                     override_cargo: config.override_cargo,
                     cargo_args,
-                    cwd: Some(cwd.into()),
-                    cargo_extra_args: config.cargo_extra_args,
+                    cwd: cwd.into(),
                     executable_args,
-                    expect_test: None,
+                    environment: spec
+                        .sysroot_root
+                        .map(|root| ("RUSTC_TOOLCHAIN".to_owned(), root.to_string()))
+                        .into_iter()
+                        .collect(),
                 }),
             }))
         }
@@ -1407,6 +1417,7 @@ pub(crate) fn runnable(
                         program: json_shell_runnable_args.program,
                         args: json_shell_runnable_args.args,
                         cwd: json_shell_runnable_args.cwd,
+                        environment: Default::default(),
                     };
                     Ok(Some(lsp_ext::Runnable {
                         label,
@@ -1419,6 +1430,9 @@ pub(crate) fn runnable(
             }
         }
         None => {
+            let Some(path) = snap.file_id_to_file_path(runnable.nav.file_id).parent() else {
+                return Ok(None);
+            };
             let (cargo_args, executable_args) =
                 CargoTargetSpec::runnable_args(snap, None, &runnable.kind, &runnable.cfg);
 
@@ -1433,10 +1447,9 @@ pub(crate) fn runnable(
                     workspace_root: None,
                     override_cargo: config.override_cargo,
                     cargo_args,
-                    cwd: None,
-                    cargo_extra_args: config.cargo_extra_args,
+                    cwd: path.as_path().unwrap().to_path_buf().into(),
                     executable_args,
-                    expect_test: None,
+                    environment: Default::default(),
                 }),
             }))
         }
@@ -1708,6 +1721,14 @@ pub(crate) mod command {
         lsp_types::Command {
             title: "triggerParameterHints".into(),
             command: "rust-analyzer.triggerParameterHints".into(),
+            arguments: None,
+        }
+    }
+
+    pub(crate) fn rename() -> lsp_types::Command {
+        lsp_types::Command {
+            title: "rename".into(),
+            command: "rust-analyzer.rename".into(),
             arguments: None,
         }
     }

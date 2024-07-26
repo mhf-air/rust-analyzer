@@ -2,6 +2,7 @@
 use std::sync::OnceLock;
 
 use base_db::{CrateId, VersionReq};
+use intern::sym;
 use mbe::DocCommentDesugarMode;
 use span::{Edition, MacroCallId, Span, SyntaxContextId};
 use stdx::TupleExt;
@@ -111,35 +112,24 @@ impl DeclarativeMacroExpander {
             match &*attrs
                 .iter()
                 .find(|it| {
-                    it.path.as_ident().and_then(|it| it.as_str())
-                        == Some("rustc_macro_transparency")
+                    it.path
+                        .as_ident()
+                        .map(|it| *it == sym::rustc_macro_transparency.clone())
+                        .unwrap_or(false)
                 })?
                 .token_tree_value()?
                 .token_trees
             {
-                [tt::TokenTree::Leaf(tt::Leaf::Ident(i)), ..] => match &*i.text {
-                    "transparent" => Some(Transparency::Transparent),
-                    "semitransparent" => Some(Transparency::SemiTransparent),
-                    "opaque" => Some(Transparency::Opaque),
+                [tt::TokenTree::Leaf(tt::Leaf::Ident(i)), ..] => match &i.sym {
+                    s if *s == sym::transparent => Some(Transparency::Transparent),
+                    s if *s == sym::semitransparent => Some(Transparency::SemiTransparent),
+                    s if *s == sym::opaque => Some(Transparency::Opaque),
                     _ => None,
                 },
                 _ => None,
             }
         };
-        let toolchain = db.toolchain(def_crate);
-        let new_meta_vars = toolchain.as_ref().map_or(false, |version| {
-            REQUIREMENT.get_or_init(|| VersionReq::parse(">=1.76").unwrap()).matches(
-                &base_db::Version {
-                    pre: base_db::Prerelease::EMPTY,
-                    build: base_db::BuildMetadata::EMPTY,
-                    major: version.major,
-                    minor: version.minor,
-                    patch: version.patch,
-                },
-            )
-        });
-
-        let edition = |ctx: SyntaxContextId| {
+        let ctx_edition = |ctx: SyntaxContextId| {
             let crate_graph = db.crate_graph();
             if ctx.is_root() {
                 crate_graph[def_crate].edition
@@ -162,7 +152,7 @@ impl DeclarativeMacroExpander {
                             DocCommentDesugarMode::Mbe,
                         );
 
-                        mbe::DeclarativeMacro::parse_macro_rules(&tt, edition, new_meta_vars)
+                        mbe::DeclarativeMacro::parse_macro_rules(&tt, ctx_edition)
                     }
                     None => mbe::DeclarativeMacro::from_err(mbe::ParseError::Expected(
                         "expected a token tree".into(),
@@ -172,15 +162,25 @@ impl DeclarativeMacroExpander {
             ),
             ast::Macro::MacroDef(macro_def) => (
                 match macro_def.body() {
-                    Some(arg) => {
-                        let tt = mbe::syntax_node_to_token_tree(
-                            arg.syntax(),
+                    Some(body) => {
+                        let span =
+                            map.span_for_range(macro_def.macro_token().unwrap().text_range());
+                        let args = macro_def.args().map(|args| {
+                            mbe::syntax_node_to_token_tree(
+                                args.syntax(),
+                                map.as_ref(),
+                                span,
+                                DocCommentDesugarMode::Mbe,
+                            )
+                        });
+                        let body = mbe::syntax_node_to_token_tree(
+                            body.syntax(),
                             map.as_ref(),
-                            map.span_for_range(macro_def.macro_token().unwrap().text_range()),
+                            span,
                             DocCommentDesugarMode::Mbe,
                         );
 
-                        mbe::DeclarativeMacro::parse_macro2(&tt, edition, new_meta_vars)
+                        mbe::DeclarativeMacro::parse_macro2(args.as_ref(), &body, ctx_edition)
                     }
                     None => mbe::DeclarativeMacro::from_err(mbe::ParseError::Expected(
                         "expected a token tree".into(),

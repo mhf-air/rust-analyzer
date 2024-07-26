@@ -25,11 +25,8 @@ use hir_def::{
 };
 use hir_expand::{
     mod_path::path,
+    name::{AsName, Name},
     HirFileId, InFile, InMacroFile, MacroFileId, MacroFileIdExt,
-    {
-        name,
-        name::{AsName, Name},
-    },
 };
 use hir_ty::{
     diagnostics::{
@@ -40,6 +37,7 @@ use hir_ty::{
     method_resolution, Adjustment, InferenceResult, Interner, Substitution, Ty, TyExt, TyKind,
     TyLoweringContext,
 };
+use intern::sym;
 use itertools::Itertools;
 use smallvec::SmallVec;
 use syntax::{
@@ -68,38 +66,44 @@ impl SourceAnalyzer {
     pub(crate) fn new_for_body(
         db: &dyn HirDatabase,
         def: DefWithBodyId,
-        node @ InFile { file_id, .. }: InFile<&SyntaxNode>,
+        node: InFile<&SyntaxNode>,
         offset: Option<TextSize>,
     ) -> SourceAnalyzer {
-        let (body, source_map) = db.body_with_source_map(def);
-        let scopes = db.expr_scopes(def);
-        let scope = match offset {
-            None => scope_for(&scopes, &source_map, node),
-            Some(offset) => scope_for_offset(db, &scopes, &source_map, node.file_id, offset),
-        };
-        let resolver = resolver_for_scope(db.upcast(), def, scope);
-        SourceAnalyzer {
-            resolver,
-            def: Some((def, body, source_map)),
-            infer: Some(db.infer(def)),
-            file_id,
-        }
+        Self::new_for_body_(db, def, node, offset, Some(db.infer(def)))
     }
 
     pub(crate) fn new_for_body_no_infer(
         db: &dyn HirDatabase,
         def: DefWithBodyId,
+        node: InFile<&SyntaxNode>,
+        offset: Option<TextSize>,
+    ) -> SourceAnalyzer {
+        Self::new_for_body_(db, def, node, offset, None)
+    }
+
+    pub(crate) fn new_for_body_(
+        db: &dyn HirDatabase,
+        def: DefWithBodyId,
         node @ InFile { file_id, .. }: InFile<&SyntaxNode>,
         offset: Option<TextSize>,
+        infer: Option<Arc<InferenceResult>>,
     ) -> SourceAnalyzer {
         let (body, source_map) = db.body_with_source_map(def);
         let scopes = db.expr_scopes(def);
         let scope = match offset {
-            None => scope_for(&scopes, &source_map, node),
-            Some(offset) => scope_for_offset(db, &scopes, &source_map, node.file_id, offset),
+            None => scope_for(db, &scopes, &source_map, node),
+            Some(offset) => {
+                debug_assert!(
+                    node.text_range().contains_inclusive(offset),
+                    "{:?} not in {:?}",
+                    offset,
+                    node.text_range()
+                );
+                scope_for_offset(db, &scopes, &source_map, node.file_id, offset)
+            }
         };
         let resolver = resolver_for_scope(db.upcast(), def, scope);
-        SourceAnalyzer { resolver, def: Some((def, body, source_map)), infer: None, file_id }
+        SourceAnalyzer { resolver, def: Some((def, body, source_map)), infer, file_id }
     }
 
     pub(crate) fn new_for_resolver(
@@ -362,7 +366,7 @@ impl SourceAnalyzer {
                 let items = into_future_trait.items(db);
                 let into_future_type = items.into_iter().find_map(|item| match item {
                     AssocItem::TypeAlias(alias)
-                        if alias.name(db) == hir_expand::name![IntoFuture] =>
+                        if alias.name(db) == Name::new_symbol_root(sym::IntoFuture.clone()) =>
                     {
                         Some(alias)
                     }
@@ -391,15 +395,21 @@ impl SourceAnalyzer {
                 // This can be either `Deref::deref` or `DerefMut::deref_mut`.
                 // Since deref kind is inferenced and stored in `InferenceResult.method_resolution`,
                 // use that result to find out which one it is.
-                let (deref_trait, deref) =
-                    self.lang_trait_fn(db, LangItem::Deref, &name![deref])?;
+                let (deref_trait, deref) = self.lang_trait_fn(
+                    db,
+                    LangItem::Deref,
+                    &Name::new_symbol_root(sym::deref.clone()),
+                )?;
                 self.infer
                     .as_ref()
                     .and_then(|infer| {
                         let expr = self.expr_id(db, &prefix_expr.clone().into())?;
                         let (func, _) = infer.method_resolution(expr)?;
-                        let (deref_mut_trait, deref_mut) =
-                            self.lang_trait_fn(db, LangItem::DerefMut, &name![deref_mut])?;
+                        let (deref_mut_trait, deref_mut) = self.lang_trait_fn(
+                            db,
+                            LangItem::DerefMut,
+                            &Name::new_symbol_root(sym::deref_mut.clone()),
+                        )?;
                         if func == deref_mut {
                             Some((deref_mut_trait, deref_mut))
                         } else {
@@ -408,8 +418,12 @@ impl SourceAnalyzer {
                     })
                     .unwrap_or((deref_trait, deref))
             }
-            ast::UnaryOp::Not => self.lang_trait_fn(db, LangItem::Not, &name![not])?,
-            ast::UnaryOp::Neg => self.lang_trait_fn(db, LangItem::Neg, &name![neg])?,
+            ast::UnaryOp::Not => {
+                self.lang_trait_fn(db, LangItem::Not, &Name::new_symbol_root(sym::not.clone()))?
+            }
+            ast::UnaryOp::Neg => {
+                self.lang_trait_fn(db, LangItem::Neg, &Name::new_symbol_root(sym::neg.clone()))?
+            }
         };
 
         let ty = self.ty_of_expr(db, &prefix_expr.expr()?)?;
@@ -429,15 +443,19 @@ impl SourceAnalyzer {
         let base_ty = self.ty_of_expr(db, &index_expr.base()?)?;
         let index_ty = self.ty_of_expr(db, &index_expr.index()?)?;
 
-        let (index_trait, index_fn) = self.lang_trait_fn(db, LangItem::Index, &name![index])?;
+        let (index_trait, index_fn) =
+            self.lang_trait_fn(db, LangItem::Index, &Name::new_symbol_root(sym::index.clone()))?;
         let (op_trait, op_fn) = self
             .infer
             .as_ref()
             .and_then(|infer| {
                 let expr = self.expr_id(db, &index_expr.clone().into())?;
                 let (func, _) = infer.method_resolution(expr)?;
-                let (index_mut_trait, index_mut_fn) =
-                    self.lang_trait_fn(db, LangItem::IndexMut, &name![index_mut])?;
+                let (index_mut_trait, index_mut_fn) = self.lang_trait_fn(
+                    db,
+                    LangItem::IndexMut,
+                    &Name::new_symbol_root(sym::index_mut.clone()),
+                )?;
                 if func == index_mut_fn {
                     Some((index_mut_trait, index_mut_fn))
                 } else {
@@ -662,7 +680,6 @@ impl SourceAnalyzer {
             return resolved;
         }
 
-        // This must be a normal source file rather than macro file.
         let ctx = LowerCtx::new(db.upcast(), self.file_id);
         let hir_path = Path::from_src(&ctx, path.clone())?;
 
@@ -955,14 +972,15 @@ impl SourceAnalyzer {
 }
 
 fn scope_for(
+    db: &dyn HirDatabase,
     scopes: &ExprScopes,
     source_map: &BodySourceMap,
     node: InFile<&SyntaxNode>,
 ) -> Option<ScopeId> {
-    node.value
-        .ancestors()
-        .filter_map(ast::Expr::cast)
-        .filter_map(|it| source_map.node_expr(InFile::new(node.file_id, &it)))
+    node.ancestors_with_macros(db.upcast())
+        .take_while(|it| !ast::Item::can_cast(it.kind()) || ast::MacroCall::can_cast(it.kind()))
+        .filter_map(|it| it.map(ast::Expr::cast).transpose())
+        .filter_map(|it| source_map.node_expr(it.as_ref()))
         .find_map(|it| scopes.scope_for(it))
 }
 
@@ -988,8 +1006,8 @@ fn scope_for_offset(
                     Some(it.file_id.macro_file()?.call_node(db.upcast()))
                 })
                 .find(|it| it.file_id == from_file)
-                .filter(|it| it.value.kind() == SyntaxKind::MACRO_CALL)?;
-            Some((source.value.text_range(), scope))
+                .filter(|it| it.kind() == SyntaxKind::MACRO_CALL)?;
+            Some((source.text_range(), scope))
         })
         .filter(|(expr_range, _scope)| expr_range.start() <= offset && offset <= expr_range.end())
         // find containing scope

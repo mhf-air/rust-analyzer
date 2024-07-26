@@ -7,7 +7,6 @@
 //! Note that `hir_def` is a work in progress, so not all of the above is
 //! actually true.
 
-#![warn(rust_2018_idioms, unused_lifetimes)]
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 
 #[cfg(feature = "in-rust-tree")]
@@ -47,7 +46,6 @@ pub mod body;
 pub mod resolver;
 
 pub mod nameres;
-mod trace;
 
 pub mod child_by_source;
 pub mod src;
@@ -73,7 +71,7 @@ use std::{
 
 use base_db::{
     impl_intern_key,
-    salsa::{self, impl_intern_value_trivial},
+    salsa::{self, InternValueTrivial},
     CrateId,
 };
 use hir_expand::{
@@ -117,6 +115,8 @@ pub struct ImportPathConfig {
     pub prefer_no_std: bool,
     /// If true, prefer import paths containing a prelude module.
     pub prefer_prelude: bool,
+    /// If true, prefer abs path (starting with `::`) where it is available.
+    pub prefer_absolute: bool,
 }
 
 #[derive(Debug)]
@@ -187,7 +187,7 @@ pub trait ItemTreeLoc {
 macro_rules! impl_intern {
     ($id:ident, $loc:ident, $intern:ident, $lookup:ident) => {
         impl_intern_key!($id);
-        impl_intern_value_trivial!($loc);
+        impl InternValueTrivial for $loc {}
         impl_intern_lookup!(DefDatabase, $id, $loc, $intern, $lookup);
     };
 }
@@ -535,7 +535,7 @@ pub struct TypeOrConstParamId {
     pub parent: GenericDefId,
     pub local_id: LocalTypeOrConstParamId,
 }
-impl_intern_value_trivial!(TypeOrConstParamId);
+impl InternValueTrivial for TypeOrConstParamId {}
 
 /// A TypeOrConstParamId with an invariant that it actually belongs to a type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -597,7 +597,7 @@ pub struct LifetimeParamId {
     pub local_id: LocalLifetimeParamId,
 }
 pub type LocalLifetimeParamId = Idx<generics::LifetimeParamData>;
-impl_intern_value_trivial!(LifetimeParamId);
+impl InternValueTrivial for LifetimeParamId {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ItemContainerId {
@@ -689,7 +689,7 @@ pub enum TypeOwnerId {
 }
 
 impl TypeOwnerId {
-    fn as_generic_def_id(self) -> Option<GenericDefId> {
+    fn as_generic_def_id(self, db: &dyn DefDatabase) -> Option<GenericDefId> {
         Some(match self {
             TypeOwnerId::FunctionId(it) => GenericDefId::FunctionId(it),
             TypeOwnerId::ConstId(it) => GenericDefId::ConstId(it),
@@ -698,7 +698,9 @@ impl TypeOwnerId {
             TypeOwnerId::TraitAliasId(it) => GenericDefId::TraitAliasId(it),
             TypeOwnerId::TypeAliasId(it) => GenericDefId::TypeAliasId(it),
             TypeOwnerId::ImplId(it) => GenericDefId::ImplId(it),
-            TypeOwnerId::EnumVariantId(it) => GenericDefId::EnumVariantId(it),
+            TypeOwnerId::EnumVariantId(it) => {
+                GenericDefId::AdtId(AdtId::EnumId(it.lookup(db).parent))
+            }
             TypeOwnerId::InTypeConstId(_) | TypeOwnerId::StaticId(_) => return None,
         })
     }
@@ -740,7 +742,6 @@ impl From<GenericDefId> for TypeOwnerId {
             GenericDefId::TraitAliasId(it) => it.into(),
             GenericDefId::TypeAliasId(it) => it.into(),
             GenericDefId::ImplId(it) => it.into(),
-            GenericDefId::EnumVariantId(it) => it.into(),
             GenericDefId::ConstId(it) => it.into(),
         }
     }
@@ -849,8 +850,8 @@ impl GeneralConstId {
     pub fn generic_def(self, db: &dyn DefDatabase) -> Option<GenericDefId> {
         match self {
             GeneralConstId::ConstId(it) => Some(it.into()),
-            GeneralConstId::ConstBlockId(it) => it.lookup(db).parent.as_generic_def_id(),
-            GeneralConstId::InTypeConstId(it) => it.lookup(db).owner.as_generic_def_id(),
+            GeneralConstId::ConstBlockId(it) => it.lookup(db).parent.as_generic_def_id(db),
+            GeneralConstId::InTypeConstId(it) => it.lookup(db).owner.as_generic_def_id(db),
         }
     }
 
@@ -860,7 +861,7 @@ impl GeneralConstId {
                 .const_data(const_id)
                 .name
                 .as_ref()
-                .and_then(|it| it.as_str())
+                .map(|it| it.as_str())
                 .unwrap_or("_")
                 .to_owned(),
             GeneralConstId::ConstBlockId(id) => format!("{{anonymous const {id:?}}}"),
@@ -888,12 +889,12 @@ impl From<EnumVariantId> for DefWithBodyId {
 }
 
 impl DefWithBodyId {
-    pub fn as_generic_def_id(self) -> Option<GenericDefId> {
+    pub fn as_generic_def_id(self, db: &dyn DefDatabase) -> Option<GenericDefId> {
         match self {
             DefWithBodyId::FunctionId(f) => Some(f.into()),
             DefWithBodyId::StaticId(_) => None,
             DefWithBodyId::ConstId(c) => Some(c.into()),
-            DefWithBodyId::VariantId(c) => Some(c.into()),
+            DefWithBodyId::VariantId(c) => Some(c.lookup(db).parent.into()),
             // FIXME: stable rust doesn't allow generics in constants, but we should
             // use `TypeOwnerId::as_generic_def_id` when it does.
             DefWithBodyId::InTypeConstId(_) => None,
@@ -921,9 +922,6 @@ pub enum GenericDefId {
     TraitAliasId(TraitAliasId),
     TypeAliasId(TypeAliasId),
     ImplId(ImplId),
-    // enum variants cannot have generics themselves, but their parent enums
-    // can, and this makes some code easier to write
-    EnumVariantId(EnumVariantId),
     // consts can have type parameters from their parents (i.e. associated consts of traits)
     ConstId(ConstId),
 }
@@ -934,7 +932,6 @@ impl_from!(
     TraitAliasId,
     TypeAliasId,
     ImplId,
-    EnumVariantId,
     ConstId
     for GenericDefId
 );
@@ -966,7 +963,6 @@ impl GenericDefId {
             GenericDefId::TraitAliasId(it) => file_id_and_params_of_item_loc(db, it),
             GenericDefId::ImplId(it) => file_id_and_params_of_item_loc(db, it),
             GenericDefId::ConstId(it) => (it.lookup(db).id.file_id(), None),
-            GenericDefId::EnumVariantId(it) => (it.lookup(db).id.file_id(), None),
         }
     }
 
@@ -981,6 +977,14 @@ impl GenericDefId {
             _ => None,
         }
     }
+
+    pub fn from_callable(db: &dyn DefDatabase, def: CallableDefId) -> GenericDefId {
+        match def {
+            CallableDefId::FunctionId(f) => f.into(),
+            CallableDefId::StructId(s) => s.into(),
+            CallableDefId::EnumVariantId(e) => e.lookup(db).parent.into(),
+        }
+    }
 }
 
 impl From<AssocItemId> for GenericDefId {
@@ -989,6 +993,36 @@ impl From<AssocItemId> for GenericDefId {
             AssocItemId::FunctionId(f) => f.into(),
             AssocItemId::ConstId(c) => c.into(),
             AssocItemId::TypeAliasId(t) => t.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CallableDefId {
+    FunctionId(FunctionId),
+    StructId(StructId),
+    EnumVariantId(EnumVariantId),
+}
+
+impl InternValueTrivial for CallableDefId {}
+
+impl_from!(FunctionId, StructId, EnumVariantId for CallableDefId);
+impl From<CallableDefId> for ModuleDefId {
+    fn from(def: CallableDefId) -> ModuleDefId {
+        match def {
+            CallableDefId::FunctionId(f) => ModuleDefId::FunctionId(f),
+            CallableDefId::StructId(s) => ModuleDefId::AdtId(AdtId::StructId(s)),
+            CallableDefId::EnumVariantId(e) => ModuleDefId::EnumVariantId(e),
+        }
+    }
+}
+
+impl CallableDefId {
+    pub fn krate(self, db: &dyn DefDatabase) -> CrateId {
+        match self {
+            CallableDefId::FunctionId(f) => f.krate(db),
+            CallableDefId::StructId(s) => s.krate(db),
+            CallableDefId::EnumVariantId(e) => e.krate(db),
         }
     }
 }
@@ -1309,7 +1343,6 @@ impl HasModule for GenericDefId {
             GenericDefId::TraitAliasId(it) => it.module(db),
             GenericDefId::TypeAliasId(it) => it.module(db),
             GenericDefId::ImplId(it) => it.module(db),
-            GenericDefId::EnumVariantId(it) => it.module(db),
             GenericDefId::ConstId(it) => it.module(db),
         }
     }

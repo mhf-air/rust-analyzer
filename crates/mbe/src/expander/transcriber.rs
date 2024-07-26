@@ -1,8 +1,8 @@
 //! Transcriber takes a template, like `fn $ident() {}`, a set of bindings like
 //! `$ident => foo`, interpolates variables in the template, to get `fn foo() {}`
 
+use intern::{sym, Symbol};
 use span::Span;
-use syntax::SmolStr;
 use tt::Delimiter;
 
 use crate::{
@@ -12,16 +12,16 @@ use crate::{
 };
 
 impl Bindings {
-    fn get(&self, name: &str) -> Result<&Binding, ExpandError> {
+    fn get(&self, name: &Symbol) -> Result<&Binding, ExpandError> {
         match self.inner.get(name) {
             Some(binding) => Ok(binding),
-            None => Err(ExpandError::UnresolvedBinding(Box::new(Box::from(name)))),
+            None => Err(ExpandError::UnresolvedBinding(Box::new(Box::from(name.as_str())))),
         }
     }
 
     fn get_fragment(
         &self,
-        name: &str,
+        name: &Symbol,
         mut span: Span,
         nesting: &mut [NestingState],
         marker: impl Fn(&mut Span),
@@ -97,8 +97,9 @@ impl Bindings {
                     | MetaVarKind::Expr
                     | MetaVarKind::Ident => {
                         Fragment::Tokens(tt::TokenTree::Leaf(tt::Leaf::Ident(tt::Ident {
-                            text: SmolStr::new_static("missing"),
+                            sym: sym::missing.clone(),
                             span,
+                            is_raw: tt::IdentIsRaw::No,
                         })))
                     }
                     MetaVarKind::Lifetime => {
@@ -111,16 +112,18 @@ impl Bindings {
                                     spacing: tt::Spacing::Joint,
                                 })),
                                 tt::TokenTree::Leaf(tt::Leaf::Ident(tt::Ident {
-                                    text: SmolStr::new_static("missing"),
+                                    sym: sym::missing.clone(),
                                     span,
+                                    is_raw: tt::IdentIsRaw::No,
                                 })),
                             ]),
                         }))
                     }
                     MetaVarKind::Literal => {
                         Fragment::Tokens(tt::TokenTree::Leaf(tt::Leaf::Ident(tt::Ident {
-                            text: SmolStr::new_static("\"missing\""),
+                            sym: sym::missing.clone(),
                             span,
+                            is_raw: tt::IdentIsRaw::No,
                         })))
                     }
                 }
@@ -195,7 +198,7 @@ fn expand_subtree(
                 .into(),
             ),
             Op::Punct(puncts) => {
-                for punct in puncts {
+                for punct in puncts.as_slice() {
                     arena.push(
                         tt::Leaf::from({
                             let mut it = *punct;
@@ -222,7 +225,7 @@ fn expand_subtree(
             }
             Op::Repeat { tokens: subtree, kind, separator } => {
                 let ExpandResult { value: fragment, err: e } =
-                    expand_repeat(ctx, subtree, *kind, separator, arena, marker);
+                    expand_repeat(ctx, subtree, *kind, separator.as_deref(), arena, marker);
                 err = err.or(e);
                 push_fragment(ctx, arena, fragment)
             }
@@ -236,8 +239,10 @@ fn expand_subtree(
                     ctx.nesting.get(ctx.nesting.len() - 1 - depth).map_or(0, |nest| nest.idx);
                 arena.push(
                     tt::Leaf::Literal(tt::Literal {
-                        text: index.to_string().into(),
+                        symbol: Symbol::integer(index),
                         span: ctx.call_site,
+                        kind: tt::LitKind::Integer,
+                        suffix: None,
                     })
                     .into(),
                 );
@@ -249,14 +254,16 @@ fn expand_subtree(
                 });
                 arena.push(
                     tt::Leaf::Literal(tt::Literal {
-                        text: length.to_string().into(),
+                        symbol: Symbol::integer(length),
                         span: ctx.call_site,
+                        kind: tt::LitKind::Integer,
+                        suffix: None,
                     })
                     .into(),
                 );
             }
             Op::Count { name, depth } => {
-                let mut binding = match ctx.bindings.get(name.as_str()) {
+                let mut binding = match ctx.bindings.get(name) {
                     Ok(b) => b,
                     Err(e) => {
                         if err.is_none() {
@@ -314,8 +321,10 @@ fn expand_subtree(
                 };
                 arena.push(
                     tt::Leaf::Literal(tt::Literal {
-                        text: c.to_string().into(),
+                        symbol: Symbol::integer(c),
                         span: ctx.call_site,
+                        suffix: None,
+                        kind: tt::LitKind::Integer,
                     })
                     .into(),
                 );
@@ -335,12 +344,12 @@ fn expand_subtree(
 
 fn expand_var(
     ctx: &mut ExpandCtx<'_>,
-    v: &SmolStr,
+    v: &Symbol,
     id: Span,
     marker: impl Fn(&mut Span),
 ) -> ExpandResult<Fragment> {
     // We already handle $crate case in mbe parser
-    debug_assert!(v != "crate");
+    debug_assert!(*v != sym::crate_);
 
     match ctx.bindings.get_fragment(v, id, &mut ctx.nesting, marker) {
         Ok(it) => ExpandResult::ok(it),
@@ -363,7 +372,12 @@ fn expand_var(
                 token_trees: Box::new([
                     tt::Leaf::from(tt::Punct { char: '$', spacing: tt::Spacing::Alone, span: id })
                         .into(),
-                    tt::Leaf::from(tt::Ident { text: v.clone(), span: id }).into(),
+                    tt::Leaf::from(tt::Ident {
+                        sym: v.clone(),
+                        span: id,
+                        is_raw: tt::IdentIsRaw::No,
+                    })
+                    .into(),
                 ]),
             }
             .into();
@@ -383,7 +397,7 @@ fn expand_repeat(
     ctx: &mut ExpandCtx<'_>,
     template: &MetaTemplate,
     kind: RepeatKind,
-    separator: &Option<Separator>,
+    separator: Option<&Separator>,
     arena: &mut Vec<tt::TokenTree<Span>>,
     marker: impl Fn(&mut Span) + Copy,
 ) -> ExpandResult<Fragment> {

@@ -1,10 +1,11 @@
 //! This module add real world mbe example for benchmark tests
 
+use intern::Symbol;
 use rustc_hash::FxHashMap;
 use span::{Edition, Span};
 use syntax::{
     ast::{self, HasName},
-    AstNode, SmolStr,
+    AstNode,
 };
 use test_utils::{bench, bench_fixture, skip_slow_tests};
 
@@ -24,9 +25,7 @@ fn benchmark_parse_macro_rules() {
         rules
             .values()
             .map(|it| {
-                DeclarativeMacro::parse_macro_rules(it, |_| span::Edition::CURRENT, true)
-                    .rules
-                    .len()
+                DeclarativeMacro::parse_macro_rules(it, |_| span::Edition::CURRENT).rules.len()
             })
             .sum()
     };
@@ -58,9 +57,7 @@ fn benchmark_expand_macro_rules() {
 fn macro_rules_fixtures() -> FxHashMap<String, DeclarativeMacro> {
     macro_rules_fixtures_tt()
         .into_iter()
-        .map(|(id, tt)| {
-            (id, DeclarativeMacro::parse_macro_rules(&tt, |_| span::Edition::CURRENT, true))
-        })
+        .map(|(id, tt)| (id, DeclarativeMacro::parse_macro_rules(&tt, |_| span::Edition::CURRENT)))
         .collect()
 }
 
@@ -170,7 +167,7 @@ fn invocation_fixtures(
             Op::Literal(it) => token_trees.push(tt::Leaf::from(it.clone()).into()),
             Op::Ident(it) => token_trees.push(tt::Leaf::from(it.clone()).into()),
             Op::Punct(puncts) => {
-                for punct in puncts {
+                for punct in puncts.as_slice() {
                     token_trees.push(tt::Leaf::from(*punct).into());
                 }
             }
@@ -187,7 +184,7 @@ fn invocation_fixtures(
                     }
                     if i + 1 != cnt {
                         if let Some(sep) = separator {
-                            match sep {
+                            match &**sep {
                                 Separator::Literal(it) => {
                                     token_trees.push(tt::Leaf::Literal(it.clone()).into())
                                 }
@@ -226,13 +223,24 @@ fn invocation_fixtures(
             *seed
         }
         fn make_ident(ident: &str) -> tt::TokenTree<Span> {
-            tt::Leaf::Ident(tt::Ident { span: DUMMY, text: SmolStr::new(ident) }).into()
+            tt::Leaf::Ident(tt::Ident {
+                span: DUMMY,
+                sym: Symbol::intern(ident),
+                is_raw: tt::IdentIsRaw::No,
+            })
+            .into()
         }
         fn make_punct(char: char) -> tt::TokenTree<Span> {
             tt::Leaf::Punct(tt::Punct { span: DUMMY, char, spacing: tt::Spacing::Alone }).into()
         }
         fn make_literal(lit: &str) -> tt::TokenTree<Span> {
-            tt::Leaf::Literal(tt::Literal { span: DUMMY, text: SmolStr::new(lit) }).into()
+            tt::Leaf::Literal(tt::Literal {
+                span: DUMMY,
+                symbol: Symbol::intern(lit),
+                kind: tt::LitKind::Str,
+                suffix: None,
+            })
+            .into()
         }
         fn make_subtree(
             kind: tt::DelimiterKind,

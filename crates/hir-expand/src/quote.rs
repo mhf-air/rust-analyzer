@@ -1,13 +1,14 @@
 //! A simplified version of quote-crate like quasi quote macro
 #![allow(clippy::crate_in_macro_def)]
 
+use intern::{sym, Symbol};
 use span::Span;
-use syntax::format_smolstr;
+use tt::IdentIsRaw;
 
 use crate::name::Name;
 
-pub(crate) const fn dollar_crate(span: Span) -> tt::Ident<Span> {
-    tt::Ident { text: syntax::SmolStr::new_static("$crate"), span }
+pub(crate) fn dollar_crate(span: Span) -> tt::Ident<Span> {
+    tt::Ident { sym: sym::dollar_crate.clone(), span, is_raw: tt::IdentIsRaw::No }
 }
 
 // A helper macro quote macro
@@ -98,8 +99,9 @@ macro_rules! __quote {
     ($span:ident $tt:ident ) => {
         vec![ {
             crate::tt::Leaf::Ident(crate::tt::Ident {
-                text: stringify!($tt).into(),
+                sym: intern::Symbol::intern(stringify!($tt)),
                 span: $span,
+                is_raw: tt::IdentIsRaw::No,
             }).into()
         }]
     };
@@ -175,12 +177,6 @@ impl ToTokenTree for crate::tt::TokenTree {
     }
 }
 
-impl ToTokenTree for &crate::tt::TokenTree {
-    fn to_token(self, _: Span) -> crate::tt::TokenTree {
-        self.clone()
-    }
-}
-
 impl ToTokenTree for crate::tt::Subtree {
     fn to_token(self, _: Span) -> crate::tt::TokenTree {
         self.into()
@@ -196,42 +192,55 @@ macro_rules! impl_to_to_tokentrees {
                     leaf.into()
                 }
             }
-
-            impl ToTokenTree for &$ty {
-                fn to_token($this, $span: Span) -> crate::tt::TokenTree {
-                    let leaf: crate::tt::Leaf = $im.clone().into();
-                    leaf.into()
-                }
-            }
         )*
     }
 }
 
+impl<T: ToTokenTree + Clone> ToTokenTree for &T {
+    fn to_token(self, span: Span) -> crate::tt::TokenTree {
+        self.clone().to_token(span)
+    }
+}
+
 impl_to_to_tokentrees! {
-    span: u32 => self { crate::tt::Literal{text: self.to_string().into(), span} };
-    span: usize => self { crate::tt::Literal{text: self.to_string().into(), span} };
-    span: i32 => self { crate::tt::Literal{text: self.to_string().into(), span} };
-    span: bool => self { crate::tt::Ident{text: self.to_string().into(), span} };
+    span: u32 => self { crate::tt::Literal{symbol: Symbol::integer(self as _), span, kind: tt::LitKind::Integer, suffix: None } };
+    span: usize => self { crate::tt::Literal{symbol: Symbol::integer(self as _), span, kind: tt::LitKind::Integer, suffix: None } };
+    span: i32 => self { crate::tt::Literal{symbol: Symbol::integer(self as _), span, kind: tt::LitKind::Integer, suffix: None } };
+    span: bool => self { crate::tt::Ident{sym: if self { sym::true_.clone() } else { sym::false_.clone() }, span, is_raw: tt::IdentIsRaw::No } };
     _span: crate::tt::Leaf => self { self };
     _span: crate::tt::Literal => self { self };
     _span: crate::tt::Ident => self { self };
     _span: crate::tt::Punct => self { self };
-    span: &str => self { crate::tt::Literal{text: format_smolstr!("\"{}\"", self.escape_default()), span}};
-    span: String => self { crate::tt::Literal{text: format_smolstr!("\"{}\"", self.escape_default()), span}};
-    span: Name => self { crate::tt::Ident{text: self.to_smol_str(), span}};
+    span: &str => self { crate::tt::Literal{symbol: Symbol::intern(self), span, kind: tt::LitKind::Str, suffix: None }};
+    span: String => self { crate::tt::Literal{symbol: Symbol::intern(&self), span, kind: tt::LitKind::Str, suffix: None }};
+    span: Name => self {
+        let (is_raw, s) = IdentIsRaw::split_from_symbol(self.as_str());
+        crate::tt::Ident{sym: Symbol::intern(s), span, is_raw }
+    };
+    span: Symbol => self {
+        let (is_raw, s) = IdentIsRaw::split_from_symbol(self.as_str());
+        crate::tt::Ident{sym: Symbol::intern(s), span, is_raw }
+    };
 }
 
 #[cfg(test)]
 mod tests {
     use crate::tt;
-    use base_db::FileId;
+    use ::tt::IdentIsRaw;
     use expect_test::expect;
+    use intern::Symbol;
     use span::{SpanAnchor, SyntaxContextId, ROOT_ERASED_FILE_AST_ID};
     use syntax::{TextRange, TextSize};
 
     const DUMMY: tt::Span = tt::Span {
         range: TextRange::empty(TextSize::new(0)),
-        anchor: SpanAnchor { file_id: FileId::from_raw(0xe4e4e), ast_id: ROOT_ERASED_FILE_AST_ID },
+        anchor: SpanAnchor {
+            file_id: span::EditionedFileId::new(
+                span::FileId::from_raw(0xe4e4e),
+                span::Edition::CURRENT,
+            ),
+            ast_id: ROOT_ERASED_FILE_AST_ID,
+        },
         ctx: SyntaxContextId::ROOT,
     };
 
@@ -257,7 +266,8 @@ mod tests {
     }
 
     fn mk_ident(name: &str) -> crate::tt::Ident {
-        crate::tt::Ident { text: name.into(), span: DUMMY }
+        let (is_raw, s) = IdentIsRaw::split_from_symbol(name);
+        crate::tt::Ident { sym: Symbol::intern(s), span: DUMMY, is_raw }
     }
 
     #[test]

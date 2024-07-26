@@ -4,7 +4,6 @@
 //! tree originates not from the text of some `FileId`, but from some macro
 //! expansion.
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
-#![warn(rust_2018_idioms, unused_lifetimes)]
 
 pub mod attrs;
 pub mod builtin_attr_macro;
@@ -31,10 +30,10 @@ use triomphe::Arc;
 
 use std::{fmt, hash::Hash};
 
-use base_db::{salsa::impl_intern_value_trivial, CrateId, FileId};
+use base_db::{salsa::InternValueTrivial, CrateId};
 use either::Either;
 use span::{
-    Edition, ErasedFileAstId, FileAstId, FileRange, HirFileIdRepr, Span, SpanAnchor,
+    Edition, EditionedFileId, ErasedFileAstId, FileAstId, HirFileIdRepr, Span, SpanAnchor,
     SyntaxContextData, SyntaxContextId,
 };
 use syntax::{
@@ -53,14 +52,14 @@ use crate::{
     span_map::{ExpansionSpanMap, SpanMap},
 };
 
-pub use crate::files::{AstId, ErasedAstId, InFile, InMacroFile, InRealFile};
+pub use crate::files::{AstId, ErasedAstId, FileRange, InFile, InMacroFile, InRealFile};
 
 pub use mbe::{DeclarativeMacro, ValueResult};
 pub use span::{HirFileId, MacroCallId, MacroFileId};
 
 pub mod tt {
     pub use span::Span;
-    pub use tt::{DelimiterKind, Spacing};
+    pub use tt::{token_to_literal, DelimiterKind, IdentIsRaw, LitKind, Spacing};
 
     pub type Delimiter = ::tt::Delimiter<Span>;
     pub type DelimSpan = ::tt::DelimSpan<Span>;
@@ -173,7 +172,7 @@ pub struct MacroCallLoc {
     pub kind: MacroCallKind,
     pub ctxt: SyntaxContextId,
 }
-impl_intern_value_trivial!(MacroCallLoc);
+impl InternValueTrivial for MacroCallLoc {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MacroDefId {
@@ -244,11 +243,11 @@ pub enum MacroCallKind {
 
 pub trait HirFileIdExt {
     /// Returns the original file of this macro call hierarchy.
-    fn original_file(self, db: &dyn ExpandDatabase) -> FileId;
+    fn original_file(self, db: &dyn ExpandDatabase) -> EditionedFileId;
 
     /// Returns the original file of this macro call hierarchy while going into the included file if
     /// one of the calls comes from an `include!``.
-    fn original_file_respecting_includes(self, db: &dyn ExpandDatabase) -> FileId;
+    fn original_file_respecting_includes(self, db: &dyn ExpandDatabase) -> EditionedFileId;
 
     /// If this is a macro call, returns the syntax node of the very first macro call this file resides in.
     fn original_call_node(self, db: &dyn ExpandDatabase) -> Option<InRealFile<SyntaxNode>>;
@@ -257,7 +256,7 @@ pub trait HirFileIdExt {
 }
 
 impl HirFileIdExt for HirFileId {
-    fn original_file(self, db: &dyn ExpandDatabase) -> FileId {
+    fn original_file(self, db: &dyn ExpandDatabase) -> EditionedFileId {
         let mut file_id = self;
         loop {
             match file_id.repr() {
@@ -269,7 +268,7 @@ impl HirFileIdExt for HirFileId {
         }
     }
 
-    fn original_file_respecting_includes(mut self, db: &dyn ExpandDatabase) -> FileId {
+    fn original_file_respecting_includes(mut self, db: &dyn ExpandDatabase) -> EditionedFileId {
         loop {
             match self.repr() {
                 HirFileIdRepr::FileId(id) => break id,
@@ -569,7 +568,7 @@ impl MacroCallLoc {
         &self,
         db: &dyn ExpandDatabase,
         macro_call_id: MacroCallId,
-    ) -> Option<FileId> {
+    ) -> Option<EditionedFileId> {
         if self.def.is_include() {
             if let MacroCallKind::FnLike { eager: Some(eager), .. } = &self.kind {
                 if let Ok(it) =
@@ -710,8 +709,8 @@ impl ExpansionInfo {
         self.expanded.clone()
     }
 
-    pub fn call_node(&self) -> InFile<Option<SyntaxNode>> {
-        self.arg.with_value(self.arg.value.as_ref().and_then(SyntaxNode::parent))
+    pub fn arg(&self) -> InFile<Option<&SyntaxNode>> {
+        self.arg.as_ref().map(|it| it.as_ref())
     }
 
     pub fn call_file(&self) -> HirFileId {

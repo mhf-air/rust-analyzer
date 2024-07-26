@@ -23,8 +23,6 @@
 //! There are also a couple of ad-hoc diagnostics implemented directly here, we
 //! don't yet have a great pattern for how to do them properly.
 
-#![warn(rust_2018_idioms, unused_lifetimes)]
-
 mod handlers {
     pub(crate) mod break_outside_of_loop;
     pub(crate) mod expected_function;
@@ -80,13 +78,13 @@ mod tests;
 use hir::{diagnostics::AnyDiagnostic, InFile, Semantics};
 use ide_db::{
     assists::{Assist, AssistId, AssistKind, AssistResolveStrategy},
-    base_db::{FileId, FileRange, SourceDatabase},
+    base_db::SourceDatabase,
     generated::lints::{LintGroup, CLIPPY_LINT_GROUPS, DEFAULT_LINT_GROUPS},
     imports::insert_use::InsertUseConfig,
     label::Label,
     source_change::SourceChange,
     syntax_helpers::node_ext::parse_tt_as_comma_sep_paths,
-    FxHashMap, FxHashSet, RootDatabase, SnippetCap,
+    EditionedFileId, FileId, FileRange, FxHashMap, FxHashSet, RootDatabase, SnippetCap,
 };
 use once_cell::sync::Lazy;
 use stdx::never;
@@ -146,12 +144,16 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    fn new(code: DiagnosticCode, message: impl Into<String>, range: FileRange) -> Diagnostic {
+    fn new(
+        code: DiagnosticCode,
+        message: impl Into<String>,
+        range: impl Into<FileRange>,
+    ) -> Diagnostic {
         let message = message.into();
         Diagnostic {
             code,
             message,
-            range,
+            range: range.into(),
             severity: match code {
                 DiagnosticCode::RustcHardError(_) => Severity::Error,
                 // FIXME: Rustc lints are not always warning, but the ones that are currently implemented are all warnings.
@@ -233,7 +235,9 @@ pub struct DiagnosticsConfig {
     pub insert_use: InsertUseConfig,
     pub prefer_no_std: bool,
     pub prefer_prelude: bool,
+    pub prefer_absolute: bool,
     pub term_search_fuel: u64,
+    pub term_search_borrowck: bool,
 }
 
 impl DiagnosticsConfig {
@@ -259,7 +263,9 @@ impl DiagnosticsConfig {
             },
             prefer_no_std: false,
             prefer_prelude: true,
+            prefer_absolute: false,
             term_search_fuel: 400,
+            term_search_borrowck: true,
         }
     }
 }
@@ -288,6 +294,7 @@ impl DiagnosticsContext<'_> {
             }
         })()
         .unwrap_or_else(|| sema.diagnostics_display_range(*node))
+        .into()
     }
 }
 
@@ -301,6 +308,9 @@ pub fn diagnostics(
 ) -> Vec<Diagnostic> {
     let _p = tracing::info_span!("diagnostics").entered();
     let sema = Semantics::new(db);
+    let file_id = sema
+        .attach_first_edition(file_id)
+        .unwrap_or_else(|| EditionedFileId::current_edition(file_id));
     let mut res = Vec::new();
 
     // [#34344] Only take first 128 errors to prevent slowing down editor/ide, the number 128 is chosen arbitrarily.
@@ -308,12 +318,16 @@ pub fn diagnostics(
         Diagnostic::new(
             DiagnosticCode::RustcHardError("syntax-error"),
             format!("Syntax Error: {err}"),
-            FileRange { file_id, range: err.range() },
+            FileRange { file_id: file_id.into(), range: err.range() },
         )
     }));
+    let parse_errors = res.len();
 
     let parse = sema.parse(file_id);
 
+    // FIXME: This iterates the entire file which is a rather expensive operation.
+    // We should implement these differently in some form?
+    // Salsa caching + incremental re-parse would be better here
     for node in parse.syntax().descendants() {
         handlers::useless_braces::useless_braces(&mut res, file_id, &node);
         handlers::field_shorthand::field_shorthand(&mut res, file_id, &node);
@@ -326,8 +340,11 @@ pub fn diagnostics(
 
     let mut diags = Vec::new();
     match module {
-        Some(m) => m.diagnostics(db, &mut diags, config.style_lints),
-        None => handlers::unlinked_file::unlinked_file(&ctx, &mut res, file_id),
+        // A bunch of parse errors in a file indicate some bigger structural parse changes in the
+        // file, so we skip semantic diagnostics so we can show these faster.
+        Some(m) if parse_errors < 16 => m.diagnostics(db, &mut diags, config.style_lints),
+        Some(_) => (),
+        None => handlers::unlinked_file::unlinked_file(&ctx, &mut res, file_id.file_id()),
     }
 
     for diag in diags {
@@ -604,7 +621,7 @@ fn unresolved_fix(id: &'static str, label: &str, target: TextRange) -> Assist {
         group: None,
         target,
         source_change: None,
-        trigger_signature_help: false,
+        command: None,
     }
 }
 
@@ -618,4 +635,5 @@ fn adjusted_display_range<N: AstNode>(
     diag_ptr
         .with_value(adj(node).unwrap_or_else(|| diag_ptr.value.text_range()))
         .original_node_file_range_rooted(ctx.sema.db)
+        .into()
 }

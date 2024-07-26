@@ -6,10 +6,8 @@ import * as tasks from "./tasks";
 import type { CtxInit } from "./ctx";
 import { makeDebugConfig } from "./debug";
 import type { Config, RunnableEnvCfg, RunnableEnvCfgItem } from "./config";
-import { unwrapUndefinable } from "./undefinable";
 import type { LanguageClient } from "vscode-languageclient/node";
-import type { RustEditor } from "./util";
-import * as toolchain from "./toolchain";
+import { unwrapUndefinable, type RustEditor } from "./util";
 
 const quickPickButtons = [
     { iconPath: new vscode.ThemeIcon("save"), tooltip: "Save as a launch.json configuration." },
@@ -67,23 +65,21 @@ export class RunnableQuickPick implements vscode.QuickPickItem {
     }
 }
 
-export function prepareBaseEnv(): Record<string, string> {
+export function prepareBaseEnv(base?: Record<string, string>): Record<string, string> {
     const env: Record<string, string> = { RUST_BACKTRACE: "short" };
-    Object.assign(env, process.env as { [key: string]: string });
+    Object.assign(env, process.env);
+    if (base) {
+        Object.assign(env, base);
+    }
     return env;
 }
 
 export function prepareEnv(
     label: string,
     runnableArgs: ra.CargoRunnableArgs,
-    runnableEnvCfg: RunnableEnvCfg,
+    runnableEnvCfg?: RunnableEnvCfg,
 ): Record<string, string> {
-    const env = prepareBaseEnv();
-
-    if (runnableArgs.expectTest) {
-        env["UPDATE_EXPECT"] = "1";
-    }
-
+    const env = prepareBaseEnv(runnableArgs.environment);
     const platform = process.platform;
 
     const checkPlatform = (it: RunnableEnvCfgItem) => {
@@ -110,51 +106,56 @@ export function prepareEnv(
     return env;
 }
 
-export async function createTask(runnable: ra.Runnable, config: Config): Promise<vscode.Task> {
-    let definition: tasks.RustTargetDefinition;
+export async function createTaskFromRunnable(
+    runnable: ra.Runnable,
+    config: Config,
+): Promise<vscode.Task> {
+    const target = vscode.workspace.workspaceFolders?.[0];
+
+    let definition: tasks.TaskDefinition;
+    let options;
+    let cargo = "cargo";
     if (runnable.kind === "cargo") {
-        const runnableArgs = runnable.args as ra.CargoRunnableArgs;
+        const runnableArgs = runnable.args;
         let args = createCargoArgs(runnableArgs);
 
-        let program: string;
         if (runnableArgs.overrideCargo) {
             // Split on spaces to allow overrides like "wrapper cargo".
             const cargoParts = runnableArgs.overrideCargo.split(" ");
 
-            program = unwrapUndefinable(cargoParts[0]);
+            cargo = unwrapUndefinable(cargoParts[0]);
             args = [...cargoParts.slice(1), ...args];
-        } else {
-            program = await toolchain.cargoPath();
         }
 
         definition = {
-            type: tasks.TASK_TYPE,
-            command: program,
-            args,
+            type: tasks.CARGO_TASK_TYPE,
+            command: unwrapUndefinable(args[0]),
+            args: args.slice(1),
+        };
+        options = {
             cwd: runnableArgs.workspaceRoot || ".",
             env: prepareEnv(runnable.label, runnableArgs, config.runnablesExtraEnv),
         };
     } else {
-        const runnableArgs = runnable.args as ra.ShellRunnableArgs;
-
+        const runnableArgs = runnable.args;
         definition = {
-            type: "shell",
+            type: tasks.SHELL_TASK_TYPE,
             command: runnableArgs.program,
             args: runnableArgs.args,
+        };
+        options = {
             cwd: runnableArgs.cwd,
             env: prepareBaseEnv(),
         };
     }
 
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
-    const target = vscode.workspace.workspaceFolders![0]; // safe, see main activate()
+    const exec = await tasks.targetToExecution(definition, options, cargo);
     const task = await tasks.buildRustTask(
         target,
         definition,
         runnable.label,
         config.problemMatcher,
-        config.cargoRunner,
-        true,
+        exec,
     );
 
     task.presentationOptions.clear = true;
@@ -167,9 +168,6 @@ export async function createTask(runnable: ra.Runnable, config: Config): Promise
 
 export function createCargoArgs(runnableArgs: ra.CargoRunnableArgs): string[] {
     const args = [...runnableArgs.cargoArgs]; // should be a copy!
-    if (runnableArgs.cargoExtraArgs) {
-        args.push(...runnableArgs.cargoExtraArgs); // Append user-specified cargo options.
-    }
     if (runnableArgs.executableArgs.length > 0) {
         args.push("--", ...runnableArgs.executableArgs);
     }
@@ -199,7 +197,7 @@ async function getRunnables(
             continue;
         }
 
-        if (debuggeeOnly && (r.label.startsWith("doctest") || r.label.startsWith("cargo"))) {
+        if (debuggeeOnly && r.label.startsWith("doctest")) {
             continue;
         }
         items.push(new RunnableQuickPick(r));

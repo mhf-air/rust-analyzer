@@ -1,14 +1,14 @@
 //! Provides set of implementation for hir's objects that allows get back location in file.
 
-use base_db::FileId;
 use either::Either;
 use hir_def::{
     nameres::{ModuleOrigin, ModuleSource},
     src::{HasChildSource, HasSource as _},
-    Lookup, MacroId, VariantId,
+    CallableDefId, Lookup, MacroId, VariantId,
 };
 use hir_expand::{HirFileId, InFile};
-use hir_ty::{db::InternedClosure, CallableDefId};
+use hir_ty::db::InternedClosure;
+use span::EditionedFileId;
 use syntax::ast;
 use tt::TextRange;
 
@@ -26,7 +26,7 @@ pub trait HasSource {
     ///
     /// The current some implementations can return `InFile` instead of `Option<InFile>`.
     /// But we made this method `Option` to support rlib in the future
-    /// by https://github.com/rust-lang/rust-analyzer/issues/6913
+    /// by <https://github.com/rust-lang/rust-analyzer/issues/6913>
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>>;
 }
 
@@ -58,7 +58,7 @@ impl Module {
         }
     }
 
-    pub fn as_source_file_id(self, db: &dyn HirDatabase) -> Option<FileId> {
+    pub fn as_source_file_id(self, db: &dyn HirDatabase) -> Option<EditionedFileId> {
         let def_map = self.id.def_map(db.upcast());
         match def_map[self.id.local_id].origin {
             ModuleOrigin::File { definition, .. } | ModuleOrigin::CrateRoot { definition, .. } => {

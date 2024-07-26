@@ -3,11 +3,10 @@ import * as vscode from "vscode";
 import * as path from "path";
 import type * as ra from "./lsp_ext";
 
-import { Cargo, getRustcId, getSysroot } from "./toolchain";
+import { Cargo } from "./toolchain";
 import type { Ctx } from "./ctx";
 import { prepareEnv } from "./run";
-import { unwrapUndefinable } from "./undefinable";
-import { isCargoRunnableArgs } from "./util";
+import { execute, isCargoRunnableArgs, unwrapUndefinable } from "./util";
 
 const debugOutput = vscode.window.createOutputChannel("Debug");
 type DebugConfigProvider = (
@@ -136,25 +135,36 @@ async function getDebugConfiguration(
     const workspaceQualifier = isMultiFolderWorkspace ? `:${workspace.name}` : "";
     function simplifyPath(p: string): string {
         // see https://github.com/rust-lang/rust-analyzer/pull/5513#issuecomment-663458818 for why this is needed
-        return path.normalize(p).replace(wsFolder, "${workspaceFolder" + workspaceQualifier + "}");
+        return path.normalize(p).replace(wsFolder, `\${workspaceFolder${workspaceQualifier}}`);
     }
 
     const env = prepareEnv(runnable.label, runnableArgs, ctx.config.runnablesExtraEnv);
     const executable = await getDebugExecutable(runnableArgs, env);
     let sourceFileMap = debugOptions.sourceFileMap;
     if (sourceFileMap === "auto") {
-        // let's try to use the default toolchain
-        const [commitHash, sysroot] = await Promise.all([
-            getRustcId(wsFolder),
-            getSysroot(wsFolder),
-        ]);
-        const rustlib = path.normalize(sysroot + "/lib/rustlib/src/rust");
         sourceFileMap = {};
-        sourceFileMap[`/rustc/${commitHash}/`] = rustlib;
+        const sysroot = env["RUSTC_TOOLCHAIN"];
+        if (sysroot) {
+            // let's try to use the default toolchain
+            const data = await execute(`rustc -V -v`, { cwd: wsFolder, env });
+            const rx = /commit-hash:\s(.*)$/m;
+
+            const commitHash = rx.exec(data)?.[1];
+            if (commitHash) {
+                const rustlib = path.normalize(sysroot + "/lib/rustlib/src/rust");
+                sourceFileMap[`/rustc/${commitHash}/`] = rustlib;
+            }
+        }
     }
 
     const provider = unwrapUndefinable(knownEngines[debugEngine.id]);
-    const debugConfig = provider(runnable, runnableArgs, simplifyPath(executable), env);
+    const debugConfig = provider(
+        runnable,
+        runnableArgs,
+        simplifyPath(executable),
+        env,
+        sourceFileMap,
+    );
     if (debugConfig.type in debugOptions.engineSettings) {
         const settingsMap = (debugOptions.engineSettings as any)[debugConfig.type];
         for (var key in settingsMap) {
@@ -181,7 +191,7 @@ async function getDebugExecutable(
     env: Record<string, string>,
 ): Promise<string> {
     const cargo = new Cargo(runnableArgs.workspaceRoot || ".", debugOutput, env);
-    const executable = await cargo.executableFromArgs(runnableArgs.cargoArgs);
+    const executable = await cargo.executableFromArgs(runnableArgs);
 
     // if we are here, there were no compilation errors.
     return executable;
