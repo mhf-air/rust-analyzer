@@ -7,11 +7,15 @@ use syntax::{
     ast::{self, HasName},
     AstNode,
 };
+use syntax_bridge::{
+    dummy_test_span_utils::{DummyTestSpanMap, DUMMY},
+    syntax_node_to_token_tree, DocCommentDesugarMode,
+};
 use test_utils::{bench, bench_fixture, skip_slow_tests};
 
 use crate::{
     parser::{MetaVarKind, Op, RepeatKind, Separator},
-    syntax_node_to_token_tree, DeclarativeMacro, DocCommentDesugarMode, DummyTestSpanMap, DUMMY,
+    DeclarativeMacro,
 };
 
 #[test]
@@ -45,7 +49,7 @@ fn benchmark_expand_macro_rules() {
         invocations
             .into_iter()
             .map(|(id, tt)| {
-                let res = rules[&id].expand(&tt, |_| (), true, DUMMY, Edition::CURRENT);
+                let res = rules[&id].expand(&tt, |_| (), DUMMY, Edition::CURRENT);
                 assert!(res.err.is_none());
                 res.value.0.token_trees.len()
             })
@@ -118,7 +122,7 @@ fn invocation_fixtures(
                         },
                         token_trees: token_trees.into_boxed_slice(),
                     };
-                    if it.expand(&subtree, |_| (), true, DUMMY, Edition::CURRENT).err.is_none() {
+                    if it.expand(&subtree, |_| (), DUMMY, Edition::CURRENT).err.is_none() {
                         res.push((name.clone(), subtree));
                         break;
                     }

@@ -1,9 +1,9 @@
 //! A set of high-level utility fixture methods to use in tests.
-use std::{iter, mem, ops::Not, str::FromStr, sync};
+use std::{iter, mem, str::FromStr, sync};
 
 use base_db::{
     CrateDisplayName, CrateGraph, CrateId, CrateName, CrateOrigin, Dependency, Env, FileChange,
-    FileSet, LangCrateOrigin, SourceDatabaseExt, SourceRoot, Version, VfsPath,
+    FileSet, LangCrateOrigin, SourceRoot, SourceRootDatabase, Version, VfsPath,
 };
 use cfg::CfgOptions;
 use hir_expand::{
@@ -11,7 +11,7 @@ use hir_expand::{
     db::ExpandDatabase,
     files::FilePosition,
     proc_macro::{
-        ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, ProcMacros,
+        ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, ProcMacrosBuilder,
     },
     FileRange,
 };
@@ -26,7 +26,7 @@ use tt::{Leaf, Subtree, TokenTree};
 
 pub const WORKSPACE: base_db::SourceRootId = base_db::SourceRootId(0);
 
-pub trait WithFixture: Default + ExpandDatabase + SourceDatabaseExt + 'static {
+pub trait WithFixture: Default + ExpandDatabase + SourceRootDatabase + 'static {
     #[track_caller]
     fn with_single_file(ra_fixture: &str) -> (Self, EditionedFileId) {
         let fixture = ChangeFixture::parse(ra_fixture);
@@ -101,7 +101,7 @@ pub trait WithFixture: Default + ExpandDatabase + SourceDatabaseExt + 'static {
     }
 }
 
-impl<DB: ExpandDatabase + SourceDatabaseExt + Default + 'static> WithFixture for DB {}
+impl<DB: ExpandDatabase + SourceRootDatabase + Default + 'static> WithFixture for DB {}
 
 pub struct ChangeFixture {
     pub file_position: Option<(EditionedFileId, RangeOrOffset)>,
@@ -303,7 +303,7 @@ impl ChangeFixture {
             }
         }
 
-        let mut proc_macros = ProcMacros::default();
+        let mut proc_macros = ProcMacrosBuilder::default();
         if !proc_macro_names.is_empty() {
             let proc_lib_file = file_id;
 
@@ -354,7 +354,7 @@ impl ChangeFixture {
 
         let mut change = ChangeWithProcMacros {
             source_change,
-            proc_macros: proc_macros.is_empty().not().then_some(proc_macros),
+            proc_macros: Some(proc_macros.build()),
             toolchains: Some(iter::repeat(toolchain).take(crate_graph.len()).collect()),
             target_data_layouts: Some(
                 iter::repeat(target_data_layout).take(crate_graph.len()).collect(),

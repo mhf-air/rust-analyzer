@@ -19,9 +19,9 @@
 //!
 //! See the full discussion : <https://rust-lang.zulipchat.com/#narrow/stream/131828-t-compiler/topic/Eager.20expansion.20of.20built-in.20macros>
 use base_db::CrateId;
-use mbe::DocCommentDesugarMode;
 use span::SyntaxContextId;
 use syntax::{ted, Parse, SyntaxElement, SyntaxNode, TextSize, WalkEvent};
+use syntax_bridge::DocCommentDesugarMode;
 use triomphe::Arc;
 
 use crate::{
@@ -82,7 +82,7 @@ pub fn expand_eager_macro_input(
         return ExpandResult { value: None, err };
     };
 
-    let mut subtree = mbe::syntax_node_to_token_tree(
+    let mut subtree = syntax_bridge::syntax_node_to_token_tree(
         &expanded_eager_input,
         arg_map,
         span,
@@ -176,14 +176,20 @@ fn eager_macro_recur(
             Some(path) => match macro_resolver(&path) {
                 Some(def) => def,
                 None => {
-                    error =
-                        Some(ExpandError::other(format!("unresolved macro {}", path.display(db))));
+                    let edition = db.crate_graph()[krate].edition;
+                    error = Some(ExpandError::other(
+                        span_map.span_at(call.syntax().text_range().start()),
+                        format!("unresolved macro {}", path.display(db, edition)),
+                    ));
                     offset += call.syntax().text_range().len();
                     continue;
                 }
             },
             None => {
-                error = Some(ExpandError::other("malformed macro invocation"));
+                error = Some(ExpandError::other(
+                    span_map.span_at(call.syntax().text_range().start()),
+                    "malformed macro invocation",
+                ));
                 offset += call.syntax().text_range().len();
                 continue;
             }

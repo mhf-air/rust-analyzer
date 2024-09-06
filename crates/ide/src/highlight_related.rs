@@ -1,6 +1,6 @@
 use std::iter;
 
-use hir::{db, DescendPreference, FilePosition, FileRange, HirFileId, InFile, Semantics};
+use hir::{db, FilePosition, FileRange, HirFileId, InFile, Semantics};
 use ide_db::{
     defs::{Definition, IdentClass},
     helpers::pick_best_token,
@@ -65,7 +65,7 @@ pub(crate) fn highlight_related(
     let token = pick_best_token(syntax.token_at_offset(offset), |kind| match kind {
         T![?] => 4, // prefer `?` when the cursor is sandwiched like in `await$0?`
         T![->] => 4,
-        kind if kind.is_keyword() => 3,
+        kind if kind.is_keyword(file_id.edition()) => 3,
         IDENT | INT_NUMBER => 2,
         T![|] => 1,
         _ => 0,
@@ -542,7 +542,7 @@ fn cover_range(r0: Option<TextRange>, r1: Option<TextRange>) -> Option<TextRange
 }
 
 fn find_defs(sema: &Semantics<'_, RootDatabase>, token: SyntaxToken) -> FxHashSet<Definition> {
-    sema.descend_into_macros(DescendPreference::None, token)
+    sema.descend_into_macros_exact(token)
         .into_iter()
         .filter_map(|token| IdentClass::classify_token(sema, &token))
         .flat_map(IdentClass::definitions_no_ops)
@@ -2003,6 +2003,36 @@ fn main() {
 //- /a.rs
 {
     return;
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn asm() {
+        check(
+            r#"
+//- minicore: asm
+#[inline]
+pub unsafe fn bootstrap() -> ! {
+    builtin#asm(
+        "blabla",
+        "mrs {tmp}, CONTROL",
+           // ^^^ read
+        "blabla",
+        "bics {tmp}, {spsel}",
+            // ^^^ read
+        "blabla",
+        "msr CONTROL, {tmp}",
+                    // ^^^ read
+        "blabla",
+        tmp$0 = inout(reg) 0,
+     // ^^^
+        aaa = in(reg) 2,
+        aaa = in(reg) msp,
+        aaa = in(reg) rv,
+        options(noreturn, nomem, nostack),
+    );
 }
 "#,
         )

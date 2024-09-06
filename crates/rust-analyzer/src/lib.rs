@@ -11,10 +11,10 @@
 
 pub mod cli;
 
-mod capabilities;
+mod command;
 mod diagnostics;
-mod diff;
-mod dispatch;
+mod discover;
+mod flycheck;
 mod hack_recover_crate_name;
 mod line_index;
 mod main_loop;
@@ -23,10 +23,12 @@ mod op_queue;
 mod reload;
 mod target_spec;
 mod task_pool;
+mod test_runner;
 mod version;
 mod u_path;
 
 mod handlers {
+    pub(crate) mod dispatch;
     pub(crate) mod notification;
     pub(crate) mod request;
 }
@@ -48,7 +50,7 @@ mod integrated_benchmarks;
 use serde::de::DeserializeOwned;
 
 pub use crate::{
-    capabilities::server_capabilities, main_loop::main_loop, reload::ws_to_crate_graph,
+    lsp::capabilities::server_capabilities, main_loop::main_loop, reload::ws_to_crate_graph,
     version::version,
 };
 

@@ -1,13 +1,15 @@
 //! Transforms `ast::Expr` into an equivalent `hir_def::expr::Expr`
 //! representation.
 
+mod asm;
+
 use std::mem;
 
 use base_db::CrateId;
 use either::Either;
 use hir_expand::{
     name::{AsName, Name},
-    ExpandError, InFile,
+    InFile,
 };
 use intern::{sym, Interned, Symbol};
 use rustc_hash::FxHashMap;
@@ -35,8 +37,8 @@ use crate::{
             FormatPlaceholder, FormatSign, FormatTrait,
         },
         Array, Binding, BindingAnnotation, BindingId, BindingProblems, CaptureBy, ClosureKind,
-        Expr, ExprId, InlineAsm, Label, LabelId, Literal, LiteralOrConst, MatchArm, Movability,
-        OffsetOf, Pat, PatId, RecordFieldPat, RecordLitField, Statement,
+        Expr, ExprId, Label, LabelId, Literal, LiteralOrConst, MatchArm, Movability, OffsetOf, Pat,
+        PatId, RecordFieldPat, RecordLitField, Statement,
     },
     item_scope::BuiltinShadowMode,
     lang_item::LangItem,
@@ -72,6 +74,7 @@ pub(super) fn lower(
         is_lowering_coroutine: false,
         label_ribs: Vec::new(),
         current_binding_owner: None,
+        awaitable_context: None,
     }
     .collect(params, body, is_async_fn)
 }
@@ -100,6 +103,8 @@ struct ExprCollector<'a> {
     // resolution
     label_ribs: Vec<LabelRib>,
     current_binding_owner: Option<ExprId>,
+
+    awaitable_context: Option<Awaitable>,
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +138,11 @@ impl RibKind {
             RibKind::Closure | RibKind::Constant => true,
         }
     }
+}
+
+enum Awaitable {
+    Yes,
+    No(&'static str),
 }
 
 #[derive(Debug, Default)]
@@ -180,6 +190,18 @@ impl ExprCollector<'_> {
         body: Option<ast::Expr>,
         is_async_fn: bool,
     ) -> (Body, BodySourceMap) {
+        self.awaitable_context.replace(if is_async_fn {
+            Awaitable::Yes
+        } else {
+            match self.owner {
+                DefWithBodyId::FunctionId(..) => Awaitable::No("non-async function"),
+                DefWithBodyId::StaticId(..) => Awaitable::No("static"),
+                DefWithBodyId::ConstId(..) | DefWithBodyId::InTypeConstId(..) => {
+                    Awaitable::No("constant")
+                }
+                DefWithBodyId::VariantId(..) => Awaitable::No("enum variant"),
+            }
+        });
         if let Some((param_list, mut attr_enabled)) = param_list {
             let mut params = vec![];
             if let Some(self_param) =
@@ -280,31 +302,40 @@ impl ExprCollector<'_> {
                 }
                 Some(ast::BlockModifier::Async(_)) => {
                     self.with_label_rib(RibKind::Closure, |this| {
-                        this.collect_block_(e, |id, statements, tail| Expr::Async {
-                            id,
-                            statements,
-                            tail,
+                        this.with_awaitable_block(Awaitable::Yes, |this| {
+                            this.collect_block_(e, |id, statements, tail| Expr::Async {
+                                id,
+                                statements,
+                                tail,
+                            })
                         })
                     })
                 }
                 Some(ast::BlockModifier::Const(_)) => {
                     self.with_label_rib(RibKind::Constant, |this| {
-                        let (result_expr_id, prev_binding_owner) =
-                            this.initialize_binding_owner(syntax_ptr);
-                        let inner_expr = this.collect_block(e);
-                        let it = this.db.intern_anonymous_const(ConstBlockLoc {
-                            parent: this.owner,
-                            root: inner_expr,
-                        });
-                        this.body.exprs[result_expr_id] = Expr::Const(it);
-                        this.current_binding_owner = prev_binding_owner;
-                        result_expr_id
+                        this.with_awaitable_block(Awaitable::No("constant block"), |this| {
+                            let (result_expr_id, prev_binding_owner) =
+                                this.initialize_binding_owner(syntax_ptr);
+                            let inner_expr = this.collect_block(e);
+                            let it = this.db.intern_anonymous_const(ConstBlockLoc {
+                                parent: this.owner,
+                                root: inner_expr,
+                            });
+                            this.body.exprs[result_expr_id] = Expr::Const(it);
+                            this.current_binding_owner = prev_binding_owner;
+                            result_expr_id
+                        })
                     })
                 }
                 // FIXME
-                Some(ast::BlockModifier::AsyncGen(_)) | Some(ast::BlockModifier::Gen(_)) | None => {
-                    self.collect_block(e)
+                Some(ast::BlockModifier::AsyncGen(_)) => {
+                    self.with_awaitable_block(Awaitable::Yes, |this| this.collect_block(e))
                 }
+                Some(ast::BlockModifier::Gen(_)) => self
+                    .with_awaitable_block(Awaitable::No("non-async gen block"), |this| {
+                        this.collect_block(e)
+                    }),
+                None => self.collect_block(e),
             },
             ast::Expr::LoopExpr(e) => {
                 let label = e.label().map(|label| self.collect_label(label));
@@ -469,6 +500,12 @@ impl ExprCollector<'_> {
             }
             ast::Expr::AwaitExpr(e) => {
                 let expr = self.collect_expr_opt(e.expr());
+                if let Awaitable::No(location) = self.is_lowering_awaitable_block() {
+                    self.source_map.diagnostics.push(BodyDiagnostic::AwaitOutsideOfAsync {
+                        node: InFile::new(self.expander.current_file_id(), AstPtr::new(&e)),
+                        location: location.to_string(),
+                    });
+                }
                 self.alloc_expr(Expr::Await { expr }, syntax_ptr)
             }
             ast::Expr::TryExpr(e) => self.collect_try_operator(syntax_ptr, e),
@@ -527,7 +564,13 @@ impl ExprCollector<'_> {
                 let prev_is_lowering_coroutine = mem::take(&mut this.is_lowering_coroutine);
                 let prev_try_block_label = this.current_try_block_label.take();
 
-                let body = this.collect_expr_opt(e.body());
+                let awaitable = if e.async_token().is_some() {
+                    Awaitable::Yes
+                } else {
+                    Awaitable::No("non-async closure")
+                };
+                let body =
+                    this.with_awaitable_block(awaitable, |this| this.collect_expr_opt(e.body()));
 
                 let closure_kind = if this.is_lowering_coroutine {
                     let movability = if e.static_token().is_some() {
@@ -652,10 +695,7 @@ impl ExprCollector<'_> {
                 }
             }
             ast::Expr::UnderscoreExpr(_) => self.alloc_expr(Expr::Underscore, syntax_ptr),
-            ast::Expr::AsmExpr(e) => {
-                let e = self.collect_expr_opt(e.expr());
-                self.alloc_expr(Expr::InlineAsm(InlineAsm { e }), syntax_ptr)
-            }
+            ast::Expr::AsmExpr(e) => self.lower_inline_asm(e, syntax_ptr),
             ast::Expr::OffsetOfExpr(e) => {
                 let container = Interned::new(TypeRef::from_ast_opt(&self.ctx(), e.ty()));
                 let fields = e.fields().map(|it| it.as_name()).collect();
@@ -696,7 +736,7 @@ impl ExprCollector<'_> {
     /// `try { <stmts>; }` into `'<new_label>: { <stmts>; ::std::ops::Try::from_output(()) }`
     /// and save the `<new_label>` to use it as a break target for desugaring of the `?` operator.
     fn desugar_try_block(&mut self, e: BlockExpr) -> ExprId {
-        let Some(try_from_output) = LangItem::TryTraitFromOutput.path(self.db, self.krate) else {
+        let Some(try_from_output) = self.lang_path(LangItem::TryTraitFromOutput) else {
             return self.collect_block(e);
         };
         let label = self
@@ -799,10 +839,10 @@ impl ExprCollector<'_> {
     fn collect_for_loop(&mut self, syntax_ptr: AstPtr<ast::Expr>, e: ast::ForExpr) -> ExprId {
         let Some((into_iter_fn, iter_next_fn, option_some, option_none)) = (|| {
             Some((
-                LangItem::IntoIterIntoIter.path(self.db, self.krate)?,
-                LangItem::IteratorNext.path(self.db, self.krate)?,
-                LangItem::OptionSome.path(self.db, self.krate)?,
-                LangItem::OptionNone.path(self.db, self.krate)?,
+                self.lang_path(LangItem::IntoIterIntoIter)?,
+                self.lang_path(LangItem::IteratorNext)?,
+                self.lang_path(LangItem::OptionSome)?,
+                self.lang_path(LangItem::OptionNone)?,
             ))
         })() else {
             // Some of the needed lang items are missing, so we can't desugar
@@ -855,6 +895,15 @@ impl ExprCollector<'_> {
             Expr::Match { expr: iter_next_expr, arms: Box::new([none_arm, some_arm]) },
             syntax_ptr,
         );
+        let loop_inner = self.alloc_expr(
+            Expr::Block {
+                id: None,
+                statements: Box::default(),
+                tail: Some(loop_inner),
+                label: None,
+            },
+            syntax_ptr,
+        );
         let loop_outer = self.alloc_expr(Expr::Loop { body: loop_inner, label }, syntax_ptr);
         let iter_binding = self.alloc_binding(iter_name, BindingAnnotation::Mutable);
         let iter_pat = self.alloc_pat_desugared(Pat::Bind { id: iter_binding, subpat: None });
@@ -882,10 +931,10 @@ impl ExprCollector<'_> {
     fn collect_try_operator(&mut self, syntax_ptr: AstPtr<ast::Expr>, e: ast::TryExpr) -> ExprId {
         let Some((try_branch, cf_continue, cf_break, try_from_residual)) = (|| {
             Some((
-                LangItem::TryTraitBranch.path(self.db, self.krate)?,
-                LangItem::ControlFlowContinue.path(self.db, self.krate)?,
-                LangItem::ControlFlowBreak.path(self.db, self.krate)?,
-                LangItem::TryTraitFromResidual.path(self.db, self.krate)?,
+                self.lang_path(LangItem::TryTraitBranch)?,
+                self.lang_path(LangItem::ControlFlowContinue)?,
+                self.lang_path(LangItem::ControlFlowBreak)?,
+                self.lang_path(LangItem::TryTraitFromResidual)?,
             ))
         })() else {
             // Some of the needed lang items are missing, so we can't desugar
@@ -992,20 +1041,11 @@ impl ExprCollector<'_> {
             }
         };
         if record_diagnostics {
-            match &res.err {
-                Some(ExpandError::UnresolvedProcMacro(krate)) => {
-                    self.source_map.diagnostics.push(BodyDiagnostic::UnresolvedProcMacro {
-                        node: InFile::new(outer_file, syntax_ptr),
-                        krate: *krate,
-                    });
-                }
-                Some(err) => {
-                    self.source_map.diagnostics.push(BodyDiagnostic::MacroError {
-                        node: InFile::new(outer_file, syntax_ptr),
-                        message: err.to_string(),
-                    });
-                }
-                None => {}
+            if let Some(err) = res.err {
+                self.source_map.diagnostics.push(BodyDiagnostic::MacroError {
+                    node: InFile::new(outer_file, syntax_ptr),
+                    err,
+                });
             }
         }
 
@@ -1807,7 +1847,7 @@ impl ExprCollector<'_> {
             },
             syntax_ptr,
         );
-        self.source_map.format_args_template_map.insert(idx, mappings);
+        self.source_map.template_map.get_or_insert_with(Default::default).0.insert(idx, mappings);
         idx
     }
 
@@ -2020,7 +2060,12 @@ impl ExprCollector<'_> {
             is_assignee_expr: false,
         })
     }
+
     // endregion: format
+
+    fn lang_path(&self, lang: LangItem) -> Option<Path> {
+        lang.path(self.db, self.krate)
+    }
 }
 
 fn pat_literal_to_hir(lit: &ast::LiteralPat) -> Option<(Literal, ast::Literal)> {
@@ -2090,6 +2135,21 @@ impl ExprCollector<'_> {
     // FIXME: desugared labels don't have ptr, that's wrong and should be fixed somehow.
     fn alloc_label_desugared(&mut self, label: Label) -> LabelId {
         self.body.labels.alloc(label)
+    }
+
+    fn is_lowering_awaitable_block(&self) -> &Awaitable {
+        self.awaitable_context.as_ref().unwrap_or(&Awaitable::No("unknown"))
+    }
+
+    fn with_awaitable_block<T>(
+        &mut self,
+        awaitable: Awaitable,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let orig = self.awaitable_context.replace(awaitable);
+        let res = f(self);
+        self.awaitable_context = orig;
+        res
     }
 }
 

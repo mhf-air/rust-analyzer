@@ -27,7 +27,7 @@ use lsp_types::{
     SemanticTokensResult, SymbolInformation, SymbolTag, TextDocumentIdentifier, Url, WorkspaceEdit,
 };
 use paths::Utf8PathBuf;
-use project_model::{ManifestPath, ProjectWorkspaceKind, TargetKind};
+use project_model::{CargoWorkspace, ManifestPath, ProjectWorkspaceKind, TargetKind};
 use serde_json::json;
 use stdx::{format_to, never};
 use syntax::{algo, ast, AstNode, TextRange, TextSize};
@@ -36,7 +36,6 @@ use vfs::{AbsPath, AbsPathBuf, FileId, VfsPath};
 
 use crate::{
     config::{Config, RustfmtConfig, WorkspaceSymbolConfig},
-    diff::diff,
     global_state::{FetchWorkspaceRequest, GlobalState, GlobalStateSnapshot},
     hack_recover_crate_name,
     line_index::LineEndings,
@@ -51,6 +50,7 @@ use crate::{
         FetchDependencyListResult, PositionOrRange, ViewCrateGraphParams, WorkspaceSymbolParams,
     },
     target_spec::{CargoTargetSpec, TargetSpec},
+    test_runner::{CargoTestHandle, TestTarget},
     u_path::{
         u_to_rs_position, u_to_rs_url, u_transform_completion_items, u_transform_signature_help,
     },
@@ -137,11 +137,6 @@ pub(crate) fn handle_memory_usage(state: &mut GlobalState, _: ()) -> anyhow::Res
     Ok(out)
 }
 
-pub(crate) fn handle_shuffle_crate_graph(state: &mut GlobalState, _: ()) -> anyhow::Result<()> {
-    state.analysis_host.shuffle_crate_graph();
-    Ok(())
-}
-
 pub(crate) fn handle_syntax_tree(
     snap: GlobalStateSnapshot,
     params: lsp_ext::SyntaxTreeParams,
@@ -202,6 +197,20 @@ pub(crate) fn handle_view_item_tree(
     Ok(res)
 }
 
+// cargo test requires the real package name which might contain hyphens but
+// the test identifier passed to this function is the namespace form where hyphens
+// are replaced with underscores so we have to reverse this and find the real package name
+fn find_package_name(namespace_root: &str, cargo: &CargoWorkspace) -> Option<String> {
+    cargo.packages().find_map(|p| {
+        let package_name = &cargo[p].name;
+        if package_name.replace('-', "_") == namespace_root {
+            Some(package_name.clone())
+        } else {
+            None
+        }
+    })
+}
+
 pub(crate) fn handle_run_test(
     state: &mut GlobalState,
     params: lsp_ext::RunTestParams,
@@ -209,7 +218,7 @@ pub(crate) fn handle_run_test(
     if let Some(_session) = state.test_run_session.take() {
         state.send_notification::<lsp_ext::EndRunTest>(());
     }
-    // We detect the lowest common ansector of all included tests, and
+    // We detect the lowest common ancestor of all included tests, and
     // run it. We ignore excluded tests for now, the client will handle
     // it for us.
     let lca = match params.include {
@@ -228,20 +237,31 @@ pub(crate) fn handle_run_test(
             .unwrap_or_default(),
         None => "".to_owned(),
     };
-    let test_path = if lca.is_empty() {
-        None
-    } else if let Some((_, path)) = lca.split_once("::") {
-        Some(path)
+    let (namespace_root, test_path) = if lca.is_empty() {
+        (None, None)
+    } else if let Some((namespace_root, path)) = lca.split_once("::") {
+        (Some(namespace_root), Some(path))
     } else {
-        None
+        (Some(lca.as_str()), None)
     };
     let mut handles = vec![];
     for ws in &*state.workspaces {
         if let ProjectWorkspaceKind::Cargo { cargo, .. } = &ws.kind {
-            let handle = flycheck::CargoTestHandle::new(
+            let test_target = if let Some(namespace_root) = namespace_root {
+                if let Some(package_name) = find_package_name(namespace_root, cargo) {
+                    TestTarget::Package(package_name)
+                } else {
+                    TestTarget::Workspace
+                }
+            } else {
+                TestTarget::Workspace
+            };
+
+            let handle = CargoTestHandle::new(
                 test_path,
-                state.config.cargo_test_options(),
+                state.config.cargo_test_options(None),
                 cargo.workspace_root(),
+                test_target,
                 state.test_run_sender.clone(),
             )?;
             handles.push(handle);
@@ -548,7 +568,7 @@ pub(crate) fn handle_workspace_symbol(
 ) -> anyhow::Result<Option<lsp_types::WorkspaceSymbolResponse>> {
     let _p = tracing::info_span!("handle_workspace_symbol").entered();
 
-    let config = snap.config.workspace_symbol();
+    let config = snap.config.workspace_symbol(None);
     let (all_symbols, libs) = decide_search_scope_and_kind(&params, &config);
 
     let query = {
@@ -771,9 +791,12 @@ pub(crate) fn handle_parent_module(
     if let Ok(file_path) = &params.text_document.uri.to_file_path() {
         if file_path.file_name().unwrap_or_default() == "Cargo.toml" {
             // search workspaces for parent packages or fallback to workspace root
-            let abs_path_buf = match AbsPathBuf::try_from(file_path.to_path_buf()).ok() {
-                Some(abs_path_buf) => abs_path_buf,
-                None => return Ok(None),
+            let abs_path_buf = match Utf8PathBuf::from_path_buf(file_path.to_path_buf())
+                .ok()
+                .map(AbsPathBuf::try_from)
+            {
+                Some(Ok(abs_path_buf)) => abs_path_buf,
+                _ => return Ok(None),
             };
 
             let manifest_path = match ManifestPath::try_from(abs_path_buf).ok() {
@@ -786,7 +809,7 @@ pub(crate) fn handle_parent_module(
                 .iter()
                 .filter_map(|ws| match &ws.kind {
                     ProjectWorkspaceKind::Cargo { cargo, .. }
-                    | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, _)), .. } => {
+                    | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, _, _)), .. } => {
                         cargo.parent_manifests(&manifest_path)
                     }
                     _ => None,
@@ -839,6 +862,7 @@ pub(crate) fn handle_runnables(
 ) -> anyhow::Result<Vec<lsp_ext::Runnable>> {
     let _p = tracing::info_span!("handle_runnables").entered();
     let file_id = from_proto::file_id(&snap, &params.text_document.uri)?;
+    let source_root = snap.analysis.source_root_id(file_id).ok();
     let line_index = snap.file_line_index(file_id)?;
     let offset = params.position.and_then(|it| from_proto::offset(&line_index, it).ok());
     let target_spec = TargetSpec::for_file(&snap, file_id)?;
@@ -881,7 +905,7 @@ pub(crate) fn handle_runnables(
     }
 
     // Add `cargo check` and `cargo test` for all targets of the whole package
-    let config = snap.config.runnables();
+    let config = snap.config.runnables(source_root);
     match target_spec {
         Some(TargetSpec::Cargo(spec)) => {
             let is_crate_no_std = snap.analysis.is_crate_no_std(spec.crate_id)?;
@@ -1616,14 +1640,14 @@ pub(crate) fn handle_inlay_hints_resolve(
     anyhow::ensure!(snap.file_exists(file_id), "Invalid LSP resolve data");
 
     let line_index = snap.file_line_index(file_id)?;
-    let hint_position = from_proto::offset(&line_index, original_hint.position)?;
+    let range = from_proto::text_range(&line_index, resolve_data.resolve_range)?;
 
     let mut forced_resolve_inlay_hints_config = snap.config.inlay_hints();
     forced_resolve_inlay_hints_config.fields_to_resolve = InlayFieldsToResolve::empty();
     let resolve_hints = snap.analysis.inlay_hints_resolve(
         &forced_resolve_inlay_hints_config,
         file_id,
-        hint_position,
+        range,
         hash,
         |hint| {
             std::hash::BuildHasher::hash_one(
@@ -1853,7 +1877,7 @@ pub(crate) fn handle_open_docs(
 
     let ws_and_sysroot = snap.workspaces.iter().find_map(|ws| match &ws.kind {
         ProjectWorkspaceKind::Cargo { cargo, .. }
-        | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, _)), .. } => {
+        | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, _, _)), .. } => {
             Some((cargo, &ws.sysroot))
         }
         ProjectWorkspaceKind::Json { .. } => None,
@@ -2127,12 +2151,13 @@ fn run_rustfmt(
     let edition = editions.iter().copied().max();
 
     let line_index = snap.file_line_index(file_id)?;
+    let source_root_id = snap.analysis.source_root_id(file_id).ok();
 
-    let mut command = match snap.config.rustfmt() {
+    let mut command = match snap.config.rustfmt(source_root_id) {
         RustfmtConfig::Rustfmt { extra_args, enable_range_formatting } => {
             // FIXME: Set RUSTUP_TOOLCHAIN
             let mut cmd = process::Command::new(toolchain::Tool::Rustfmt.path());
-            cmd.envs(snap.config.extra_env());
+            cmd.envs(snap.config.extra_env(source_root_id));
             cmd.args(extra_args);
 
             if let Some(edition) = edition {
@@ -2190,7 +2215,7 @@ fn run_rustfmt(
                 _ => process::Command::new(cmd),
             };
 
-            cmd.envs(snap.config.extra_env());
+            cmd.envs(snap.config.extra_env(source_root_id));
             cmd.args(args);
             cmd
         }
@@ -2316,8 +2341,8 @@ pub(crate) fn internal_testing_fetch_config(
         .transpose()?;
     serde_json::to_value(match &*params.config {
         "local" => state.config.assist(source_root).assist_emit_must_use,
-        "global" => matches!(
-            state.config.rustfmt(),
+        "workspace" => matches!(
+            state.config.rustfmt(source_root),
             RustfmtConfig::Rustfmt { enable_range_formatting: true, .. }
         ),
         _ => return Err(anyhow::anyhow!("Unknown test config key: {}", params.config)),
@@ -2381,4 +2406,48 @@ fn resolve_resource_op(op: &ResourceOp) -> ResourceOperationKind {
         ResourceOp::Rename(_) => ResourceOperationKind::Rename,
         ResourceOp::Delete(_) => ResourceOperationKind::Delete,
     }
+}
+
+pub(crate) fn diff(left: &str, right: &str) -> TextEdit {
+    use dissimilar::Chunk;
+
+    let chunks = dissimilar::diff(left, right);
+
+    let mut builder = TextEdit::builder();
+    let mut pos = TextSize::default();
+
+    let mut chunks = chunks.into_iter().peekable();
+    while let Some(chunk) = chunks.next() {
+        if let (Chunk::Delete(deleted), Some(&Chunk::Insert(inserted))) = (chunk, chunks.peek()) {
+            chunks.next().unwrap();
+            let deleted_len = TextSize::of(deleted);
+            builder.replace(TextRange::at(pos, deleted_len), inserted.into());
+            pos += deleted_len;
+            continue;
+        }
+
+        match chunk {
+            Chunk::Equal(text) => {
+                pos += TextSize::of(text);
+            }
+            Chunk::Delete(deleted) => {
+                let deleted_len = TextSize::of(deleted);
+                builder.delete(TextRange::at(pos, deleted_len));
+                pos += deleted_len;
+            }
+            Chunk::Insert(inserted) => {
+                builder.insert(pos, inserted.into());
+            }
+        }
+    }
+    builder.finish()
+}
+
+#[test]
+fn diff_smoke_test() {
+    let mut original = String::from("fn foo(a:u32){\n}");
+    let result = "fn foo(a: u32) {}";
+    let edit = diff(&original, result);
+    edit.apply(&mut original);
+    assert_eq!(original, result);
 }

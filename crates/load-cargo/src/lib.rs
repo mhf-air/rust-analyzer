@@ -16,11 +16,16 @@ use ide_db::{
 use itertools::Itertools;
 use proc_macro_api::{MacroDylib, ProcMacroServer};
 use project_model::{
-    CargoConfig, ManifestPath, PackageRoot, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind,
+    CargoConfig, PackageRoot, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind,
 };
 use span::Span;
-use vfs::{file_set::FileSetConfig, loader::Handle, AbsPath, AbsPathBuf, VfsPath};
+use vfs::{
+    file_set::FileSetConfig,
+    loader::{Handle, LoadingProgress},
+    AbsPath, AbsPathBuf, VfsPath,
+};
 
+#[derive(Debug)]
 pub struct LoadCargoConfig {
     pub load_out_dirs_from_check: bool,
     pub with_proc_macro_server: ProcMacroServerChoice,
@@ -60,20 +65,31 @@ pub fn load_workspace(
     let (sender, receiver) = unbounded();
     let mut vfs = vfs::Vfs::default();
     let mut loader = {
-        let loader =
-            vfs_notify::NotifyHandle::spawn(Box::new(move |msg| sender.send(msg).unwrap()));
+        let loader = vfs_notify::NotifyHandle::spawn(sender);
         Box::new(loader)
     };
 
+    tracing::debug!(?load_config, "LoadCargoConfig");
     let proc_macro_server = match &load_config.with_proc_macro_server {
         ProcMacroServerChoice::Sysroot => ws
             .find_sysroot_proc_macro_srv()
-            .and_then(|it| ProcMacroServer::spawn(&it, extra_env).map_err(Into::into)),
+            .and_then(|it| ProcMacroServer::spawn(&it, extra_env).map_err(Into::into))
+            .map_err(|e| (e, true)),
         ProcMacroServerChoice::Explicit(path) => {
-            ProcMacroServer::spawn(path, extra_env).map_err(Into::into)
+            ProcMacroServer::spawn(path, extra_env).map_err(Into::into).map_err(|e| (e, true))
         }
-        ProcMacroServerChoice::None => Err(anyhow::format_err!("proc macro server disabled")),
+        ProcMacroServerChoice::None => {
+            Err((anyhow::format_err!("proc macro server disabled"), false))
+        }
     };
+    match &proc_macro_server {
+        Ok(server) => {
+            tracing::info!(path=%server.path(), "Proc-macro server started")
+        }
+        Err((e, _)) => {
+            tracing::info!(%e, "Failed to start proc-macro server")
+        }
+    }
 
     let (crate_graph, proc_macros) = ws.to_crate_graph(
         &mut |path: &AbsPath| {
@@ -87,7 +103,7 @@ pub fn load_workspace(
     let proc_macros = {
         let proc_macro_server = match &proc_macro_server {
             Ok(it) => Ok(it),
-            Err(e) => Err(e.to_string()),
+            Err((e, hard_err)) => Err((e.to_string(), *hard_err)),
         };
         proc_macros
             .into_iter()
@@ -95,7 +111,7 @@ pub fn load_workspace(
                 (
                     crate_id,
                     path.map_or_else(
-                        |_| Err("proc macro crate is missing dylib".to_owned()),
+                        |e| Err((e, true)),
                         |(_, path)| {
                             proc_macro_server.as_ref().map_err(Clone::clone).and_then(
                                 |proc_macro_server| load_proc_macro(proc_macro_server, &path, &[]),
@@ -244,7 +260,7 @@ impl ProjectFolders {
             let mut file_set_roots: Vec<VfsPath> = vec![];
             let mut entries = vec![];
 
-            if let Some(manifest) = ws.manifest().map(ManifestPath::as_ref) {
+            if let Some(manifest) = ws.manifest().map(|it| it.to_path_buf()) {
                 file_set_roots.push(VfsPath::from(manifest.to_owned()));
                 entries.push(manifest.to_owned());
             }
@@ -355,8 +371,7 @@ impl SourceRootConfig {
     }
 }
 
-/// Load the proc-macros for the given lib path, replacing all expanders whose names are in `dummy_replace`
-/// with an identity dummy expander.
+/// Load the proc-macros for the given lib path, disabling all expanders whose names are in `ignored_macros`.
 pub fn load_proc_macro(
     server: &ProcMacroServer,
     path: &AbsPath,
@@ -383,7 +398,7 @@ pub fn load_proc_macro(
         }
         Err(e) => {
             tracing::warn!("proc-macro loading for {path} failed: {e}");
-            Err(e)
+            Err((e, true))
         }
     }
 }
@@ -407,8 +422,8 @@ fn load_crate_graph(
     // wait until Vfs has loaded all roots
     for task in receiver {
         match task {
-            vfs::loader::Message::Progress { n_done, n_total, .. } => {
-                if n_done == Some(n_total) {
+            vfs::loader::Message::Progress { n_done, .. } => {
+                if n_done == LoadingProgress::Finished {
                     break;
                 }
             }

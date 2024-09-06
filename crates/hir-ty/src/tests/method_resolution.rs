@@ -1186,11 +1186,11 @@ fn test() {
             89..109 '{     ...     }': bool
             99..103 'true': bool
             123..167 '{     ...o(); }': ()
-            133..134 's': &'? S
+            133..134 's': &'static S
             137..151 'unsafe { f() }': &'static S
             146..147 'f': fn f() -> &'static S
             146..149 'f()': &'static S
-            157..158 's': &'? S
+            157..158 's': &'static S
             157..164 's.foo()': bool
         "#]],
     );
@@ -1286,6 +1286,7 @@ fn main() {
 fn method_on_dyn_impl() {
     check_types(
         r#"
+//- minicore: coerce_unsized
 trait Foo {}
 
 impl Foo for u32 {}
@@ -1847,9 +1848,9 @@ impl Foo {
 }
 fn test() {
     Foo.foo();
-  //^^^ adjustments: Borrow(Ref(Not))
+  //^^^ adjustments: Borrow(Ref('?1, Not))
     (&Foo).foo();
-  // ^^^^ adjustments: Deref(None), Borrow(Ref(Not))
+  // ^^^^ adjustments: Deref(None), Borrow(Ref('?3, Not))
 }
 "#,
     );
@@ -1863,7 +1864,7 @@ fn receiver_adjustment_unsize_array() {
 fn test() {
     let a = [1, 2, 3];
     a.len();
-} //^ adjustments: Borrow(Ref(Not)), Pointer(Unsize)
+} //^ adjustments: Borrow(Ref('?7, Not)), Pointer(Unsize)
 "#,
     );
 }
@@ -2076,7 +2077,7 @@ impl Foo {
 }
 fn test() {
     Box::new(Foo).foo();
-  //^^^^^^^^^^^^^ adjustments: Deref(None), Borrow(Ref(Not))
+  //^^^^^^^^^^^^^ adjustments: Deref(None), Borrow(Ref('?3, Not))
 }
 "#,
     );
@@ -2094,7 +2095,46 @@ impl Foo {
 use core::mem::ManuallyDrop;
 fn test() {
     ManuallyDrop::new(Foo).foo();
-  //^^^^^^^^^^^^^^^^^^^^^^ adjustments: Deref(Some(OverloadedDeref(Some(Not)))), Borrow(Ref(Not))
+  //^^^^^^^^^^^^^^^^^^^^^^ adjustments: Deref(Some(OverloadedDeref(Some(Not)))), Borrow(Ref('?4, Not))
+}
+"#,
+    );
+}
+
+#[test]
+fn mismatched_args_due_to_supertraits_with_deref() {
+    check_no_mismatches(
+        r#"
+//- minicore: deref
+use core::ops::Deref;
+
+trait Trait1 {
+    type Assoc: Deref<Target = String>;
+}
+
+trait Trait2: Trait1 {
+}
+
+trait Trait3 {
+    type T1: Trait1;
+    type T2: Trait2;
+    fn bar(&self, x: bool, y: bool);
+}
+
+struct Foo;
+
+impl Foo {
+    fn bar(&mut self, _: &'static str) {}
+}
+
+impl Deref for Foo {
+    type Target = u32;
+    fn deref(&self) -> &Self::Target { &0 }
+}
+
+fn problem_method<T: Trait3>() {
+    let mut foo = Foo;
+    foo.bar("hello"); // Rustc ok, RA errors (mismatched args)
 }
 "#,
     );

@@ -383,6 +383,40 @@ fn main() {
 }
 
 #[test]
+fn doctest_convert_closure_to_fn() {
+    check_doc_test(
+        "convert_closure_to_fn",
+        r#####"
+//- minicore: copy
+struct String;
+impl String {
+    fn new() -> Self {}
+    fn push_str(&mut self, s: &str) {}
+}
+fn main() {
+    let mut s = String::new();
+    let closure = |$0a| s.push_str(a);
+    closure("abc");
+}
+"#####,
+        r#####"
+struct String;
+impl String {
+    fn new() -> Self {}
+    fn push_str(&mut self, s: &str) {}
+}
+fn main() {
+    let mut s = String::new();
+    fn closure(a: &str, s: &mut String) {
+        s.push_str(a)
+    }
+    closure("abc", &mut s);
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_convert_for_loop_with_for_each() {
     check_doc_test(
         "convert_for_loop_with_for_each",
@@ -876,6 +910,29 @@ fn qux(bar: Bar, baz: Baz) {}
 }
 
 #[test]
+fn doctest_explicit_enum_discriminant() {
+    check_doc_test(
+        "explicit_enum_discriminant",
+        r#####"
+enum TheEnum$0 {
+    Foo,
+    Bar,
+    Baz = 42,
+    Quux,
+}
+"#####,
+        r#####"
+enum TheEnum {
+    Foo = 0,
+    Bar = 1,
+    Baz = 42,
+    Quux = 43,
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_extract_expressions_from_format_string() {
     check_doc_test(
         "extract_expressions_from_format_string",
@@ -994,7 +1051,7 @@ fn main() {
 "#####,
         r#####"
 fn main() {
-    let $0var_name = (1 + 2);
+    let $0var_name = 1 + 2;
     var_name * 4;
 }
 "#####,
@@ -3087,6 +3144,27 @@ fn arithmetics {
 fn arithmetics {
     assert_eq!(2 + 2, 5);
 }
+"#####,
+    )
+}
+
+#[test]
+fn doctest_toggle_macro_delimiter() {
+    check_doc_test(
+        "toggle_macro_delimiter",
+        r#####"
+macro_rules! sth {
+    () => {};
+}
+
+sth!$0( );
+"#####,
+        r#####"
+macro_rules! sth {
+    () => {};
+}
+
+sth!{ }
 "#####,
     )
 }

@@ -145,8 +145,6 @@ struct DefMapCrateData {
     /// Side table for resolving derive helpers.
     exported_derives: FxHashMap<MacroDefId, Box<[Name]>>,
     fn_proc_macro_mapping: FxHashMap<FunctionId, ProcMacroId>,
-    /// The error that occurred when failing to load the proc-macro dll.
-    proc_macro_loading_error: Option<Box<str>>,
 
     /// Custom attributes registered with `#![register_attr]`.
     registered_attrs: Vec<Symbol>,
@@ -169,7 +167,6 @@ impl DefMapCrateData {
             extern_prelude: FxIndexMap::default(),
             exported_derives: FxHashMap::default(),
             fn_proc_macro_mapping: FxHashMap::default(),
-            proc_macro_loading_error: None,
             registered_attrs: Vec::new(),
             registered_tools: PREDEFINED_TOOLS.iter().map(|it| Symbol::intern(it)).collect(),
             unstable_features: FxHashSet::default(),
@@ -189,7 +186,6 @@ impl DefMapCrateData {
             registered_attrs,
             registered_tools,
             unstable_features,
-            proc_macro_loading_error: _,
             rustc_coherence_is_core: _,
             no_core: _,
             no_std: _,
@@ -331,6 +327,10 @@ pub struct ModuleData {
 impl DefMap {
     /// The module id of a crate or block root.
     pub const ROOT: LocalModuleId = LocalModuleId::from_raw(la_arena::RawIdx::from_u32(0));
+
+    pub fn edition(&self) -> Edition {
+        self.data.edition
+    }
 
     pub(crate) fn crate_def_map_query(db: &dyn DefDatabase, crate_id: CrateId) -> Arc<DefMap> {
         let crate_graph = db.crate_graph();
@@ -474,10 +474,6 @@ impl DefMap {
         self.data.fn_proc_macro_mapping.get(&id).copied()
     }
 
-    pub fn proc_macro_loading_error(&self) -> Option<&str> {
-        self.data.proc_macro_loading_error.as_deref()
-    }
-
     pub fn krate(&self) -> CrateId {
         self.krate
     }
@@ -558,7 +554,7 @@ impl DefMap {
             for (name, child) in
                 map.modules[module].children.iter().sorted_by(|a, b| Ord::cmp(&a.0, &b.0))
             {
-                let path = format!("{path}::{}", name.display(db.upcast()));
+                let path = format!("{path}::{}", name.display(db.upcast(), Edition::LATEST));
                 buf.push('\n');
                 go(buf, db, map, &path, *child);
             }

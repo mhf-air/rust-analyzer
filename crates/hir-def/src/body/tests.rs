@@ -143,6 +143,41 @@ mod m {
 }
 
 #[test]
+fn desugar_for_loop() {
+    let (db, body, def) = lower(
+        r#"
+//- minicore: iterator
+fn main() {
+    for ident in 0..10 {
+        foo();
+        bar()
+    }
+}
+"#,
+    );
+
+    expect![[r#"
+        fn main() -> () {
+            match builtin#lang(into_iter)(
+                (0) ..(10) ,
+            ) {
+                mut <ra@gennew>11 => loop {
+                    match builtin#lang(next)(
+                        &mut <ra@gennew>11,
+                    ) {
+                        builtin#lang(None) => break,
+                        builtin#lang(Some)(ident) => {
+                            foo();
+                            bar()
+                        },
+                    }
+                },
+            }
+        }"#]]
+    .assert_eq(&body.pretty_print(&db, def, Edition::CURRENT))
+}
+
+#[test]
 fn desugar_builtin_format_args() {
     let (db, body, def) = lower(
         r#"
@@ -219,7 +254,7 @@ fn main() {
                 },
             );
         }"#]]
-    .assert_eq(&body.pretty_print(&db, def))
+    .assert_eq(&body.pretty_print(&db, def, Edition::CURRENT))
 }
 
 #[test]
@@ -285,7 +320,7 @@ impl SsrError {
                 ),
             );
         }"#]]
-    .assert_eq(&body.pretty_print(&db, def))
+    .assert_eq(&body.pretty_print(&db, def, Edition::CURRENT))
 }
 
 #[test]
@@ -333,5 +368,5 @@ fn f(a: i32, b: u32) -> String {
                 );
             };
         }"#]]
-    .assert_eq(&body.pretty_print(&db, def))
+    .assert_eq(&body.pretty_print(&db, def, Edition::CURRENT))
 }

@@ -8,31 +8,23 @@
 
 mod expander;
 mod parser;
-mod syntax_bridge;
-mod to_parser_input;
 
 #[cfg(test)]
 mod benchmark;
+#[cfg(test)]
+mod tests;
 
 use span::{Edition, Span, SyntaxContextId};
-use stdx::impl_from;
+use syntax_bridge::to_parser_input;
 use tt::iter::TtIter;
+use tt::DelimSpan;
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::parser::{MetaTemplate, MetaVarKind, Op};
 
-// FIXME: we probably should re-think  `token_tree_to_syntax_node` interfaces
-pub use ::parser::TopEntryPoint;
 pub use tt::{Delimiter, DelimiterKind, Punct};
-
-pub use crate::syntax_bridge::{
-    desugar_doc_comment_text, parse_exprs_with_sep, parse_to_token_tree,
-    parse_to_token_tree_static_span, syntax_node_to_token_tree, syntax_node_to_token_tree_modified,
-    token_tree_to_syntax_node, DocCommentDesugarMode, SpanMapper,
-};
-
-pub use crate::syntax_bridge::dummy_test_span_utils::*;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ParseError {
@@ -64,39 +56,45 @@ impl fmt::Display for ParseError {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
-pub enum ExpandError {
+pub struct ExpandError {
+    pub inner: Arc<(Span, ExpandErrorKind)>,
+}
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub enum ExpandErrorKind {
     BindingError(Box<Box<str>>),
     UnresolvedBinding(Box<Box<str>>),
     LeftoverTokens,
-    ConversionError,
     LimitExceeded,
     NoMatchingRule,
     UnexpectedToken,
-    CountError(CountError),
 }
 
-impl_from!(CountError for ExpandError);
-
 impl ExpandError {
-    fn binding_error(e: impl Into<Box<str>>) -> ExpandError {
-        ExpandError::BindingError(Box::new(e.into()))
+    fn new(span: Span, kind: ExpandErrorKind) -> ExpandError {
+        ExpandError { inner: Arc::new((span, kind)) }
+    }
+    fn binding_error(span: Span, e: impl Into<Box<str>>) -> ExpandError {
+        ExpandError { inner: Arc::new((span, ExpandErrorKind::BindingError(Box::new(e.into())))) }
+    }
+}
+impl fmt::Display for ExpandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.1.fmt(f)
     }
 }
 
-impl fmt::Display for ExpandError {
+impl fmt::Display for ExpandErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ExpandError::NoMatchingRule => f.write_str("no rule matches input tokens"),
-            ExpandError::UnexpectedToken => f.write_str("unexpected token in input"),
-            ExpandError::BindingError(e) => f.write_str(e),
-            ExpandError::UnresolvedBinding(binding) => {
+            ExpandErrorKind::NoMatchingRule => f.write_str("no rule matches input tokens"),
+            ExpandErrorKind::UnexpectedToken => f.write_str("unexpected token in input"),
+            ExpandErrorKind::BindingError(e) => f.write_str(e),
+            ExpandErrorKind::UnresolvedBinding(binding) => {
                 f.write_str("could not find binding ")?;
                 f.write_str(binding)
             }
-            ExpandError::ConversionError => f.write_str("could not convert tokens"),
-            ExpandError::LimitExceeded => f.write_str("Expand exceed limit"),
-            ExpandError::LeftoverTokens => f.write_str("leftover tokens"),
-            ExpandError::CountError(e) => e.fmt(f),
+            ExpandErrorKind::LimitExceeded => f.write_str("Expand exceed limit"),
+            ExpandErrorKind::LeftoverTokens => f.write_str("leftover tokens"),
         }
     }
 }
@@ -248,11 +246,10 @@ impl DeclarativeMacro {
         &self,
         tt: &tt::Subtree<Span>,
         marker: impl Fn(&mut Span) + Copy,
-        new_meta_vars: bool,
         call_site: Span,
         def_site_edition: Edition,
     ) -> ExpandResult<(tt::Subtree<Span>, MatchedArmIndex)> {
-        expander::expand_rules(&self.rules, tt, marker, new_meta_vars, call_site, def_site_edition)
+        expander::expand_rules(&self.rules, tt, marker, call_site, def_site_edition)
     }
 }
 
@@ -355,14 +352,15 @@ impl<T: Default, E> From<Result<T, E>> for ValueResult<T, E> {
     }
 }
 
-fn expect_fragment<S: Copy + fmt::Debug>(
-    tt_iter: &mut TtIter<'_, S>,
+pub fn expect_fragment(
+    tt_iter: &mut TtIter<'_, Span>,
     entry_point: ::parser::PrefixEntryPoint,
     edition: ::parser::Edition,
-) -> ExpandResult<Option<tt::TokenTree<S>>> {
+    delim_span: DelimSpan<Span>,
+) -> ExpandResult<Option<tt::TokenTree<Span>>> {
     use ::parser;
     let buffer = tt::buffer::TokenBuffer::from_tokens(tt_iter.as_slice());
-    let parser_input = to_parser_input::to_parser_input(edition, &buffer);
+    let parser_input = to_parser_input(edition, &buffer);
     let tree_traversal = entry_point.parse(&parser_input, edition);
     let mut cursor = buffer.begin();
     let mut error = false;
@@ -387,7 +385,10 @@ fn expect_fragment<S: Copy + fmt::Debug>(
     }
 
     let err = if error || !cursor.is_root() {
-        Some(ExpandError::binding_error(format!("expected {entry_point:?}")))
+        Some(ExpandError::binding_error(
+            buffer.begin().token_tree().map_or(delim_span.close, |tt| tt.span()),
+            format!("expected {entry_point:?}"),
+        ))
     } else {
         None
     };

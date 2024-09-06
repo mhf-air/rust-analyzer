@@ -99,8 +99,9 @@ mod tests {
     fn missing_unsafe_diagnostic_with_raw_ptr() {
         check_diagnostics(
             r#"
+//- minicore: sized
 fn main() {
-    let x = &5 as *const usize;
+    let x = &5_usize as *const usize;
     unsafe { let _y = *x; }
     let _z = *x;
 }          //^^💡 error: this operation is unsafe and requires an unsafe function or block
@@ -112,17 +113,18 @@ fn main() {
     fn missing_unsafe_diagnostic_with_unsafe_call() {
         check_diagnostics(
             r#"
+//- minicore: sized
 struct HasUnsafe;
 
 impl HasUnsafe {
     unsafe fn unsafe_fn(&self) {
-        let x = &5 as *const usize;
+        let x = &5_usize as *const usize;
         let _y = *x;
     }
 }
 
 unsafe fn unsafe_fn() {
-    let x = &5 as *const usize;
+    let x = &5_usize as *const usize;
     let _y = *x;
 }
 
@@ -158,6 +160,56 @@ fn main() {
     unsafe {
         let _x = STATIC_MUT.a;
     }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn missing_unsafe_diagnostic_with_extern_static() {
+        check_diagnostics(
+            r#"
+//- minicore: copy
+
+extern "C" {
+    static EXTERN: i32;
+    static mut EXTERN_MUT: i32;
+}
+
+fn main() {
+    let _x = EXTERN;
+           //^^^^^^💡 error: this operation is unsafe and requires an unsafe function or block
+    let _x = EXTERN_MUT;
+           //^^^^^^^^^^💡 error: this operation is unsafe and requires an unsafe function or block
+    unsafe {
+        let _x = EXTERN;
+        let _x = EXTERN_MUT;
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn no_unsafe_diagnostic_with_addr_of_static() {
+        check_diagnostics(
+            r#"
+//- minicore: copy, addr_of
+
+use core::ptr::{addr_of, addr_of_mut};
+
+extern "C" {
+    static EXTERN: i32;
+    static mut EXTERN_MUT: i32;
+}
+static mut STATIC_MUT: i32 = 0;
+
+fn main() {
+    let _x = addr_of!(EXTERN);
+    let _x = addr_of!(EXTERN_MUT);
+    let _x = addr_of!(STATIC_MUT);
+    let _x = addr_of_mut!(EXTERN_MUT);
+    let _x = addr_of_mut!(STATIC_MUT);
 }
 "#,
         );
@@ -200,14 +252,15 @@ fn main() {
     fn add_unsafe_block_when_dereferencing_a_raw_pointer() {
         check_fix(
             r#"
+//- minicore: sized
 fn main() {
-    let x = &5 as *const usize;
+    let x = &5_usize as *const usize;
     let _z = *x$0;
 }
 "#,
             r#"
 fn main() {
-    let x = &5 as *const usize;
+    let x = &5_usize as *const usize;
     let _z = unsafe { *x };
 }
 "#,
@@ -218,8 +271,9 @@ fn main() {
     fn add_unsafe_block_when_calling_unsafe_function() {
         check_fix(
             r#"
+//- minicore: sized
 unsafe fn func() {
-    let x = &5 as *const usize;
+    let x = &5_usize as *const usize;
     let z = *x;
 }
 fn main() {
@@ -228,7 +282,7 @@ fn main() {
 "#,
             r#"
 unsafe fn func() {
-    let x = &5 as *const usize;
+    let x = &5_usize as *const usize;
     let z = *x;
 }
 fn main() {
@@ -242,6 +296,7 @@ fn main() {
     fn add_unsafe_block_when_calling_unsafe_method() {
         check_fix(
             r#"
+//- minicore: sized
 struct S(usize);
 impl S {
     unsafe fn func(&self) {
@@ -483,6 +538,30 @@ unsafe fn foo() -> u8 {
 
 fn main() {
     let x = format!("foo: {}", foo$0());
+}
+            "#,
+        )
+    }
+
+    #[test]
+    fn rustc_deprecated_safe_2024() {
+        check_diagnostics(
+            r#"
+//- /ed2021.rs crate:ed2021 edition:2021
+#[rustc_deprecated_safe_2024]
+unsafe fn safe() -> u8 {
+    0
+}
+//- /ed2024.rs crate:ed2024 edition:2024
+#[rustc_deprecated_safe_2024]
+unsafe fn not_safe() -> u8 {
+    0
+}
+//- /main.rs crate:main deps:ed2021,ed2024
+fn main() {
+    ed2021::safe();
+    ed2024::not_safe();
+  //^^^^^^^^^^^^^^^^^^💡 error: this operation is unsafe and requires an unsafe function or block
 }
             "#,
         )

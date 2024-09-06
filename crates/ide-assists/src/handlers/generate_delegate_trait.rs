@@ -2,13 +2,14 @@ use std::ops::Not;
 
 use crate::{
     assist_context::{AssistContext, Assists},
-    utils::{convert_param_list_to_arg_list, suggest_name},
+    utils::convert_param_list_to_arg_list,
 };
 use either::Either;
 use hir::{db::HirDatabase, HasVisibility};
 use ide_db::{
     assists::{AssistId, GroupLabel},
     path_transform::PathTransform,
+    syntax_helpers::suggest_name,
     FxHashMap, FxHashSet,
 };
 use itertools::Itertools;
@@ -22,7 +23,7 @@ use syntax::{
         WherePred,
     },
     ted::{self, Position},
-    AstNode, NodeOrToken, SmolStr, SyntaxKind, ToSmolStr,
+    AstNode, Edition, NodeOrToken, SmolStr, SyntaxKind, ToSmolStr,
 };
 
 // Assist: generate_delegate_trait
@@ -109,6 +110,7 @@ struct Field {
     ty: ast::Type,
     range: syntax::TextRange,
     impls: Vec<Delegee>,
+    edition: Edition,
 }
 
 impl Field {
@@ -119,6 +121,7 @@ impl Field {
         let db = ctx.sema.db;
 
         let module = ctx.sema.file_to_module_def(ctx.file_id())?;
+        let edition = module.krate().edition(ctx.db());
 
         let (name, range, ty) = match f {
             Either::Left(f) => {
@@ -147,7 +150,7 @@ impl Field {
             }
         }
 
-        Some(Field { name, ty, range, impls })
+        Some(Field { name, ty, range, impls, edition })
     }
 }
 
@@ -163,18 +166,18 @@ enum Delegee {
 }
 
 impl Delegee {
-    fn signature(&self, db: &dyn HirDatabase) -> String {
+    fn signature(&self, db: &dyn HirDatabase, edition: Edition) -> String {
         let mut s = String::new();
 
         let (Delegee::Bound(it) | Delegee::Impls(it, _)) = self;
 
         for m in it.module(db).path_to_root(db).iter().rev() {
             if let Some(name) = m.name(db) {
-                s.push_str(&format!("{}::", name.display_no_db().to_smolstr()));
+                s.push_str(&format!("{}::", name.display_no_db(edition).to_smolstr()));
             }
         }
 
-        s.push_str(&it.name(db).display_no_db().to_smolstr());
+        s.push_str(&it.name(db).display_no_db(edition).to_smolstr());
         s
     }
 }
@@ -212,9 +215,11 @@ impl Struct {
             // if self.hir_ty.impls_trait(db, trait_, &[]) {
             //     continue;
             // }
-            let signature = delegee.signature(db);
+            let signature = delegee.signature(db, field.edition);
 
-            let Some(delegate) = generate_impl(ctx, self, &field.ty, &field.name, delegee) else {
+            let Some(delegate) =
+                generate_impl(ctx, self, &field.ty, &field.name, delegee, field.edition)
+            else {
                 continue;
             };
 
@@ -240,6 +245,7 @@ fn generate_impl(
     field_ty: &ast::Type,
     field_name: &str,
     delegee: &Delegee,
+    edition: Edition,
 ) -> Option<ast::Impl> {
     let delegate: ast::Impl;
     let db = ctx.db();
@@ -259,7 +265,7 @@ fn generate_impl(
                 strukt_params.clone(),
                 strukt_params.map(|params| params.to_generic_args()),
                 delegee.is_auto(db),
-                make::ty(&delegee.name(db).display_no_db().to_smolstr()),
+                make::ty(&delegee.name(db).display_no_db(edition).to_smolstr()),
                 strukt_ty,
                 bound_def.where_clause(),
                 ast_strukt.where_clause(),
@@ -350,7 +356,7 @@ fn generate_impl(
             let type_gen_args = strukt_params.clone().map(|params| params.to_generic_args());
 
             let path_type =
-                make::ty(&trait_.name(db).display_no_db().to_smolstr()).clone_for_update();
+                make::ty(&trait_.name(db).display_no_db(edition).to_smolstr()).clone_for_update();
             transform_impl(ctx, ast_strukt, &old_impl, &transform_args, path_type.syntax())?;
 
             // 3) Generate delegate trait impl
@@ -735,6 +741,7 @@ fn func_assoc_item(
         item.async_token().is_some(),
         item.const_token().is_some(),
         item.unsafe_token().is_some(),
+        item.gen_token().is_some(),
     )
     .clone_for_update();
 

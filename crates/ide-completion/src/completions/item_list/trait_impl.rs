@@ -31,14 +31,14 @@
 //! }
 //! ```
 
-use hir::HasAttrs;
+use hir::{HasAttrs, Name};
 use ide_db::{
     documentation::HasDocs, path_transform::PathTransform,
     syntax_helpers::insert_whitespace_into_node, traits::get_missing_assoc_items, SymbolKind,
 };
 use syntax::{
-    ast::{self, edit_in_place::AttrsOwnerEdit, HasTypeBounds},
-    format_smolstr, AstNode, SmolStr, SyntaxElement, SyntaxKind, TextRange, ToSmolStr, T,
+    ast::{self, edit_in_place::AttrsOwnerEdit, make, HasGenericArgs, HasTypeBounds},
+    format_smolstr, ted, AstNode, SmolStr, SyntaxElement, SyntaxKind, TextRange, ToSmolStr, T,
 };
 use text_edit::TextEdit;
 
@@ -178,11 +178,37 @@ fn add_function_impl(
     func: hir::Function,
     impl_def: hir::Impl,
 ) {
-    let fn_name = func.name(ctx.db);
+    let fn_name = &func.name(ctx.db);
+    let sugar: &[_] = if func.is_async(ctx.db) {
+        &[AsyncSugaring::Async, AsyncSugaring::Desugar]
+    } else if func.returns_impl_future(ctx.db) {
+        &[AsyncSugaring::Plain, AsyncSugaring::Resugar]
+    } else {
+        &[AsyncSugaring::Plain]
+    };
+    for &sugaring in sugar {
+        add_function_impl_(acc, ctx, replacement_range, func, impl_def, fn_name, sugaring);
+    }
+}
 
+fn add_function_impl_(
+    acc: &mut Completions,
+    ctx: &CompletionContext<'_>,
+    replacement_range: TextRange,
+    func: hir::Function,
+    impl_def: hir::Impl,
+    fn_name: &Name,
+    async_sugaring: AsyncSugaring,
+) {
+    let async_ = if let AsyncSugaring::Async | AsyncSugaring::Resugar = async_sugaring {
+        "async "
+    } else {
+        ""
+    };
     let label = format_smolstr!(
-        "fn {}({})",
-        fn_name.display(ctx.db),
+        "{}fn {}({})",
+        async_,
+        fn_name.display(ctx.db, ctx.edition),
         if func.assoc_fn_params(ctx.db).is_empty() { "" } else { ".." }
     );
 
@@ -192,19 +218,15 @@ fn add_function_impl(
         SymbolKind::Function
     });
 
-    let mut item = CompletionItem::new(completion_kind, replacement_range, label);
-    item.lookup_by(format!("fn {}", fn_name.display(ctx.db)))
+    let mut item = CompletionItem::new(completion_kind, replacement_range, label, ctx.edition);
+    item.lookup_by(format!("{}fn {}", async_, fn_name.display(ctx.db, ctx.edition)))
         .set_documentation(func.docs(ctx.db))
-        .set_relevance(CompletionRelevance { is_item_from_trait: true, ..Default::default() });
+        .set_relevance(CompletionRelevance { exact_name_match: true, ..Default::default() });
 
     if let Some(source) = ctx.sema.source(func) {
-        let assoc_item = ast::AssocItem::Fn(source.value);
-        if let Some(transformed_item) = get_transformed_assoc_item(ctx, assoc_item, impl_def) {
-            let transformed_fn = match transformed_item {
-                ast::AssocItem::Fn(func) => func,
-                _ => unreachable!(),
-            };
-
+        if let Some(transformed_fn) =
+            get_transformed_fn(ctx, source.value, impl_def, async_sugaring)
+        {
             let function_decl = function_declaration(&transformed_fn, source.file_id.is_macro());
             match ctx.config.snippet_cap {
                 Some(cap) => {
@@ -219,6 +241,14 @@ fn add_function_impl(
             item.add_to(acc, ctx.db);
         }
     }
+}
+
+#[derive(Copy, Clone)]
+enum AsyncSugaring {
+    Desugar,
+    Resugar,
+    Async,
+    Plain,
 }
 
 /// Transform a relevant associated item to inline generics from the impl, remove attrs and docs, etc.
@@ -245,6 +275,82 @@ fn get_transformed_assoc_item(
     Some(assoc_item)
 }
 
+/// Transform a relevant associated item to inline generics from the impl, remove attrs and docs, etc.
+fn get_transformed_fn(
+    ctx: &CompletionContext<'_>,
+    fn_: ast::Fn,
+    impl_def: hir::Impl,
+    async_: AsyncSugaring,
+) -> Option<ast::Fn> {
+    let trait_ = impl_def.trait_(ctx.db)?;
+    let source_scope = &ctx.sema.scope(fn_.syntax())?;
+    let target_scope = &ctx.sema.scope(ctx.sema.source(impl_def)?.syntax().value)?;
+    let transform = PathTransform::trait_impl(
+        target_scope,
+        source_scope,
+        trait_,
+        ctx.sema.source(impl_def)?.value,
+    );
+
+    let fn_ = fn_.clone_for_update();
+    // FIXME: Paths in nested macros are not handled well. See
+    // `macro_generated_assoc_item2` test.
+    transform.apply(fn_.syntax());
+    fn_.remove_attrs_and_docs();
+    match async_ {
+        AsyncSugaring::Desugar => {
+            match fn_.ret_type() {
+                Some(ret_ty) => {
+                    let ty = ret_ty.ty()?;
+                    ted::replace(
+                        ty.syntax(),
+                        make::ty(&format!("impl Future<Output = {ty}>"))
+                            .syntax()
+                            .clone_for_update(),
+                    );
+                }
+                None => ted::append_child(
+                    fn_.param_list()?.syntax(),
+                    make::ret_type(make::ty("impl Future<Output = ()>"))
+                        .syntax()
+                        .clone_for_update(),
+                ),
+            }
+            fn_.async_token().unwrap().detach();
+        }
+        AsyncSugaring::Resugar => {
+            let ty = fn_.ret_type()?.ty()?;
+            match &ty {
+                // best effort guessing here
+                ast::Type::ImplTraitType(t) => {
+                    let output = t.type_bound_list()?.bounds().find_map(|b| match b.ty()? {
+                        ast::Type::PathType(p) => {
+                            let p = p.path()?.segment()?;
+                            if p.name_ref()?.text() != "Future" {
+                                return None;
+                            }
+                            match p.generic_arg_list()?.generic_args().next()? {
+                                ast::GenericArg::AssocTypeArg(a)
+                                    if a.name_ref()?.text() == "Output" =>
+                                {
+                                    a.ty()
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    })?;
+                    ted::replace(ty.syntax(), output.syntax());
+                }
+                _ => (),
+            }
+            ted::prepend_child(fn_.syntax(), make::token(T![async]));
+        }
+        AsyncSugaring::Async | AsyncSugaring::Plain => (),
+    }
+    Some(fn_)
+}
+
 fn add_type_alias_impl(
     acc: &mut Completions,
     ctx: &CompletionContext<'_>,
@@ -256,10 +362,11 @@ fn add_type_alias_impl(
 
     let label = format_smolstr!("type {alias_name} =");
 
-    let mut item = CompletionItem::new(SymbolKind::TypeAlias, replacement_range, label);
+    let mut item =
+        CompletionItem::new(SymbolKind::TypeAlias, replacement_range, label, ctx.edition);
     item.lookup_by(format!("type {alias_name}"))
         .set_documentation(type_alias.docs(ctx.db))
-        .set_relevance(CompletionRelevance { is_item_from_trait: true, ..Default::default() });
+        .set_relevance(CompletionRelevance { exact_name_match: true, ..Default::default() });
 
     if let Some(source) = ctx.sema.source(type_alias) {
         let assoc_item = ast::AssocItem::TypeAlias(source.value);
@@ -314,7 +421,7 @@ fn add_const_impl(
     const_: hir::Const,
     impl_def: hir::Impl,
 ) {
-    let const_name = const_.name(ctx.db).map(|n| n.display_no_db().to_smolstr());
+    let const_name = const_.name(ctx.db).map(|n| n.display_no_db(ctx.edition).to_smolstr());
 
     if let Some(const_name) = const_name {
         if let Some(source) = ctx.sema.source(const_) {
@@ -328,11 +435,12 @@ fn add_const_impl(
                 let label = make_const_compl_syntax(&transformed_const, source.file_id.is_macro());
                 let replacement = format!("{label} ");
 
-                let mut item = CompletionItem::new(SymbolKind::Const, replacement_range, label);
+                let mut item =
+                    CompletionItem::new(SymbolKind::Const, replacement_range, label, ctx.edition);
                 item.lookup_by(format_smolstr!("const {const_name}"))
                     .set_documentation(const_.docs(ctx.db))
                     .set_relevance(CompletionRelevance {
-                        is_item_from_trait: true,
+                        exact_name_match: true,
                         ..Default::default()
                     });
                 match ctx.config.snippet_cap {
@@ -1392,6 +1500,134 @@ trait Tr {
 }
 impl Tr for () {
     type Item = $0;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn impl_fut() {
+        check_edit(
+            "fn foo",
+            r#"
+//- minicore: future, send, sized
+use core::future::Future;
+
+trait DesugaredAsyncTrait {
+    fn foo(&self) -> impl Future<Output = usize> + Send;
+}
+
+impl DesugaredAsyncTrait for () {
+    $0
+}
+"#,
+            r#"
+use core::future::Future;
+
+trait DesugaredAsyncTrait {
+    fn foo(&self) -> impl Future<Output = usize> + Send;
+}
+
+impl DesugaredAsyncTrait for () {
+    fn foo(&self) -> impl Future<Output = usize> + Send {
+    $0
+}
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn impl_fut_resugared() {
+        check_edit(
+            "async fn foo",
+            r#"
+//- minicore: future, send, sized
+use core::future::Future;
+
+trait DesugaredAsyncTrait {
+    fn foo(&self) -> impl Future<Output = usize> + Send;
+}
+
+impl DesugaredAsyncTrait for () {
+    $0
+}
+"#,
+            r#"
+use core::future::Future;
+
+trait DesugaredAsyncTrait {
+    fn foo(&self) -> impl Future<Output = usize> + Send;
+}
+
+impl DesugaredAsyncTrait for () {
+    async fn foo(&self) -> usize {
+    $0
+}
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn async_desugared() {
+        check_edit(
+            "fn foo",
+            r#"
+//- minicore: future, send, sized
+use core::future::Future;
+
+trait DesugaredAsyncTrait {
+    async fn foo(&self) -> usize;
+}
+
+impl DesugaredAsyncTrait for () {
+    $0
+}
+"#,
+            r#"
+use core::future::Future;
+
+trait DesugaredAsyncTrait {
+    async fn foo(&self) -> usize;
+}
+
+impl DesugaredAsyncTrait for () {
+     fn foo(&self) -> impl Future<Output = usize> {
+    $0
+}
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn async_() {
+        check_edit(
+            "async fn foo",
+            r#"
+//- minicore: future, send, sized
+use core::future::Future;
+
+trait DesugaredAsyncTrait {
+    async fn foo(&self) -> usize;
+}
+
+impl DesugaredAsyncTrait for () {
+    $0
+}
+"#,
+            r#"
+use core::future::Future;
+
+trait DesugaredAsyncTrait {
+    async fn foo(&self) -> usize;
+}
+
+impl DesugaredAsyncTrait for () {
+    async fn foo(&self) -> usize {
+    $0
+}
 }
 "#,
         );

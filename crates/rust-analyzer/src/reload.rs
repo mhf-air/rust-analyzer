@@ -15,9 +15,7 @@
 // FIXME: This is a mess that needs some untangling work
 use std::{iter, mem};
 
-use flycheck::{FlycheckConfig, FlycheckHandle};
-use hir::{db::DefDatabase, ChangeWithProcMacros, ProcMacros};
-use ide::CrateId;
+use hir::{db::DefDatabase, ChangeWithProcMacros, ProcMacros, ProcMacrosBuilder};
 use ide_db::{
     base_db::{salsa::Durability, CrateGraph, ProcMacroPaths, Version},
     FxHashMap,
@@ -33,6 +31,7 @@ use vfs::{AbsPath, AbsPathBuf, ChangeKind};
 
 use crate::{
     config::{Config, FilesWatcher, LinkedProject},
+    flycheck::{FlycheckConfig, FlycheckHandle},
     global_state::{FetchWorkspaceRequest, GlobalState},
     lsp_ext,
     main_loop::{DiscoverProjectParam, Task},
@@ -62,14 +61,27 @@ pub(crate) enum ProcMacroProgress {
 }
 
 impl GlobalState {
+    /// Is the server quiescent?
+    ///
+    /// This indicates that we've fully loaded the projects and
+    /// are ready to do semantic work.
     pub(crate) fn is_quiescent(&self) -> bool {
-        !(self.last_reported_status.is_none()
-            || self.fetch_workspaces_queue.op_in_progress()
-            || self.fetch_build_data_queue.op_in_progress()
-            || self.fetch_proc_macros_queue.op_in_progress()
-            || self.discover_workspace_queue.op_in_progress()
-            || self.vfs_progress_config_version < self.vfs_config_version
-            || self.vfs_progress_n_done < self.vfs_progress_n_total)
+        self.vfs_done
+            && self.last_reported_status.is_some()
+            && !self.fetch_workspaces_queue.op_in_progress()
+            && !self.fetch_build_data_queue.op_in_progress()
+            && !self.fetch_proc_macros_queue.op_in_progress()
+            && !self.discover_workspace_queue.op_in_progress()
+            && self.vfs_progress_config_version >= self.vfs_config_version
+    }
+
+    /// Is the server ready to respond to analysis dependent LSP requests?
+    ///
+    /// Unlike `is_quiescent`, this returns false when we're indexing
+    /// the project, because we're holding the salsa lock and cannot
+    /// respond to LSP requests that depend on salsa data.
+    fn is_fully_ready(&self) -> bool {
+        self.is_quiescent() && !self.prime_caches_queue.op_in_progress()
     }
 
     pub(crate) fn update_configuration(&mut self, config: Config) {
@@ -88,7 +100,7 @@ impl GlobalState {
         {
             let req = FetchWorkspaceRequest { path: None, force_crate_graph_reload: false };
             self.fetch_workspaces_queue.request_op("discovered projects changed".to_owned(), req)
-        } else if self.config.flycheck() != old_config.flycheck() {
+        } else if self.config.flycheck(None) != old_config.flycheck(None) {
             self.reload_flycheck();
         }
 
@@ -105,12 +117,12 @@ impl GlobalState {
     pub(crate) fn current_status(&self) -> lsp_ext::ServerStatusParams {
         let mut status = lsp_ext::ServerStatusParams {
             health: lsp_ext::Health::Ok,
-            quiescent: self.is_quiescent(),
+            quiescent: self.is_fully_ready(),
             message: None,
         };
         let mut message = String::new();
 
-        if !self.config.cargo_autoreload()
+        if !self.config.cargo_autoreload_config(None)
             && self.is_quiescent()
             && self.fetch_workspaces_queue.op_requested()
             && self.config.discover_workspace_config().is_none()
@@ -168,6 +180,19 @@ impl GlobalState {
                 self.proc_macro_clients.iter().map(Some).chain(iter::repeat_with(|| None));
 
             for (ws, proc_macro_client) in self.workspaces.iter().zip(proc_macro_clients) {
+                if let ProjectWorkspaceKind::Cargo { error: Some(error), .. }
+                | ProjectWorkspaceKind::DetachedFile {
+                    cargo: Some((_, _, Some(error))), ..
+                } = &ws.kind
+                {
+                    status.health |= lsp_ext::Health::Warning;
+                    format_to!(
+                        message,
+                        "Failed to read Cargo metadata with dependencies for `{}`: {:#}\n\n",
+                        ws.manifest_or_root(),
+                        error
+                    );
+                }
                 if let Some(err) = ws.sysroot.error() {
                     status.health |= lsp_ext::Health::Warning;
                     format_to!(
@@ -239,11 +264,11 @@ impl GlobalState {
                 .map(ManifestPath::try_from)
                 .filter_map(Result::ok)
                 .collect();
-            let cargo_config = self.config.cargo();
+            let cargo_config = self.config.cargo(None);
             let discover_command = self.config.discover_workspace_config().cloned();
             let is_quiescent = !(self.discover_workspace_queue.op_in_progress()
                 || self.vfs_progress_config_version < self.vfs_config_version
-                || self.vfs_progress_n_done < self.vfs_progress_n_total);
+                || !self.vfs_done);
 
             move |sender| {
                 let progress = {
@@ -332,7 +357,7 @@ impl GlobalState {
     pub(crate) fn fetch_build_data(&mut self, cause: Cause) {
         info!(%cause, "will fetch build data");
         let workspaces = Arc::clone(&self.workspaces);
-        let config = self.config.cargo();
+        let config = self.config.cargo(None);
         let root_path = self.config.root_path().clone();
 
         self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, move |sender| {
@@ -357,7 +382,7 @@ impl GlobalState {
 
     pub(crate) fn fetch_proc_macros(&mut self, cause: Cause, paths: Vec<ProcMacroPaths>) {
         info!(%cause, "will load proc macros");
-        let ignored_proc_macros = self.config.ignored_proc_macros().clone();
+        let ignored_proc_macros = self.config.ignored_proc_macros(None).clone();
         let proc_macro_clients = self.proc_macro_clients.clone();
 
         self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, move |sender| {
@@ -371,43 +396,44 @@ impl GlobalState {
                 }
             };
 
-            let mut res = FxHashMap::default();
+            let mut builder = ProcMacrosBuilder::default();
             let chain = proc_macro_clients
                 .iter()
                 .map(|res| res.as_ref().map_err(|e| e.to_string()))
-                .chain(iter::repeat_with(|| Err("Proc macros servers are not running".into())));
+                .chain(iter::repeat_with(|| Err("proc-macro-srv is not running".into())));
             for (client, paths) in chain.zip(paths) {
-                res.extend(paths.into_iter().map(move |(crate_id, res)| {
-                    (
-                        crate_id,
-                        res.map_or_else(
-                            |_| Err("proc macro crate is missing dylib".to_owned()),
-                            |(crate_name, path)| {
-                                progress(path.to_string());
-                                client.as_ref().map_err(Clone::clone).and_then(|client| {
-                                    load_proc_macro(
-                                        client,
-                                        &path,
-                                        crate_name
-                                            .as_deref()
-                                            .and_then(|crate_name| {
-                                                ignored_proc_macros.iter().find_map(
-                                                    |(name, macros)| {
-                                                        eq_ignore_underscore(name, crate_name)
+                paths
+                    .into_iter()
+                    .map(move |(crate_id, res)| {
+                        (
+                            crate_id,
+                            res.map_or_else(
+                                |e| Err((e, true)),
+                                |(crate_name, path)| {
+                                    progress(path.to_string());
+                                    client.as_ref().map_err(|it| (it.clone(), true)).and_then(
+                                        |client| {
+                                            load_proc_macro(
+                                                client,
+                                                &path,
+                                                ignored_proc_macros
+                                                    .iter()
+                                                    .find_map(|(name, macros)| {
+                                                        eq_ignore_underscore(name, &crate_name)
                                                             .then_some(&**macros)
-                                                    },
-                                                )
-                                            })
-                                            .unwrap_or_default(),
+                                                    })
+                                                    .unwrap_or_default(),
+                                            )
+                                        },
                                     )
-                                })
-                            },
-                        ),
-                    )
-                }));
+                                },
+                            ),
+                        )
+                    })
+                    .for_each(|(krate, res)| builder.insert(krate, res));
             }
 
-            sender.send(Task::LoadProcMacros(ProcMacroProgress::End(res))).unwrap();
+            sender.send(Task::LoadProcMacros(ProcMacroProgress::End(builder.build()))).unwrap();
         });
     }
 
@@ -481,7 +507,7 @@ impl GlobalState {
             // FIXME: can we abort the build scripts here if they are already running?
             self.workspaces = Arc::new(workspaces);
 
-            if self.config.run_build_scripts() {
+            if self.config.run_build_scripts(None) {
                 self.build_deps_changed = false;
                 self.fetch_build_data_queue.request_op("workspace updated".to_owned(), ());
             }
@@ -539,9 +565,25 @@ impl GlobalState {
                         .collect()
                 };
 
+            // Also explicitly watch any build files configured in JSON project files.
+            for ws in self.workspaces.iter() {
+                if let ProjectWorkspaceKind::Json(project_json) = &ws.kind {
+                    for (_, krate) in project_json.crates() {
+                        let Some(build) = &krate.build else {
+                            continue;
+                        };
+                        watchers.push(lsp_types::FileSystemWatcher {
+                            glob_pattern: lsp_types::GlobPattern::String(
+                                build.build_file.to_string(),
+                            ),
+                            kind: None,
+                        });
+                    }
+                }
+            }
+
             watchers.extend(
-                iter::once(self.config.user_config_path().as_path())
-                    .chain(iter::once(self.config.root_ratoml_path().as_path()))
+                iter::once(Config::user_config_path())
                     .chain(self.workspaces.iter().map(|ws| ws.manifest().map(ManifestPath::as_ref)))
                     .flatten()
                     .map(|glob_pattern| lsp_types::FileSystemWatcher {
@@ -585,7 +627,7 @@ impl GlobalState {
                         ..
                     } => cargo_config_extra_env
                         .iter()
-                        .chain(self.config.extra_env())
+                        .chain(self.config.extra_env(None))
                         .map(|(a, b)| (a.clone(), b.clone()))
                         .chain(
                             ws.sysroot
@@ -660,17 +702,24 @@ impl GlobalState {
                 vfs.file_id(&vfs_path)
             };
 
-            ws_to_crate_graph(&self.workspaces, self.config.extra_env(), load)
+            ws_to_crate_graph(&self.workspaces, self.config.extra_env(None), load)
         };
         let mut change = ChangeWithProcMacros::new();
         if self.config.expand_proc_macros() {
             change.set_proc_macros(
                 crate_graph
                     .iter()
-                    .map(|id| (id, Err("Proc-macros have not been built yet".to_owned())))
+                    .map(|id| (id, Err(("proc-macro has not been built yet".to_owned(), true))))
                     .collect(),
             );
             self.fetch_proc_macros_queue.request_op(cause, proc_macro_paths);
+        } else {
+            change.set_proc_macros(
+                crate_graph
+                    .iter()
+                    .map(|id| (id, Err(("proc-macro expansion is disabled".to_owned(), false))))
+                    .collect(),
+            );
         }
         change.set_crate_graph(crate_graph);
         change.set_target_data_layouts(layouts);
@@ -742,23 +791,29 @@ impl GlobalState {
 
     fn reload_flycheck(&mut self) {
         let _p = tracing::info_span!("GlobalState::reload_flycheck").entered();
-        let config = self.config.flycheck();
+        let config = self.config.flycheck(None);
         let sender = self.flycheck_sender.clone();
         let invocation_strategy = match config {
-            FlycheckConfig::CargoCommand { .. } => flycheck::InvocationStrategy::PerWorkspace,
-            FlycheckConfig::CustomCommand { invocation_strategy, .. } => invocation_strategy,
+            FlycheckConfig::CargoCommand { .. } => {
+                crate::flycheck::InvocationStrategy::PerWorkspace
+            }
+            FlycheckConfig::CustomCommand { ref invocation_strategy, .. } => {
+                invocation_strategy.clone()
+            }
         };
 
         self.flycheck = match invocation_strategy {
-            flycheck::InvocationStrategy::Once => vec![FlycheckHandle::spawn(
-                0,
-                Box::new(move |msg| sender.send(msg).unwrap()),
-                config,
-                None,
-                self.config.root_path().clone(),
-                None,
-            )],
-            flycheck::InvocationStrategy::PerWorkspace => {
+            crate::flycheck::InvocationStrategy::Once => {
+                vec![FlycheckHandle::spawn(
+                    0,
+                    sender,
+                    config,
+                    None,
+                    self.config.root_path().clone(),
+                    None,
+                )]
+            }
+            crate::flycheck::InvocationStrategy::PerWorkspace => {
                 self.workspaces
                     .iter()
                     .enumerate()
@@ -768,7 +823,7 @@ impl GlobalState {
                             match &ws.kind {
                                 ProjectWorkspaceKind::Cargo { cargo, .. }
                                 | ProjectWorkspaceKind::DetachedFile {
-                                    cargo: Some((cargo, _)),
+                                    cargo: Some((cargo, _, _)),
                                     ..
                                 } => (cargo.workspace_root(), Some(cargo.manifest_path())),
                                 ProjectWorkspaceKind::Json(project) => {
@@ -787,10 +842,9 @@ impl GlobalState {
                         ))
                     })
                     .map(|(id, (root, manifest_path), sysroot_root)| {
-                        let sender = sender.clone();
                         FlycheckHandle::spawn(
                             id,
-                            Box::new(move |msg| sender.send(msg).unwrap()),
+                            sender.clone(),
                             config.clone(),
                             sysroot_root,
                             root.to_path_buf(),
@@ -809,12 +863,7 @@ pub fn ws_to_crate_graph(
     workspaces: &[ProjectWorkspace],
     extra_env: &FxHashMap<String, String>,
     mut load: impl FnMut(&AbsPath) -> Option<vfs::FileId>,
-) -> (
-    CrateGraph,
-    Vec<FxHashMap<CrateId, Result<(Option<String>, AbsPathBuf), String>>>,
-    Vec<Result<Arc<str>, Arc<str>>>,
-    Vec<Option<Version>>,
-) {
+) -> (CrateGraph, Vec<ProcMacroPaths>, Vec<Result<Arc<str>, Arc<str>>>, Vec<Option<Version>>) {
     let mut crate_graph = CrateGraph::default();
     let mut proc_macro_paths = Vec::default();
     let mut layouts = Vec::default();

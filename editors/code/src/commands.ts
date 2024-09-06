@@ -100,12 +100,6 @@ export function memoryUsage(ctx: CtxInit): Cmd {
     };
 }
 
-export function shuffleCrateGraph(ctx: CtxInit): Cmd {
-    return async () => {
-        return ctx.client.sendRequest(ra.shuffleCrateGraph);
-    };
-}
-
 export function triggerParameterHints(_: CtxInit): Cmd {
     return async () => {
         const parameterHintsEnabled = vscode.workspace
@@ -1203,9 +1197,10 @@ export function newDebugConfig(ctx: CtxInit): Cmd {
 }
 
 export function hoverRefCommandProxy(_: Ctx): Cmd {
-    return async () => {
-        if (HOVER_REFERENCE_COMMAND) {
-            const { command, arguments: args = [] } = HOVER_REFERENCE_COMMAND;
+    return async (index: number) => {
+        const link = HOVER_REFERENCE_COMMAND[index];
+        if (link) {
+            const { command, arguments: args = [] } = link;
             await vscode.commands.executeCommand(command, ...args);
         }
     };

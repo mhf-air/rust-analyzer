@@ -9,10 +9,11 @@ use chalk_ir::{cast::Cast, fold::Shift, DebruijnIndex, Mutability, TyVariableKin
 use either::Either;
 use hir_def::{
     hir::{
-        ArithOp, Array, BinaryOp, ClosureKind, Expr, ExprId, LabelId, Literal, Statement, UnaryOp,
+        ArithOp, Array, AsmOperand, AsmOptions, BinaryOp, ClosureKind, Expr, ExprId, LabelId,
+        Literal, Statement, UnaryOp,
     },
     lang_item::{LangItem, LangItemTarget},
-    path::{GenericArgs, Path},
+    path::{GenericArg, GenericArgs, Path},
     BlockId, FieldId, GenericDefId, GenericParamId, ItemContainerId, Lookup, TupleFieldId, TupleId,
 };
 use hir_expand::name::Name;
@@ -41,9 +42,9 @@ use crate::{
     primitive::{self, UintTy},
     static_lifetime, to_chalk_trait_id,
     traits::FnTrait,
-    Adjust, Adjustment, AdtId, AutoBorrow, Binders, CallableDefId, FnAbi, FnPointer, FnSig,
-    FnSubst, Interner, Rawness, Scalar, Substitution, TraitEnvironment, TraitRef, Ty, TyBuilder,
-    TyExt, TyKind,
+    Adjust, Adjustment, AdtId, AutoBorrow, Binders, CallableDefId, CallableSig, FnAbi, FnPointer,
+    FnSig, FnSubst, Interner, Rawness, Scalar, Substitution, TraitEnvironment, TraitRef, Ty,
+    TyBuilder, TyExt, TyKind,
 };
 
 use super::{
@@ -610,7 +611,12 @@ impl InferenceContext<'_> {
             Expr::Cast { expr, type_ref } => {
                 let cast_ty = self.make_ty(type_ref);
                 let expr_ty = self.infer_expr(*expr, &Expectation::Castable(cast_ty.clone()));
-                self.deferred_cast_checks.push(CastCheck::new(expr_ty, cast_ty.clone()));
+                self.deferred_cast_checks.push(CastCheck::new(
+                    tgt_expr,
+                    *expr,
+                    expr_ty,
+                    cast_ty.clone(),
+                ));
                 cast_ty
             }
             Expr::Ref { expr, rawness, mutability } => {
@@ -635,7 +641,10 @@ impl InferenceContext<'_> {
                 let inner_ty = self.infer_expr_inner(*expr, &expectation);
                 match rawness {
                     Rawness::RawPtr => TyKind::Raw(mutability, inner_ty),
-                    Rawness::Ref => TyKind::Ref(mutability, error_lifetime(), inner_ty),
+                    Rawness::Ref => {
+                        let lt = self.table.new_lifetime_var();
+                        TyKind::Ref(mutability, lt, inner_ty)
+                    }
                 }
                 .intern(Interner)
             }
@@ -786,18 +795,23 @@ impl InferenceContext<'_> {
                             adj.apply(&mut self.table, base_ty)
                         });
                     // mutability will be fixed up in `InferenceContext::infer_mut`;
-                    adj.push(Adjustment::borrow(Mutability::Not, self_ty.clone()));
+                    adj.push(Adjustment::borrow(
+                        Mutability::Not,
+                        self_ty.clone(),
+                        self.table.new_lifetime_var(),
+                    ));
                     self.write_expr_adj(*base, adj);
                     if let Some(func) = self
                         .db
                         .trait_data(index_trait)
                         .method_by_name(&Name::new_symbol_root(sym::index.clone()))
                     {
-                        let substs = TyBuilder::subst_for_def(self.db, index_trait, None)
-                            .push(self_ty.clone())
-                            .push(index_ty.clone())
-                            .build();
-                        self.write_method_resolution(tgt_expr, func, substs);
+                        let subst = TyBuilder::subst_for_def(self.db, index_trait, None);
+                        if subst.remaining() != 2 {
+                            return self.err_ty();
+                        }
+                        let subst = subst.push(self_ty.clone()).push(index_ty.clone()).build();
+                        self.write_method_resolution(tgt_expr, func, subst);
                     }
                     let assoc = self.resolve_ops_index_output();
                     let res = self.resolve_associated_type_with_params(
@@ -911,9 +925,61 @@ impl InferenceContext<'_> {
                 expected
             }
             Expr::OffsetOf(_) => TyKind::Scalar(Scalar::Uint(UintTy::Usize)).intern(Interner),
-            Expr::InlineAsm(it) => {
-                self.infer_expr_no_expect(it.e);
-                self.result.standard_types.unit.clone()
+            Expr::InlineAsm(asm) => {
+                let mut check_expr_asm_operand = |expr, is_input: bool| {
+                    let ty = self.infer_expr_no_expect(expr);
+
+                    // If this is an input value, we require its type to be fully resolved
+                    // at this point. This allows us to provide helpful coercions which help
+                    // pass the type candidate list in a later pass.
+                    //
+                    // We don't require output types to be resolved at this point, which
+                    // allows them to be inferred based on how they are used later in the
+                    // function.
+                    if is_input {
+                        let ty = self.resolve_ty_shallow(&ty);
+                        match ty.kind(Interner) {
+                            TyKind::FnDef(def, parameters) => {
+                                let fnptr_ty = TyKind::Function(
+                                    CallableSig::from_def(self.db, *def, parameters).to_fn_ptr(),
+                                )
+                                .intern(Interner);
+                                _ = self.coerce(Some(expr), &ty, &fnptr_ty);
+                            }
+                            TyKind::Ref(mutbl, _, base_ty) => {
+                                let ptr_ty = TyKind::Raw(*mutbl, base_ty.clone()).intern(Interner);
+                                _ = self.coerce(Some(expr), &ty, &ptr_ty);
+                            }
+                            _ => {}
+                        }
+                    }
+                };
+
+                let diverge = asm.options.contains(AsmOptions::NORETURN);
+                asm.operands.iter().for_each(|(_, operand)| match *operand {
+                    AsmOperand::In { expr, .. } => check_expr_asm_operand(expr, true),
+                    AsmOperand::Out { expr: Some(expr), .. } | AsmOperand::InOut { expr, .. } => {
+                        check_expr_asm_operand(expr, false)
+                    }
+                    AsmOperand::Out { expr: None, .. } => (),
+                    AsmOperand::SplitInOut { in_expr, out_expr, .. } => {
+                        check_expr_asm_operand(in_expr, true);
+                        if let Some(out_expr) = out_expr {
+                            check_expr_asm_operand(out_expr, false);
+                        }
+                    }
+                    // FIXME
+                    AsmOperand::Label(_) => (),
+                    // FIXME
+                    AsmOperand::Const(_) => (),
+                    // FIXME
+                    AsmOperand::Sym(_) => (),
+                });
+                if diverge {
+                    self.result.standard_types.never.clone()
+                } else {
+                    self.result.standard_types.unit.clone()
+                }
             }
         };
         // use a new type variable if we got unknown here
@@ -990,7 +1056,7 @@ impl InferenceContext<'_> {
         match fn_x {
             FnTrait::FnOnce => (),
             FnTrait::FnMut => {
-                if let TyKind::Ref(Mutability::Mut, _, inner) = derefed_callee.kind(Interner) {
+                if let TyKind::Ref(Mutability::Mut, lt, inner) = derefed_callee.kind(Interner) {
                     if adjustments
                         .last()
                         .map(|it| matches!(it.kind, Adjust::Borrow(_)))
@@ -999,15 +1065,27 @@ impl InferenceContext<'_> {
                         // prefer reborrow to move
                         adjustments
                             .push(Adjustment { kind: Adjust::Deref(None), target: inner.clone() });
-                        adjustments.push(Adjustment::borrow(Mutability::Mut, inner.clone()))
+                        adjustments.push(Adjustment::borrow(
+                            Mutability::Mut,
+                            inner.clone(),
+                            lt.clone(),
+                        ))
                     }
                 } else {
-                    adjustments.push(Adjustment::borrow(Mutability::Mut, derefed_callee.clone()));
+                    adjustments.push(Adjustment::borrow(
+                        Mutability::Mut,
+                        derefed_callee.clone(),
+                        self.table.new_lifetime_var(),
+                    ));
                 }
             }
             FnTrait::Fn => {
                 if !matches!(derefed_callee.kind(Interner), TyKind::Ref(Mutability::Not, _, _)) {
-                    adjustments.push(Adjustment::borrow(Mutability::Not, derefed_callee.clone()));
+                    adjustments.push(Adjustment::borrow(
+                        Mutability::Not,
+                        derefed_callee.clone(),
+                        self.table.new_lifetime_var(),
+                    ));
                 }
             }
         }
@@ -1295,10 +1373,12 @@ impl InferenceContext<'_> {
 
         // HACK: We can use this substitution for the function because the function itself doesn't
         // have its own generic parameters.
-        let subst = TyBuilder::subst_for_def(self.db, trait_, None)
-            .push(lhs_ty.clone())
-            .push(rhs_ty.clone())
-            .build();
+        let subst = TyBuilder::subst_for_def(self.db, trait_, None);
+        if subst.remaining() != 2 {
+            return Ty::new(Interner, TyKind::Error);
+        }
+        let subst = subst.push(lhs_ty.clone()).push(rhs_ty.clone()).build();
+
         self.write_method_resolution(tgt_expr, func, subst.clone());
 
         let method_ty = self.db.value_ty(func.into()).unwrap().substitute(Interner, &subst);
@@ -1310,11 +1390,11 @@ impl InferenceContext<'_> {
             Some(sig) => {
                 let p_left = &sig.params()[0];
                 if matches!(op, BinaryOp::CmpOp(..) | BinaryOp::Assignment { .. }) {
-                    if let &TyKind::Ref(mtbl, _, _) = p_left.kind(Interner) {
+                    if let TyKind::Ref(mtbl, lt, _) = p_left.kind(Interner) {
                         self.write_expr_adj(
                             lhs,
                             vec![Adjustment {
-                                kind: Adjust::Borrow(AutoBorrow::Ref(mtbl)),
+                                kind: Adjust::Borrow(AutoBorrow::Ref(lt.clone(), *mtbl)),
                                 target: p_left.clone(),
                             }],
                         );
@@ -1322,11 +1402,11 @@ impl InferenceContext<'_> {
                 }
                 let p_right = &sig.params()[1];
                 if matches!(op, BinaryOp::CmpOp(..)) {
-                    if let &TyKind::Ref(mtbl, _, _) = p_right.kind(Interner) {
+                    if let TyKind::Ref(mtbl, lt, _) = p_right.kind(Interner) {
                         self.write_expr_adj(
                             rhs,
                             vec![Adjustment {
-                                kind: Adjust::Borrow(AutoBorrow::Ref(mtbl)),
+                                kind: Adjust::Borrow(AutoBorrow::Ref(lt.clone(), *mtbl)),
                                 target: p_right.clone(),
                             }],
                         );
@@ -1759,13 +1839,14 @@ impl InferenceContext<'_> {
         skip_indices: &[u32],
         is_varargs: bool,
     ) {
-        if args.len() != param_tys.len() + skip_indices.len() && !is_varargs {
+        let arg_count_mismatch = args.len() != param_tys.len() + skip_indices.len() && !is_varargs;
+        if arg_count_mismatch {
             self.push_diagnostic(InferenceDiagnostic::MismatchedArgCount {
                 call_expr: expr,
                 expected: param_tys.len() + skip_indices.len(),
                 found: args.len(),
             });
-        }
+        };
 
         // Quoting https://github.com/rust-lang/rust/blob/6ef275e6c3cb1384ec78128eceeb4963ff788dca/src/librustc_typeck/check/mod.rs#L3325 --
         // We do this in a pretty awful way: first we type-check any arguments
@@ -1819,7 +1900,7 @@ impl InferenceContext<'_> {
                 // The function signature may contain some unknown types, so we need to insert
                 // type vars here to avoid type mismatch false positive.
                 let coercion_target = self.insert_type_vars(coercion_target);
-                if self.coerce(Some(arg), &ty, &coercion_target).is_err() {
+                if self.coerce(Some(arg), &ty, &coercion_target).is_err() && !arg_count_mismatch {
                     self.result.type_mismatches.insert(
                         arg.into(),
                         TypeMismatch { expected: coercion_target, actual: ty.clone() },
@@ -1851,29 +1932,45 @@ impl InferenceContext<'_> {
         if let Some(generic_args) = generic_args {
             // if args are provided, it should be all of them, but we can't rely on that
             let self_params = type_params + const_params + lifetime_params;
-            for (arg, kind_id) in
-                generic_args.args.iter().zip(def_generics.iter_self_id()).take(self_params)
-            {
-                let arg = generic_arg_to_chalk(
-                    self.db,
-                    kind_id,
-                    arg,
-                    self,
-                    |this, type_ref| this.make_ty(type_ref),
-                    |this, c, ty| {
-                        const_or_path_to_chalk(
-                            this.db,
-                            &this.resolver,
-                            this.owner.into(),
-                            ty,
-                            c,
-                            ParamLoweringMode::Placeholder,
-                            || this.generics(),
-                            DebruijnIndex::INNERMOST,
-                        )
-                    },
-                    |this, lt_ref| this.make_lifetime(lt_ref),
-                );
+
+            let mut args = generic_args.args.iter().peekable();
+            for kind_id in def_generics.iter_self_id().take(self_params) {
+                let arg = args.peek();
+                let arg = match (kind_id, arg) {
+                    // Lifetimes can be elided.
+                    // Once we have implemented lifetime elision correctly,
+                    // this should be handled in a proper way.
+                    (
+                        GenericParamId::LifetimeParamId(_),
+                        None | Some(GenericArg::Type(_) | GenericArg::Const(_)),
+                    ) => error_lifetime().cast(Interner),
+
+                    // If we run out of `generic_args`, stop pushing substs
+                    (_, None) => break,
+
+                    // Normal cases
+                    (_, Some(_)) => generic_arg_to_chalk(
+                        self.db,
+                        kind_id,
+                        args.next().unwrap(), // `peek()` is `Some(_)`, so guaranteed no panic
+                        self,
+                        |this, type_ref| this.make_ty(type_ref),
+                        |this, c, ty| {
+                            const_or_path_to_chalk(
+                                this.db,
+                                &this.resolver,
+                                this.owner.into(),
+                                ty,
+                                c,
+                                ParamLoweringMode::Placeholder,
+                                || this.generics(),
+                                DebruijnIndex::INNERMOST,
+                            )
+                        },
+                        |this, lt_ref| this.make_lifetime(lt_ref),
+                    ),
+                };
+
                 substs.push(arg);
             }
         };
