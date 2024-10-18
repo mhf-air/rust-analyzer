@@ -373,7 +373,7 @@ fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {
                             .targets
                             .iter()
                             .any(|&it| crate_root_paths.contains(&cargo[it].root.as_path()));
-                        has_target_with_root.then(|| cargo[pkg].name.clone())
+                        has_target_with_root.then(|| cargo.package_flag(&cargo[pkg]))
                     }),
                     project_model::ProjectWorkspaceKind::Json(project) => {
                         if !project.crates().any(|(_, krate)| {
@@ -396,7 +396,7 @@ fn run_flycheck(state: &mut GlobalState, vfs_path: VfsPath) -> bool {
                     if id == flycheck.id() {
                         updated = true;
                         match package.filter(|_| {
-                            !world.config.flycheck_workspace(source_root_id) || target.is_some()
+                            !world.config.flycheck_workspace(source_root_id) && target.is_some()
                         }) {
                             Some(package) => flycheck
                                 .restart_for_package(package, target.clone().map(TupleExt::head)),

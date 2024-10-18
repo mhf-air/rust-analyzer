@@ -12,10 +12,11 @@ use std::{
 use cfg::{CfgAtom, CfgDiff};
 use hir::Symbol;
 use ide::{
-    AssistConfig, CallableSnippets, CompletionConfig, DiagnosticsConfig, ExprFillDefaultMode,
-    GenericParameterHints, HighlightConfig, HighlightRelatedConfig, HoverConfig, HoverDocFormat,
-    InlayFieldsToResolve, InlayHintsConfig, JoinLinesConfig, MemoryLayoutHoverConfig,
-    MemoryLayoutHoverRenderKind, Snippet, SnippetScope, SourceRootId,
+    AssistConfig, CallHierarchyConfig, CallableSnippets, CompletionConfig,
+    CompletionFieldsToResolve, DiagnosticsConfig, ExprFillDefaultMode, GenericParameterHints,
+    HighlightConfig, HighlightRelatedConfig, HoverConfig, HoverDocFormat, InlayFieldsToResolve,
+    InlayHintsConfig, JoinLinesConfig, MemoryLayoutHoverConfig, MemoryLayoutHoverRenderKind,
+    Snippet, SnippetScope, SourceRootId,
 };
 use ide_db::{
     imports::insert_use::{ImportGranularity, InsertUseConfig, PrefixKind},
@@ -24,7 +25,8 @@ use ide_db::{
 use itertools::Itertools;
 use paths::{Utf8Path, Utf8PathBuf};
 use project_model::{
-    CargoConfig, CargoFeatures, ProjectJson, ProjectJsonData, ProjectManifest, RustLibSource,
+    CargoConfig, CargoFeatures, ProjectJson, ProjectJsonData, ProjectJsonFromCommand,
+    ProjectManifest, RustLibSource,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use semver::Version;
@@ -59,7 +61,7 @@ mod patch_old_style;
 // However, editor specific config, which the server doesn't know about, should
 // be specified directly in `package.json`.
 //
-// To deprecate an option by replacing it with another name use `new_name | `old_name` so that we keep
+// To deprecate an option by replacing it with another name use `new_name` | `old_name` so that we keep
 // parsing the old name.
 config_data! {
     /// Configs that apply on a workspace-wide scope. There are 2 levels on which a global configuration can be configured
@@ -74,6 +76,8 @@ config_data! {
         /// How many worker threads to handle priming caches. The default `0` means to pick automatically.
         cachePriming_numThreads: NumThreads = NumThreads::Physical,
 
+        /// Custom completion snippets.
+        completion_snippets_custom: FxHashMap<String, SnippetDef> = Config::completion_snippets_default(),
 
 
         /// These directories will be ignored by rust-analyzer. They are
@@ -259,7 +263,7 @@ config_data! {
         /// Exclude imports from find-all-references.
         references_excludeImports: bool = false,
 
-        /// Exclude tests from find-all-references.
+        /// Exclude tests from find-all-references and call-hierarchy.
         references_excludeTests: bool = false,
 
         /// Inject additional highlighting into doc comments.
@@ -419,6 +423,10 @@ config_data! {
         assist_termSearch_fuel: usize = 1800,
 
 
+        /// Whether to automatically add a semicolon when completing unit-returning functions.
+        ///
+        /// In `match` arms it completes a comma instead.
+        completion_addSemicolonToUnit: bool = true,
         /// Toggles the additional completions that automatically add imports when completed.
         /// Note that your client must specify the `additionalTextEdits` LSP client capability to truly have this feature enabled.
         completion_autoimport_enable: bool       = true,
@@ -437,48 +445,6 @@ config_data! {
         completion_postfix_enable: bool         = true,
         /// Enables completions of private items and fields that are defined in the current workspace even if they are not visible at the current position.
         completion_privateEditable_enable: bool = false,
-        /// Custom completion snippets.
-        completion_snippets_custom: FxHashMap<String, SnippetDef> = serde_json::from_str(r#"{
-            "Arc::new": {
-                "postfix": "arc",
-                "body": "Arc::new(${receiver})",
-                "requires": "std::sync::Arc",
-                "description": "Put the expression into an `Arc`",
-                "scope": "expr"
-            },
-            "Rc::new": {
-                "postfix": "rc",
-                "body": "Rc::new(${receiver})",
-                "requires": "std::rc::Rc",
-                "description": "Put the expression into an `Rc`",
-                "scope": "expr"
-            },
-            "Box::pin": {
-                "postfix": "pinbox",
-                "body": "Box::pin(${receiver})",
-                "requires": "std::boxed::Box",
-                "description": "Put the expression into a pinned `Box`",
-                "scope": "expr"
-            },
-            "Ok": {
-                "postfix": "ok",
-                "body": "Ok(${receiver})",
-                "description": "Wrap the expression in a `Result::Ok`",
-                "scope": "expr"
-            },
-            "Err": {
-                "postfix": "err",
-                "body": "Err(${receiver})",
-                "description": "Wrap the expression in a `Result::Err`",
-                "scope": "expr"
-            },
-            "Some": {
-                "postfix": "some",
-                "body": "Some(${receiver})",
-                "description": "Wrap the expression in an `Option::Some`",
-                "scope": "expr"
-            }
-        }"#).unwrap(),
         /// Whether to enable term search based snippets like `Some(foo.bar().baz())`.
         completion_termSearch_enable: bool = false,
         /// Term search fuel in "units of work" for autocompletion (Defaults to 1000).
@@ -609,6 +575,9 @@ config_data! {
         /// set to a path relative to the workspace to use that path.
         cargo_targetDir | rust_analyzerTargetDir: Option<TargetDirectory> = None,
 
+        /// Set `cfg(test)` for local crates. Defaults to true.
+        cfg_setTest: bool = true,
+
         /// Run the check command for diagnostics on save.
         checkOnSave | checkOnSave_enable: bool                         = true,
 
@@ -730,7 +699,6 @@ config_data! {
         workspace_symbol_search_limit: usize = 128,
         /// Workspace symbol search scope.
         workspace_symbol_search_scope: WorkspaceSymbolSearchScopeDef = WorkspaceSymbolSearchScopeDef::Workspace,
-
     }
 }
 
@@ -761,7 +729,13 @@ enum RatomlFile {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    discovered_projects: Vec<ProjectManifest>,
+    /// Projects that have a Cargo.toml or a rust-project.json in a
+    /// parent directory, so we can discover them by walking the
+    /// file system.
+    discovered_projects_from_filesystem: Vec<ProjectManifest>,
+    /// Projects whose configuration was generated by a command
+    /// configured in discoverConfig.
+    discovered_projects_from_command: Vec<ProjectJsonFromCommand>,
     /// The workspace roots as registered by the LSP client
     workspace_roots: Vec<AbsPathBuf>,
     caps: ClientCapabilities,
@@ -882,7 +856,7 @@ impl Config {
                 // IMPORTANT : This holds as long as ` completion_snippets_custom` is declared `client`.
                 config.snippets.clear();
 
-                let snips = self.completion_snippets_custom(None).to_owned();
+                let snips = self.completion_snippets_custom().to_owned();
 
                 for (name, def) in snips.iter() {
                     if def.prefix.is_empty() && def.postfix.is_empty() {
@@ -1054,19 +1028,19 @@ impl Config {
         (config, e, should_update)
     }
 
-    pub fn add_linked_projects(&mut self, data: ProjectJsonData, buildfile: AbsPathBuf) {
-        let linked_projects = &mut self.client_config.0.global.linkedProjects;
-
-        let new_project = ManifestOrProjectJson::DiscoveredProjectJson { data, buildfile };
-        match linked_projects {
-            Some(projects) => {
-                match projects.iter_mut().find(|p| p.manifest() == new_project.manifest()) {
-                    Some(p) => *p = new_project,
-                    None => projects.push(new_project),
-                }
+    pub fn add_discovered_project_from_command(
+        &mut self,
+        data: ProjectJsonData,
+        buildfile: AbsPathBuf,
+    ) {
+        for proj in self.discovered_projects_from_command.iter_mut() {
+            if proj.buildfile == buildfile {
+                proj.data = data;
+                return;
             }
-            None => *linked_projects = Some(vec![new_project]),
         }
+
+        self.discovered_projects_from_command.push(ProjectJsonFromCommand { data, buildfile });
     }
 }
 
@@ -1259,7 +1233,7 @@ pub struct NotificationsConfig {
     pub cargo_toml_not_found: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum RustfmtConfig {
     Rustfmt { extra_args: Vec<String>, enable_range_formatting: bool },
     CustomCommand { command: String, args: Vec<String> },
@@ -1344,7 +1318,8 @@ impl Config {
 
         Config {
             caps: ClientCapabilities::new(caps),
-            discovered_projects: Vec::new(),
+            discovered_projects_from_filesystem: Vec::new(),
+            discovered_projects_from_command: Vec::new(),
             root_path,
             snippets: Default::default(),
             workspace_roots,
@@ -1365,7 +1340,7 @@ impl Config {
         if discovered.is_empty() {
             tracing::error!("failed to find any projects in {:?}", &self.workspace_roots);
         }
-        self.discovered_projects = discovered;
+        self.discovered_projects_from_filesystem = discovered;
     }
 
     pub fn remove_workspace(&mut self, path: &AbsPath) {
@@ -1418,7 +1393,12 @@ impl Config {
         }
     }
 
+    pub fn call_hierarchy(&self) -> CallHierarchyConfig {
+        CallHierarchyConfig { exclude_tests: self.references_excludeTests().to_owned() }
+    }
+
     pub fn completion(&self, source_root: Option<SourceRootId>) -> CompletionConfig {
+        let client_capability_fields = self.completion_resolve_support_properties();
         CompletionConfig {
             enable_postfix_completions: self.completion_postfix_enable(source_root).to_owned(),
             enable_imports_on_the_fly: self.completion_autoimport_enable(source_root).to_owned()
@@ -1433,6 +1413,7 @@ impl Config {
                 CallableCompletionDef::AddParentheses => Some(CallableSnippets::AddParentheses),
                 CallableCompletionDef::None => None,
             },
+            add_semicolon_to_unit: *self.completion_addSemicolonToUnit(source_root),
             snippet_cap: SnippetCap::new(self.completion_snippet()),
             insert_use: self.insert_use_config(source_root),
             prefer_no_std: self.imports_preferNoStd(source_root).to_owned(),
@@ -1442,6 +1423,15 @@ impl Config {
             limit: self.completion_limit(source_root).to_owned(),
             enable_term_search: self.completion_termSearch_enable(source_root).to_owned(),
             term_search_fuel: self.completion_termSearch_fuel(source_root).to_owned() as u64,
+            fields_to_resolve: CompletionFieldsToResolve {
+                resolve_label_details: client_capability_fields.contains("labelDetails"),
+                resolve_tags: client_capability_fields.contains("tags"),
+                resolve_detail: client_capability_fields.contains("detail"),
+                resolve_documentation: client_capability_fields.contains("documentation"),
+                resolve_filter_text: client_capability_fields.contains("filterText"),
+                resolve_text_edit: client_capability_fields.contains("textEdit"),
+                resolve_command: client_capability_fields.contains("command"),
+            },
         }
     }
 
@@ -1687,42 +1677,59 @@ impl Config {
         self.workspace_discoverConfig().as_ref()
     }
 
-    pub fn linked_or_discovered_projects(&self) -> Vec<LinkedProject> {
-        match self.linkedProjects().as_slice() {
-            [] => {
-                let exclude_dirs: Vec<_> =
-                    self.files_excludeDirs().iter().map(|p| self.root_path.join(p)).collect();
-                self.discovered_projects
-                    .iter()
-                    .filter(|project| {
-                        !exclude_dirs.iter().any(|p| project.manifest_path().starts_with(p))
-                    })
-                    .cloned()
-                    .map(LinkedProject::from)
-                    .collect()
-            }
-            linked_projects => linked_projects
-                .iter()
-                .filter_map(|linked_project| match linked_project {
-                    ManifestOrProjectJson::Manifest(it) => {
-                        let path = self.root_path.join(it);
-                        ProjectManifest::from_manifest_file(path)
-                            .map_err(|e| tracing::error!("failed to load linked project: {}", e))
-                            .ok()
-                            .map(Into::into)
-                    }
-                    ManifestOrProjectJson::DiscoveredProjectJson { data, buildfile } => {
-                        let root_path =
-                            buildfile.parent().expect("Unable to get parent of buildfile");
+    fn discovered_projects(&self) -> Vec<ManifestOrProjectJson> {
+        let exclude_dirs: Vec<_> =
+            self.files_excludeDirs().iter().map(|p| self.root_path.join(p)).collect();
 
-                        Some(ProjectJson::new(None, root_path, data.clone()).into())
-                    }
-                    ManifestOrProjectJson::ProjectJson(it) => {
-                        Some(ProjectJson::new(None, &self.root_path, it.clone()).into())
-                    }
-                })
-                .collect(),
+        let mut projects = vec![];
+        for fs_proj in &self.discovered_projects_from_filesystem {
+            let manifest_path = fs_proj.manifest_path();
+            if exclude_dirs.iter().any(|p| manifest_path.starts_with(p)) {
+                continue;
+            }
+
+            let buf: Utf8PathBuf = manifest_path.to_path_buf().into();
+            projects.push(ManifestOrProjectJson::Manifest(buf));
         }
+
+        for dis_proj in &self.discovered_projects_from_command {
+            projects.push(ManifestOrProjectJson::DiscoveredProjectJson {
+                data: dis_proj.data.clone(),
+                buildfile: dis_proj.buildfile.clone(),
+            });
+        }
+
+        projects
+    }
+
+    pub fn linked_or_discovered_projects(&self) -> Vec<LinkedProject> {
+        let linked_projects = self.linkedProjects();
+        let projects = if linked_projects.is_empty() {
+            self.discovered_projects()
+        } else {
+            linked_projects.clone()
+        };
+
+        projects
+            .iter()
+            .filter_map(|linked_project| match linked_project {
+                ManifestOrProjectJson::Manifest(it) => {
+                    let path = self.root_path.join(it);
+                    ProjectManifest::from_manifest_file(path)
+                        .map_err(|e| tracing::error!("failed to load linked project: {}", e))
+                        .ok()
+                        .map(Into::into)
+                }
+                ManifestOrProjectJson::DiscoveredProjectJson { data, buildfile } => {
+                    let root_path = buildfile.parent().expect("Unable to get parent of buildfile");
+
+                    Some(ProjectJson::new(None, root_path, data.clone()).into())
+                }
+                ManifestOrProjectJson::ProjectJson(it) => {
+                    Some(ProjectJson::new(None, &self.root_path, it.clone()).into())
+                }
+            })
+            .collect()
     }
 
     pub fn prefill_caches(&self) -> bool {
@@ -1869,7 +1876,59 @@ impl Config {
             extra_args: self.cargo_extraArgs(source_root).clone(),
             extra_env: self.cargo_extraEnv(source_root).clone(),
             target_dir: self.target_dir_from_config(source_root),
+            set_test: *self.cfg_setTest(source_root),
         }
+    }
+
+    pub fn cfg_set_test(&self, source_root: Option<SourceRootId>) -> bool {
+        *self.cfg_setTest(source_root)
+    }
+
+    pub(crate) fn completion_snippets_default() -> FxHashMap<String, SnippetDef> {
+        serde_json::from_str(
+            r#"{
+            "Arc::new": {
+                "postfix": "arc",
+                "body": "Arc::new(${receiver})",
+                "requires": "std::sync::Arc",
+                "description": "Put the expression into an `Arc`",
+                "scope": "expr"
+            },
+            "Rc::new": {
+                "postfix": "rc",
+                "body": "Rc::new(${receiver})",
+                "requires": "std::rc::Rc",
+                "description": "Put the expression into an `Rc`",
+                "scope": "expr"
+            },
+            "Box::pin": {
+                "postfix": "pinbox",
+                "body": "Box::pin(${receiver})",
+                "requires": "std::boxed::Box",
+                "description": "Put the expression into a pinned `Box`",
+                "scope": "expr"
+            },
+            "Ok": {
+                "postfix": "ok",
+                "body": "Ok(${receiver})",
+                "description": "Wrap the expression in a `Result::Ok`",
+                "scope": "expr"
+            },
+            "Err": {
+                "postfix": "err",
+                "body": "Err(${receiver})",
+                "description": "Wrap the expression in a `Result::Err`",
+                "scope": "expr"
+            },
+            "Some": {
+                "postfix": "some",
+                "body": "Some(${receiver})",
+                "description": "Wrap the expression in an `Option::Some`",
+                "scope": "expr"
+            }
+        }"#,
+        )
+        .unwrap()
     }
 
     pub fn rustfmt(&self, source_root_id: Option<SourceRootId>) -> RustfmtConfig {
@@ -2280,18 +2339,6 @@ where
 {
     let path: &Utf8Path = path.as_ref();
     se.serialize_str(path.as_str())
-}
-
-impl ManifestOrProjectJson {
-    fn manifest(&self) -> Option<&Utf8Path> {
-        match self {
-            ManifestOrProjectJson::Manifest(manifest) => Some(manifest),
-            ManifestOrProjectJson::DiscoveredProjectJson { buildfile, .. } => {
-                Some(buildfile.as_ref())
-            }
-            ManifestOrProjectJson::ProjectJson(_) => None,
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

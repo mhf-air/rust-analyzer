@@ -35,6 +35,7 @@ mod handlers {
 
 pub mod tracing {
     pub mod config;
+    pub mod json;
     pub use config::Config;
     pub mod hprof;
 }

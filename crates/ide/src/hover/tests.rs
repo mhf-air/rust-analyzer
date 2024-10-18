@@ -1497,6 +1497,24 @@ const foo$0: u32 = {
 }
 
 #[test]
+fn hover_unsigned_max_const() {
+    check(
+        r#"const $0A: u128 = -1_i128 as u128;"#,
+        expect![[r#"
+            *A*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            const A: u128 = 340282366920938463463374607431768211455 (0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF)
+            ```
+        "#]],
+    );
+}
+
+#[test]
 fn hover_eval_complex_constants() {
     check(
         r#"
@@ -6318,7 +6336,19 @@ fn hover_lint() {
 
                 arithmetic operation overflows
             "#]],
-    )
+    );
+    check(
+        r#"#![expect(arithmetic_overflow$0)]"#,
+        expect![[r#"
+                *arithmetic_overflow*
+                ```
+                arithmetic_overflow
+                ```
+                ___
+
+                arithmetic operation overflows
+            "#]],
+    );
 }
 
 #[test]
@@ -6334,7 +6364,19 @@ fn hover_clippy_lint() {
 
                 Checks for `foo = bar; bar = foo` sequences.
             "#]],
-    )
+    );
+    check(
+        r#"#![expect(clippy::almost_swapped$0)]"#,
+        expect![[r#"
+                *almost_swapped*
+                ```
+                clippy::almost_swapped
+                ```
+                ___
+
+                Checks for `foo = bar; bar = foo` sequences.
+            "#]],
+    );
 }
 
 #[test]
@@ -7133,7 +7175,7 @@ impl T$0 for () {}
             ```
 
             ```rust
-            // Object Safety: Yes
+            // Dyn Compatible: Yes
             trait T {}
             ```
         "#]],
@@ -7153,7 +7195,7 @@ impl T$0 for () {}
             ```
 
             ```rust
-            // Object Safety: Yes
+            // Dyn Compatible: Yes
             trait T {}
             ```
         "#]],
@@ -7177,7 +7219,7 @@ impl T$0 for () {}
             ```
 
             ```rust
-            // Object Safety: No
+            // Dyn Compatible: No
             // - Reason: has a method `func` that is non dispatchable because of:
             //   - missing a receiver
             trait T { /* … */ }
@@ -7203,7 +7245,7 @@ impl T$0 for () {}
             ```
 
             ```rust
-            // Object Safety: No
+            // Dyn Compatible: No
             // - Reason: has a method `func` that is non dispatchable because of:
             //   - missing a receiver
             trait T {
@@ -7233,7 +7275,7 @@ impl T$0 for () {}
             ```
 
             ```rust
-            // Object Safety: No
+            // Dyn Compatible: No
             // - Reason: has a method `func` that is non dispatchable because of:
             //   - missing a receiver
             trait T {
@@ -7263,7 +7305,7 @@ impl T$0 for () {}
             ```
 
             ```rust
-            // Object Safety: No
+            // Dyn Compatible: No
             // - Reason: has a method `func` that is non dispatchable because of:
             //   - missing a receiver
             trait T {
@@ -8739,6 +8781,240 @@ fn foo() {
             ```rust
             pub fn dyn()
             ```
+        "#]],
+    );
+}
+
+#[test]
+fn test_hover_function_with_pat_param() {
+    check(
+        r#"fn test_1$0((start_range, end_range): (u32, u32), a: i32) {}"#,
+        expect![[r#"
+            *test_1*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            fn test_1((start_range, end_range): (u32, u32), a: i32)
+            ```
+        "#]],
+    );
+
+    // Test case with tuple pattern and mutable parameters
+    check(
+        r#"fn test_2$0((mut x, y): (i32, i32)) {}"#,
+        expect![[r#"
+            *test_2*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            fn test_2((mut x, y): (i32, i32))
+            ```
+        "#]],
+    );
+
+    // Test case with a pattern in a reference type
+    check(
+        r#"fn test_3$0(&(a, b): &(i32, i32)) {}"#,
+        expect![[r#"
+            *test_3*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            fn test_3(&(a, b): &(i32, i32))
+            ```
+        "#]],
+    );
+
+    // Test case with complex pattern (struct destructuring)
+    check(
+        r#"struct Point { x: i32, y: i32 } fn test_4$0(Point { x, y }: Point) {}"#,
+        expect![[r#"
+            *test_4*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            fn test_4(Point { x, y }: Point)
+            ```
+        "#]],
+    );
+
+    // Test case with a nested pattern
+    check(
+        r#"fn test_5$0(((a, b), c): ((i32, i32), i32)) {}"#,
+        expect![[r#"
+            *test_5*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            fn test_5(((a, b), c): ((i32, i32), i32))
+            ```
+        "#]],
+    );
+
+    // Test case with an unused variable in the pattern
+    check(
+        r#"fn test_6$0((_, y): (i32, i64)) {}"#,
+        expect![[r#"
+            *test_6*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            fn test_6((_, y): (i32, i64))
+            ```
+        "#]],
+    );
+
+    // Test case with a complex pattern involving both tuple and struct
+    check(
+        r#"struct Foo { a: i32, b: i32 } fn test_7$0((x, Foo { a, b }): (i32, Foo)) {}"#,
+        expect![[r#"
+            *test_7*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            fn test_7((x, Foo { a, b }): (i32, Foo))
+            ```
+        "#]],
+    );
+
+    // Test case with Enum and Or pattern
+    check(
+        r#"enum MyEnum { A(i32), B(i32) } fn test_8$0((MyEnum::A(x) | MyEnum::B(x)): MyEnum) {}"#,
+        expect![[r#"
+            *test_8*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            fn test_8((MyEnum::A(x) | MyEnum::B(x)): MyEnum)
+            ```
+        "#]],
+    );
+
+    // Test case with a pattern as a function parameter
+    check(
+        r#"struct Foo { a: i32, b: i32 } fn test_9$0(Foo { a, b }: Foo) {}"#,
+        expect![[r#"
+            *test_9*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            fn test_9(Foo { a, b }: Foo)
+            ```
+        "#]],
+    );
+
+    // Test case with a pattern as a function parameter with a different name
+    check(
+        r#"struct Foo { a: i32, b: i32 } fn test_10$0(Foo { a, b: b1 }: Foo) {}"#,
+        expect![[r#"
+            *test_10*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            fn test_10(Foo { a, b: b1 }: Foo)
+            ```
+        "#]],
+    );
+
+    // Test case with a pattern as a function parameter with annotations
+    check(
+        r#"struct Foo { a: i32, b: i32 } fn test_10$0(Foo { a, b: mut b }: Foo) {}"#,
+        expect![[r#"
+            *test_10*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            fn test_10(Foo { a, b: mut b }: Foo)
+            ```
+        "#]],
+    );
+}
+
+#[test]
+fn hover_path_inside_block_scope() {
+    check(
+        r#"
+mod m {
+    const _: () = {
+        mod m2 {
+            const C$0: () = ();
+        }
+    };
+}
+"#,
+        expect![[r#"
+            *C*
+
+            ```rust
+            test::m::m2
+            ```
+
+            ```rust
+            const C: () = ()
+            ```
+        "#]],
+    );
+}
+
+#[test]
+fn regression_18238() {
+    check(
+        r#"
+macro_rules! foo {
+    ($name:ident) => {
+        pub static $name = Foo::new(|| {
+            $crate;
+        });
+    };
+}
+
+foo!(BAR_$0);
+"#,
+        expect![[r#"
+        *BAR_*
+
+        ```rust
+        test
+        ```
+
+        ```rust
+        pub static BAR_: {error} = Foo::new(||{
+            crate;
+        })
+        ```
         "#]],
     );
 }

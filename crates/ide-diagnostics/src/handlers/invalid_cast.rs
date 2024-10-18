@@ -95,10 +95,10 @@ pub(crate) fn invalid_cast(ctx: &DiagnosticsContext<'_>, d: &hir::InvalidCast) -
             DiagnosticCode::RustcHardError("E0605"),
             format_ty!(ctx, "non-primitive cast: `{}` as `{}`", d.expr_ty, d.cast_ty),
         ),
-        CastError::UnknownCastPtrKind | CastError::UnknownExprPtrKind => (
-            DiagnosticCode::RustcHardError("E0641"),
-            "cannot cast to a pointer of an unknown kind".to_owned(),
-        ),
+        // CastError::UnknownCastPtrKind | CastError::UnknownExprPtrKind => (
+        //     DiagnosticCode::RustcHardError("E0641"),
+        //     "cannot cast to a pointer of an unknown kind".to_owned(),
+        // ),
     };
     Diagnostic::new(code, message, display_range)
 }
@@ -441,36 +441,36 @@ fn main() {
   //^^^^^^^^^^^^^^^^^ error: cannot cast thin pointer `*const i32` to fat pointer `*const [i32]`
 
     let t: *mut (dyn Trait + 'static) = 0 as *mut _;
-                                      //^^^^^^^^^^^ error: cannot cast `i32` to a fat pointer `*mut _`
+                                      //^^^^^^^^^^^ error: cannot cast `usize` to a fat pointer `*mut _`
     let mut fail: *const str = 0 as *const str;
-                             //^^^^^^^^^^^^^^^ error: cannot cast `i32` to a fat pointer `*const str`
+                             //^^^^^^^^^^^^^^^ error: cannot cast `usize` to a fat pointer `*const str`
     let mut fail2: *const str = 0isize as *const str;
                               //^^^^^^^^^^^^^^^^^^^^ error: cannot cast `isize` to a fat pointer `*const str`
 }
 
 fn foo<T: ?Sized>() {
     let s = 0 as *const T;
-          //^^^^^^^^^^^^^ error: cannot cast `i32` to a fat pointer `*const T`
+          //^^^^^^^^^^^^^ error: cannot cast `usize` to a fat pointer `*const T`
 }
 "#,
             &["E0308", "unused_variables"],
         );
     }
 
-    #[test]
-    fn order_dependent_cast_inference() {
-        check_diagnostics(
-            r#"
-//- minicore: sized
-fn main() {
-    let x = &"hello";
-    let mut y = 0 as *const _;
-              //^^^^^^^^^^^^^ error: cannot cast to a pointer of an unknown kind
-    y = x as *const _;
-}
-"#,
-        );
-    }
+    //     #[test]
+    //     fn order_dependent_cast_inference() {
+    //         check_diagnostics(
+    //             r#"
+    // //- minicore: sized
+    // fn main() {
+    //     let x = &"hello";
+    //     let mut y = 0 as *const _;
+    //               //^^^^^^^^^^^^^ error: cannot cast to a pointer of an unknown kind
+    //     y = x as *const _;
+    // }
+    // "#,
+    //         );
+    //     }
 
     #[test]
     fn ptr_to_ptr_different_regions() {
@@ -556,6 +556,7 @@ fn unprincipled<'a, 'b>(x: *mut (dyn Send + 'a)) -> *mut (dyn Sync + 'b) {
         );
     }
 
+    #[ignore = "issue #18047"]
     #[test]
     fn ptr_to_trait_obj_wrap_upcast() {
         check_diagnostics(
@@ -831,7 +832,7 @@ fn main() {
 //- minicore: sized
 fn main() {
     _ = ((), ()) as ();
-      //^^^^^^^^^^^^^^ error: non-primitive cast: `(_, _)` as `()`
+      //^^^^^^^^^^^^^^ error: non-primitive cast: `((), ())` as `()`
 }
 "#,
         );
@@ -1002,6 +1003,130 @@ fn _slice(bar: &[i32]) -> bool {
 }
 "#,
             &["E0308"],
+        );
+    }
+
+    #[test]
+    fn trait_upcasting() {
+        check_diagnostics(
+            r#"
+//- minicore: coerce_unsized, dispatch_from_dyn
+#![feature(trait_upcasting)]
+trait Foo {}
+trait Bar: Foo {}
+
+impl dyn Bar {
+    fn bar(&self) {
+        _ = self as &dyn Foo;
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn issue_18047() {
+        check_diagnostics(
+            r#"
+//- minicore: coerce_unsized, dispatch_from_dyn
+trait LocalFrom<T> {
+    fn from(_: T) -> Self;
+}
+trait LocalInto<T> {
+    fn into(self) -> T;
+}
+
+impl<T, U> LocalInto<U> for T
+where
+    U: LocalFrom<T>,
+{
+    fn into(self) -> U {
+        U::from(self)
+    }
+}
+
+impl<T> LocalFrom<T> for T {
+    fn from(t: T) -> T {
+        t
+    }
+}
+
+trait Foo {
+    type ErrorType;
+    type Assoc;
+}
+
+trait Bar {
+    type ErrorType;
+}
+
+struct ErrorLike;
+
+impl<E> LocalFrom<E> for ErrorLike
+where
+    E: Trait + 'static,
+{
+    fn from(_: E) -> Self {
+        loop {}
+    }
+}
+
+trait Baz {
+    type Assoc: Bar;
+    type Error: LocalInto<ErrorLike>;
+}
+
+impl<T, U> Baz for T
+where
+    T: Foo<Assoc = U>,
+    T::ErrorType: LocalInto<ErrorLike>,
+    U: Bar,
+    <U as Bar>::ErrorType: LocalInto<ErrorLike>,
+{
+    type Assoc = U;
+    type Error = T::ErrorType;
+}
+struct S;
+trait Trait {}
+impl Trait for S {}
+
+fn test<T>()
+where
+    T: Baz,
+    T::Assoc: 'static,
+{
+    let _ = &S as &dyn Trait;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn cast_literal_to_char() {
+        check_diagnostics(
+            r#"
+fn foo() {
+    0 as char;
+}
+            "#,
+        );
+    }
+
+    #[test]
+    fn cast_isize_to_infer_pointer() {
+        check_diagnostics(
+            r#"
+//- minicore: coerce_unsized
+struct Foo {}
+
+struct Wrap<'a>(&'a mut Foo);
+
+fn main() {
+    let lparam: isize = 0;
+
+    let _wrap = Wrap(unsafe { &mut *(lparam as *mut _) });
+}
+        "#,
         );
     }
 }

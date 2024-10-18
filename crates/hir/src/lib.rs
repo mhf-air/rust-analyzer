@@ -80,7 +80,7 @@ use nameres::diagnostics::DefDiagnosticKind;
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 use span::{Edition, EditionedFileId, FileId, MacroCallId, SyntaxContextId};
-use stdx::{impl_from, never};
+use stdx::{format_to, impl_from, never};
 use syntax::{
     ast::{self, HasAttrs as _, HasGenericParams, HasName},
     format_smolstr, AstNode, AstPtr, SmolStr, SyntaxNode, SyntaxNodePtr, TextRange, ToSmolStr, T,
@@ -136,17 +136,17 @@ pub use {
         },
         hygiene::{marks_rev, SyntaxContextExt},
         inert_attr_macro::AttributeTemplate,
-        insert_whitespace_into_node,
         name::Name,
+        prettify_macro_expansion,
         proc_macro::{ProcMacros, ProcMacrosBuilder},
         tt, ExpandResult, HirFileId, HirFileIdExt, MacroFileId, MacroFileIdExt,
     },
     hir_ty::{
         consteval::ConstEvalError,
         display::{ClosureStyle, HirDisplay, HirDisplayError, HirWrite},
+        dyn_compatibility::{DynCompatibilityViolation, MethodViolationCode},
         layout::LayoutError,
         mir::{MirEvalError, MirLowerError},
-        object_safety::{MethodViolationCode, ObjectSafetyViolation},
         CastError, FnAbi, PointerCast, Safety,
     },
     // FIXME: Properly encapsulate mir
@@ -497,10 +497,9 @@ impl Module {
 
     /// Finds a parent module.
     pub fn parent(self, db: &dyn HirDatabase) -> Option<Module> {
-        // FIXME: handle block expressions as modules (their parent is in a different DefMap)
         let def_map = self.id.def_map(db.upcast());
-        let parent_id = def_map[self.id.local_id].parent?;
-        Some(Module { id: def_map.module_id(parent_id) })
+        let parent_id = def_map.containing_module(self.id.local_id)?;
+        Some(Module { id: parent_id })
     }
 
     /// Finds nearest non-block ancestor `Module` (`self` included).
@@ -557,7 +556,7 @@ impl Module {
         acc: &mut Vec<AnyDiagnostic>,
         style_lints: bool,
     ) {
-        let _p = tracing::info_span!("Module::diagnostics", name = ?self.name(db)).entered();
+        let _p = tracing::info_span!("diagnostics", name = ?self.name(db)).entered();
         let edition = db.crate_graph()[self.id.krate()].edition;
         let def_map = self.id.def_map(db.upcast());
         for diag in def_map.diagnostics() {
@@ -1884,9 +1883,10 @@ impl DefWithBody {
             );
         }
 
-        for expr in hir_ty::diagnostics::missing_unsafe(db, self.into()) {
+        let (unafe_exprs, only_lint) = hir_ty::diagnostics::missing_unsafe(db, self.into());
+        for expr in unafe_exprs {
             match source_map.expr_syntax(expr) {
-                Ok(expr) => acc.push(MissingUnsafe { expr }.into()),
+                Ok(expr) => acc.push(MissingUnsafe { expr, only_lint }.into()),
                 Err(SyntheticSyntax) => {
                     // FIXME: Here and elsewhere in this file, the `expr` was
                     // desugared, report or assert that this doesn't happen.
@@ -2553,6 +2553,17 @@ impl Const {
         Type::from_value_def(db, self.id)
     }
 
+    /// Evaluate the constant and return the result as a string.
+    ///
+    /// This function is intended for IDE assistance, different from [`Const::render_eval`].
+    pub fn eval(self, db: &dyn HirDatabase, edition: Edition) -> Result<String, ConstEvalError> {
+        let c = db.const_eval(self.id.into(), Substitution::empty(Interner), None)?;
+        Ok(format!("{}", c.display(db, edition)))
+    }
+
+    /// Evaluate the constant and return the result as a string, with more detailed information.
+    ///
+    /// This function is intended for user-facing display.
     pub fn render_eval(
         self,
         db: &dyn HirDatabase,
@@ -2567,10 +2578,16 @@ impl Const {
                         let value = u128::from_le_bytes(mir::pad16(b, false));
                         let value_signed =
                             i128::from_le_bytes(mir::pad16(b, matches!(s, Scalar::Int(_))));
-                        if value >= 10 {
-                            return Ok(format!("{value_signed} ({value:#X})"));
+                        let mut result = if let Scalar::Int(_) = s {
+                            value_signed.to_string()
                         } else {
-                            return Ok(format!("{value_signed}"));
+                            value.to_string()
+                        };
+                        if value >= 10 {
+                            format_to!(result, " ({value:#X})");
+                            return Ok(result);
+                        } else {
+                            return Ok(result);
                         }
                     }
                 }
@@ -2672,8 +2689,8 @@ impl Trait {
             .count()
     }
 
-    pub fn object_safety(&self, db: &dyn HirDatabase) -> Option<ObjectSafetyViolation> {
-        hir_ty::object_safety::object_safety(db, self.id)
+    pub fn dyn_compatibility(&self, db: &dyn HirDatabase) -> Option<DynCompatibilityViolation> {
+        hir_ty::dyn_compatibility::dyn_compatibility(db, self.id)
     }
 
     fn all_macro_calls(&self, db: &dyn HirDatabase) -> Box<[(AstId<ast::Item>, MacroCallId)]> {

@@ -204,7 +204,7 @@ impl Body {
     pub fn blocks<'a>(
         &'a self,
         db: &'a dyn DefDatabase,
-    ) -> impl Iterator<Item = (BlockId, Arc<DefMap>)> + '_ {
+    ) -> impl Iterator<Item = (BlockId, Arc<DefMap>)> + 'a {
         self.block_scopes.iter().map(move |&block| (block, db.block_def_map(block)))
     }
 
@@ -225,6 +225,17 @@ impl Body {
         edition: Edition,
     ) -> String {
         pretty::print_expr_hir(db, self, owner, expr, edition)
+    }
+
+    pub fn pretty_print_pat(
+        &self,
+        db: &dyn DefDatabase,
+        owner: DefWithBodyId,
+        pat: PatId,
+        oneline: bool,
+        edition: Edition,
+    ) -> String {
+        pretty::print_pat_hir(db, self, owner, pat, oneline, edition)
     }
 
     fn new(

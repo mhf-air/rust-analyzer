@@ -38,11 +38,11 @@ pub mod consteval;
 pub mod db;
 pub mod diagnostics;
 pub mod display;
+pub mod dyn_compatibility;
 pub mod lang_items;
 pub mod layout;
 pub mod method_resolution;
 pub mod mir;
-pub mod object_safety;
 pub mod primitive;
 pub mod traits;
 
@@ -56,7 +56,7 @@ use std::{
     hash::{BuildHasherDefault, Hash},
 };
 
-use base_db::salsa::InternValueTrivial;
+use base_db::ra_salsa::InternValueTrivial;
 use chalk_ir::{
     fold::{Shift, TypeFoldable},
     interner::HasInterner,
@@ -379,6 +379,7 @@ pub enum FnAbi {
     AvrNonBlockingInterrupt,
     C,
     CCmseNonsecureCall,
+    CCmseNonsecureEntry,
     CDecl,
     CDeclUnwind,
     CUnwind,
@@ -436,6 +437,7 @@ impl FnAbi {
             s if *s == sym::avr_dash_interrupt => FnAbi::AvrInterrupt,
             s if *s == sym::avr_dash_non_dash_blocking_dash_interrupt => FnAbi::AvrNonBlockingInterrupt,
             s if *s == sym::C_dash_cmse_dash_nonsecure_dash_call => FnAbi::CCmseNonsecureCall,
+            s if *s == sym::C_dash_cmse_dash_nonsecure_dash_entry => FnAbi::CCmseNonsecureEntry,
             s if *s == sym::C_dash_unwind => FnAbi::CUnwind,
             s if *s == sym::C => FnAbi::C,
             s if *s == sym::cdecl_dash_unwind => FnAbi::CDeclUnwind,
@@ -479,6 +481,7 @@ impl FnAbi {
             FnAbi::AvrNonBlockingInterrupt => "avr-non-blocking-interrupt",
             FnAbi::C => "C",
             FnAbi::CCmseNonsecureCall => "C-cmse-nonsecure-call",
+            FnAbi::CCmseNonsecureEntry => "C-cmse-nonsecure-entry",
             FnAbi::CDecl => "C-decl",
             FnAbi::CDeclUnwind => "cdecl-unwind",
             FnAbi::CUnwind => "C-unwind",
