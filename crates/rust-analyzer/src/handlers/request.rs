@@ -4,6 +4,7 @@
 use std::{
     fs,
     io::Write as _,
+    ops::Not,
     process::{self, Stdio},
 };
 
@@ -14,7 +15,7 @@ use ide::{
     FilePosition, FileRange, HoverAction, HoverGotoTypeData, InlayFieldsToResolve, Query,
     RangeInfo, ReferenceCategory, Runnable, RunnableKind, SingleResolve, SourceChange, TextEdit,
 };
-use ide_db::SymbolKind;
+use ide_db::{FxHashMap, SymbolKind};
 use itertools::Itertools;
 use lsp_server::ErrorCode;
 use lsp_types::{
@@ -36,6 +37,7 @@ use vfs::{AbsPath, AbsPathBuf, FileId, VfsPath};
 
 use crate::{
     config::{Config, RustfmtConfig, WorkspaceSymbolConfig},
+    diagnostics::convert_diagnostic,
     global_state::{FetchWorkspaceRequest, GlobalState, GlobalStateSnapshot},
     hack_recover_crate_name,
     line_index::LineEndings,
@@ -122,7 +124,7 @@ pub(crate) fn handle_analyzer_status(
     format_to!(buf, "{}", crate::version());
 
     buf.push_str("\nConfiguration: \n");
-    format_to!(buf, "{:?}", snap.config);
+    format_to!(buf, "{:#?}", snap.config);
 
     Ok(buf)
 }
@@ -476,6 +478,78 @@ pub(crate) fn handle_on_type_formatting(
     Ok(Some(change))
 }
 
+pub(crate) fn handle_document_diagnostics(
+    snap: GlobalStateSnapshot,
+    params: lsp_types::DocumentDiagnosticParams,
+) -> anyhow::Result<lsp_types::DocumentDiagnosticReportResult> {
+    const EMPTY: lsp_types::DocumentDiagnosticReportResult =
+        lsp_types::DocumentDiagnosticReportResult::Report(
+            lsp_types::DocumentDiagnosticReport::Full(
+                lsp_types::RelatedFullDocumentDiagnosticReport {
+                    related_documents: None,
+                    full_document_diagnostic_report: lsp_types::FullDocumentDiagnosticReport {
+                        result_id: None,
+                        items: vec![],
+                    },
+                },
+            ),
+        );
+
+    let file_id = from_proto::file_id(&snap, &params.text_document.uri)?;
+    let source_root = snap.analysis.source_root_id(file_id)?;
+    if !snap.analysis.is_local_source_root(source_root)? {
+        return Ok(EMPTY);
+    }
+    let config = snap.config.diagnostics(Some(source_root));
+    if !config.enabled {
+        return Ok(EMPTY);
+    }
+    let line_index = snap.file_line_index(file_id)?;
+    let supports_related = snap.config.text_document_diagnostic_related_document_support();
+
+    let mut related_documents = FxHashMap::default();
+    let diagnostics = snap
+        .analysis
+        .full_diagnostics(&config, AssistResolveStrategy::None, file_id)?
+        .into_iter()
+        .filter_map(|d| {
+            let file = d.range.file_id;
+            if file == file_id {
+                let diagnostic = convert_diagnostic(&line_index, d);
+                return Some(diagnostic);
+            }
+            if supports_related {
+                let (diagnostics, line_index) = related_documents
+                    .entry(file)
+                    .or_insert_with(|| (Vec::new(), snap.file_line_index(file).ok()));
+                let diagnostic = convert_diagnostic(line_index.as_mut()?, d);
+                diagnostics.push(diagnostic);
+            }
+            None
+        });
+    Ok(lsp_types::DocumentDiagnosticReportResult::Report(
+        lsp_types::DocumentDiagnosticReport::Full(lsp_types::RelatedFullDocumentDiagnosticReport {
+            full_document_diagnostic_report: lsp_types::FullDocumentDiagnosticReport {
+                result_id: None,
+                items: diagnostics.collect(),
+            },
+            related_documents: related_documents.is_empty().not().then(|| {
+                related_documents
+                    .into_iter()
+                    .map(|(id, (items, _))| {
+                        (
+                            to_proto::url(&snap, id),
+                            lsp_types::DocumentDiagnosticReportKind::Full(
+                                lsp_types::FullDocumentDiagnosticReport { result_id: None, items },
+                            ),
+                        )
+                    })
+                    .collect()
+            }),
+        }),
+    ))
+}
+
 pub(crate) fn handle_document_symbol(
     snap: GlobalStateSnapshot,
     params: lsp_types::DocumentSymbolParams,
@@ -542,18 +616,11 @@ pub(crate) fn handle_document_symbol(
         url: &Url,
         res: &mut Vec<SymbolInformation>,
     ) {
-        let mut tags = Vec::new();
-
-        #[allow(deprecated)]
-        if let Some(true) = symbol.deprecated {
-            tags.push(SymbolTag::DEPRECATED)
-        }
-
         #[allow(deprecated)]
         res.push(SymbolInformation {
             name: symbol.name.clone(),
             kind: symbol.kind,
-            tags: Some(tags),
+            tags: symbol.tags.clone(),
             deprecated: symbol.deprecated,
             location: Location::new(url.clone(), symbol.range),
             container_name,
@@ -1096,7 +1163,7 @@ pub(crate) fn handle_completion_resolve(
     else {
         return Ok(original_completion);
     };
-    let resolved_completions = to_proto::completion_items(
+    let mut resolved_completions = to_proto::completion_items(
         &snap.config,
         &forced_resolve_completions_config.fields_to_resolve,
         &line_index,
@@ -1105,15 +1172,13 @@ pub(crate) fn handle_completion_resolve(
         resolve_data.trigger_character,
         resolved_completions,
     );
-    let Some(mut resolved_completion) = resolved_completions.into_iter().find(|completion| {
-        completion.label == original_completion.label
-            && completion.kind == original_completion.kind
-            && completion.deprecated == original_completion.deprecated
-            && completion.preselect == original_completion.preselect
-            && completion.sort_text == original_completion.sort_text
-    }) else {
-        return Ok(original_completion);
-    };
+
+    let mut resolved_completion =
+        if resolved_completions.get(resolve_data.completion_item_index).is_some() {
+            resolved_completions.swap_remove(resolve_data.completion_item_index)
+        } else {
+            return Ok(original_completion);
+        };
 
     if !resolve_data.imports.is_empty() {
         let additional_edits = snap

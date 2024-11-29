@@ -13,7 +13,8 @@ use triomphe::Arc;
 
 use crate::{
     sysroot::SysrootMode, workspace::ProjectWorkspaceKind, CargoWorkspace, CfgOverrides,
-    ManifestPath, ProjectJson, ProjectJsonData, ProjectWorkspace, Sysroot, WorkspaceBuildScripts,
+    ManifestPath, ProjectJson, ProjectJsonData, ProjectWorkspace, Sysroot, SysrootQueryMetadata,
+    WorkspaceBuildScripts,
 };
 
 fn load_cargo(file: &str) -> (CrateGraph, ProcMacroPaths) {
@@ -116,7 +117,7 @@ fn get_fake_sysroot() -> Sysroot {
     // fake sysroot, so we give them both the same path:
     let sysroot_dir = AbsPathBuf::assert(sysroot_path);
     let sysroot_src_dir = sysroot_dir.clone();
-    Sysroot::load(Some(sysroot_dir), Some(sysroot_src_dir))
+    Sysroot::load(Some(sysroot_dir), Some(sysroot_src_dir), SysrootQueryMetadata::CargoMetadata)
 }
 
 fn rooted_project_json(data: ProjectJsonData) -> ProjectJson {
@@ -222,8 +223,6 @@ fn rust_project_is_proc_macro_has_proc_macro_dep() {
 }
 
 #[test]
-// FIXME Remove the ignore
-#[ignore = "requires nightly until the sysroot ships a cargo workspace for library on stable"]
 fn smoke_test_real_sysroot_cargo() {
     let file_map = &mut FxHashMap::<AbsPathBuf, FileId>::default();
     let meta: Metadata = get_test_json_file("hello-world-metadata.json");
@@ -233,9 +232,9 @@ fn smoke_test_real_sysroot_cargo() {
     let sysroot = Sysroot::discover(
         AbsPath::assert(Utf8Path::new(env!("CARGO_MANIFEST_DIR"))),
         &Default::default(),
+        SysrootQueryMetadata::CargoMetadata,
     );
     assert!(matches!(sysroot.mode(), SysrootMode::Workspace(_)));
-
     let project_workspace = ProjectWorkspace {
         kind: ProjectWorkspaceKind::Cargo {
             cargo: cargo_workspace,

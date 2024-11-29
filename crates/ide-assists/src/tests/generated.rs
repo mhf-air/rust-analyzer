@@ -187,8 +187,8 @@ enum Action { Move { distance: u32 }, Stop }
 
 fn handle(action: Action) {
     match action {
-        $0Action::Move { distance } => todo!(),
-        Action::Stop => todo!(),
+        Action::Move { distance } => ${1:todo!()},
+        Action::Stop => ${2:todo!()},$0
     }
 }
 "#####,
@@ -1544,6 +1544,36 @@ enum Countries {
 fn main() {
     let country = Countries::Lesotho;
 }
+"#####,
+    )
+}
+
+#[test]
+fn doctest_generate_fn_type_alias_named() {
+    check_doc_test(
+        "generate_fn_type_alias_named",
+        r#####"
+unsafe fn fo$0o(n: i32) -> i32 { 42i32 }
+"#####,
+        r#####"
+type ${0:FooFn} = unsafe fn(n: i32) -> i32;
+
+unsafe fn foo(n: i32) -> i32 { 42i32 }
+"#####,
+    )
+}
+
+#[test]
+fn doctest_generate_fn_type_alias_unnamed() {
+    check_doc_test(
+        "generate_fn_type_alias_unnamed",
+        r#####"
+unsafe fn fo$0o(n: i32) -> i32 { 42i32 }
+"#####,
+        r#####"
+type ${0:FooFn} = unsafe fn(i32) -> i32;
+
+unsafe fn foo(n: i32) -> i32 { 42i32 }
 "#####,
     )
 }
@@ -3265,6 +3295,20 @@ fn foo() {
 }
 
 #[test]
+fn doctest_unwrap_option_return_type() {
+    check_doc_test(
+        "unwrap_option_return_type",
+        r#####"
+//- minicore: option
+fn foo() -> Option<i32>$0 { Some(42i32) }
+"#####,
+        r#####"
+fn foo() -> i32 { 42i32 }
+"#####,
+    )
+}
+
+#[test]
 fn doctest_unwrap_result_return_type() {
     check_doc_test(
         "unwrap_result_return_type",
@@ -3293,6 +3337,20 @@ fn main() {
     let foo = "Foo";
     let bar = "Bar";
 }
+"#####,
+    )
+}
+
+#[test]
+fn doctest_wrap_return_type_in_option() {
+    check_doc_test(
+        "wrap_return_type_in_option",
+        r#####"
+//- minicore: option
+fn foo() -> i32$0 { 42i32 }
+"#####,
+        r#####"
+fn foo() -> Option<i32> { Some(42i32) }
 "#####,
     )
 }

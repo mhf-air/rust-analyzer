@@ -211,34 +211,35 @@ impl ProjectWorkspace {
                 let project_location = project_json.parent().to_path_buf();
                 let project_json: ProjectJson =
                     ProjectJson::new(Some(project_json.clone()), &project_location, data);
-                ProjectWorkspace::load_inline(
-                    project_json,
-                    config.target.as_deref(),
-                    &config.extra_env,
-                    &config.cfg_overrides,
-                )
+                ProjectWorkspace::load_inline(project_json, config)
             }
             ProjectManifest::CargoScript(rust_file) => {
                 ProjectWorkspace::load_detached_file(rust_file, config)?
             }
             ProjectManifest::CargoToml(cargo_toml) => {
                 let sysroot = match (&config.sysroot, &config.sysroot_src) {
-                    (Some(RustLibSource::Discover), None) => {
-                        Sysroot::discover(cargo_toml.parent(), &config.extra_env)
-                    }
+                    (Some(RustLibSource::Discover), None) => Sysroot::discover(
+                        cargo_toml.parent(),
+                        &config.extra_env,
+                        config.sysroot_query_metadata,
+                    ),
                     (Some(RustLibSource::Discover), Some(sysroot_src)) => {
                         Sysroot::discover_with_src_override(
                             cargo_toml.parent(),
                             &config.extra_env,
                             sysroot_src.clone(),
+                            config.sysroot_query_metadata,
                         )
                     }
-                    (Some(RustLibSource::Path(path)), None) => {
-                        Sysroot::discover_sysroot_src_dir(path.clone())
-                    }
-                    (Some(RustLibSource::Path(sysroot)), Some(sysroot_src)) => {
-                        Sysroot::load(Some(sysroot.clone()), Some(sysroot_src.clone()))
-                    }
+                    (Some(RustLibSource::Path(path)), None) => Sysroot::discover_sysroot_src_dir(
+                        path.clone(),
+                        config.sysroot_query_metadata,
+                    ),
+                    (Some(RustLibSource::Path(sysroot)), Some(sysroot_src)) => Sysroot::load(
+                        Some(sysroot.clone()),
+                        Some(sysroot_src.clone()),
+                        config.sysroot_query_metadata,
+                    ),
                     (None, _) => Sysroot::empty(),
                 };
                 tracing::info!(workspace = %cargo_toml, src_root = ?sysroot.src_root(), root = ?sysroot.root(), "Using sysroot");
@@ -352,20 +353,19 @@ impl ProjectWorkspace {
         Ok(res)
     }
 
-    pub fn load_inline(
-        project_json: ProjectJson,
-        target: Option<&str>,
-        extra_env: &FxHashMap<String, String>,
-        cfg_overrides: &CfgOverrides,
-    ) -> ProjectWorkspace {
-        let sysroot = Sysroot::load(project_json.sysroot.clone(), project_json.sysroot_src.clone());
+    pub fn load_inline(project_json: ProjectJson, config: &CargoConfig) -> ProjectWorkspace {
+        let sysroot = Sysroot::load(
+            project_json.sysroot.clone(),
+            project_json.sysroot_src.clone(),
+            config.sysroot_query_metadata,
+        );
         let cfg_config = RustcCfgConfig::Rustc(&sysroot);
         let data_layout_config = RustcDataLayoutConfig::Rustc(&sysroot);
         let toolchain = match get_toolchain_version(
             project_json.path(),
             &sysroot,
             Tool::Rustc,
-            extra_env,
+            &config.extra_env,
             "rustc ",
         ) {
             Ok(it) => it,
@@ -375,15 +375,16 @@ impl ProjectWorkspace {
             }
         };
 
-        let rustc_cfg = rustc_cfg::get(target, extra_env, cfg_config);
-        let data_layout = target_data_layout::get(data_layout_config, target, extra_env);
+        let target = config.target.as_deref();
+        let rustc_cfg = rustc_cfg::get(target, &config.extra_env, cfg_config);
+        let data_layout = target_data_layout::get(data_layout_config, target, &config.extra_env);
         ProjectWorkspace {
             kind: ProjectWorkspaceKind::Json(project_json),
             sysroot,
             rustc_cfg,
             toolchain,
             target_layout: data_layout.map(Arc::from).map_err(|it| Arc::from(it.to_string())),
-            cfg_overrides: cfg_overrides.clone(),
+            cfg_overrides: config.cfg_overrides.clone(),
         }
     }
 
@@ -393,8 +394,12 @@ impl ProjectWorkspace {
     ) -> anyhow::Result<ProjectWorkspace> {
         let dir = detached_file.parent();
         let sysroot = match &config.sysroot {
-            Some(RustLibSource::Path(path)) => Sysroot::discover_sysroot_src_dir(path.clone()),
-            Some(RustLibSource::Discover) => Sysroot::discover(dir, &config.extra_env),
+            Some(RustLibSource::Path(path)) => {
+                Sysroot::discover_sysroot_src_dir(path.clone(), config.sysroot_query_metadata)
+            }
+            Some(RustLibSource::Discover) => {
+                Sysroot::discover(dir, &config.extra_env, config.sysroot_query_metadata)
+            }
             None => Sysroot::empty(),
         };
 
@@ -1062,7 +1067,7 @@ fn cargo_to_crate_graph(
                 proc_macros,
                 cargo,
                 pkg_data,
-                build_data,
+                build_data.zip(Some(build_scripts.error().is_some())),
                 cfg_options.clone(),
                 file_id,
                 name,
@@ -1285,7 +1290,7 @@ fn handle_rustc_crates(
                         proc_macros,
                         rustc_workspace,
                         &rustc_workspace[pkg],
-                        build_scripts.get_output(pkg),
+                        build_scripts.get_output(pkg).zip(Some(build_scripts.error().is_some())),
                         cfg_options.clone(),
                         file_id,
                         &rustc_workspace[tgt].name,
@@ -1345,7 +1350,7 @@ fn add_target_crate_root(
     proc_macros: &mut ProcMacroPaths,
     cargo: &CargoWorkspace,
     pkg: &PackageData,
-    build_data: Option<&BuildScriptOutput>,
+    build_data: Option<(&BuildScriptOutput, bool)>,
     cfg_options: CfgOptions,
     file_id: FileId,
     cargo_name: &str,
@@ -1368,7 +1373,7 @@ fn add_target_crate_root(
         for feature in pkg.active_features.iter() {
             opts.insert_key_value(sym::feature.clone(), Symbol::intern(feature));
         }
-        if let Some(cfgs) = build_data.as_ref().map(|it| &it.cfgs) {
+        if let Some(cfgs) = build_data.map(|(it, _)| &it.cfgs) {
             opts.extend(cfgs.iter().cloned());
         }
         opts
@@ -1379,7 +1384,7 @@ fn add_target_crate_root(
     inject_cargo_env(&mut env);
     inject_rustc_tool_env(&mut env, cargo, cargo_name, kind);
 
-    if let Some(envs) = build_data.map(|it| &it.envs) {
+    if let Some(envs) = build_data.map(|(it, _)| &it.envs) {
         for (k, v) in envs {
             env.set(k, v.clone());
         }
@@ -1396,11 +1401,14 @@ fn add_target_crate_root(
         origin,
     );
     if let TargetKind::Lib { is_proc_macro: true } = kind {
-        let proc_macro = match build_data.as_ref().map(|it| it.proc_macro_dylib_path.as_ref()) {
-            Some(it) => match it {
-                Some(path) => Ok((cargo_name.to_owned(), path.clone())),
-                None => Err("proc-macro crate build data is missing dylib path".to_owned()),
-            },
+        let proc_macro = match build_data {
+            Some((BuildScriptOutput { proc_macro_dylib_path, .. }, has_errors)) => {
+                match proc_macro_dylib_path {
+                    Some(path) => Ok((cargo_name.to_owned(), path.clone())),
+                    None if has_errors => Err("failed to build proc-macro".to_owned()),
+                    None => Err("proc-macro crate build data is missing dylib path".to_owned()),
+                }
+            }
             None => Err("proc-macro crate is missing its build data".to_owned()),
         };
         proc_macros.insert(crate_id, proc_macro);

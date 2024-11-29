@@ -6,6 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use cfg::{CfgAtom, CfgDiff};
 use hir::{
     db::{DefDatabase, ExpandDatabase, HirDatabase},
     Adt, AssocItem, Crate, DefWithBody, HasSource, HirDisplay, HirFileIdExt, ImportPathConfig,
@@ -31,7 +32,7 @@ use itertools::Itertools;
 use load_cargo::{load_workspace, LoadCargoConfig, ProcMacroServerChoice};
 use oorandom::Rand32;
 use profile::{Bytes, StopWatch};
-use project_model::{CargoConfig, ProjectManifest, ProjectWorkspace, RustLibSource};
+use project_model::{CargoConfig, CfgOverrides, ProjectManifest, ProjectWorkspace, RustLibSource};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{AstNode, SyntaxNode};
@@ -64,8 +65,16 @@ impl flags::AnalysisStats {
                 true => None,
                 false => Some(RustLibSource::Discover),
             },
+            sysroot_query_metadata: match self.no_query_sysroot_metadata {
+                true => project_model::SysrootQueryMetadata::None,
+                false => project_model::SysrootQueryMetadata::CargoMetadata,
+            },
             all_targets: true,
-            set_test: true,
+            set_test: !self.no_test,
+            cfg_overrides: CfgOverrides {
+                global: CfgDiff::new(vec![CfgAtom::Flag(hir::sym::miri.clone())], vec![]).unwrap(),
+                selective: Default::default(),
+            },
             ..Default::default()
         };
         let no_progress = &|_| ();
@@ -167,7 +176,6 @@ impl flags::AnalysisStats {
         let mut num_decls = 0;
         let mut bodies = Vec::new();
         let mut adts = Vec::new();
-        let mut consts = Vec::new();
         let mut file_ids = Vec::new();
         while let Some(module) = visit_queue.pop() {
             if visited_modules.insert(module) {
@@ -188,7 +196,6 @@ impl flags::AnalysisStats {
                         }
                         ModuleDef::Const(c) => {
                             bodies.push(DefWithBody::from(c));
-                            consts.push(c)
                         }
                         ModuleDef::Static(s) => bodies.push(DefWithBody::from(s)),
                         _ => (),
@@ -202,7 +209,6 @@ impl flags::AnalysisStats {
                             AssocItem::Function(f) => bodies.push(DefWithBody::from(f)),
                             AssocItem::Const(c) => {
                                 bodies.push(DefWithBody::from(c));
-                                consts.push(c);
                             }
                             _ => (),
                         }
@@ -215,7 +221,10 @@ impl flags::AnalysisStats {
             visited_modules.len(),
             bodies.len(),
             adts.len(),
-            consts.len(),
+            bodies
+                .iter()
+                .filter(|it| matches!(it, DefWithBody::Const(_) | DefWithBody::Static(_)))
+                .count(),
         );
         let crate_def_map_time = crate_def_map_sw.elapsed();
         eprintln!("{:<20} {}", "Item Collection:", crate_def_map_time);
@@ -242,7 +251,7 @@ impl flags::AnalysisStats {
         }
 
         if !self.skip_const_eval {
-            self.run_const_eval(db, &consts, verbosity);
+            self.run_const_eval(db, &bodies, verbosity);
         }
 
         if self.run_all_ide_things {
@@ -315,18 +324,23 @@ impl flags::AnalysisStats {
         report_metric("data layout time", data_layout_time.time.as_millis() as u64, "ms");
     }
 
-    fn run_const_eval(&self, db: &RootDatabase, consts: &[hir::Const], verbosity: Verbosity) {
+    fn run_const_eval(&self, db: &RootDatabase, bodies: &[DefWithBody], verbosity: Verbosity) {
         let mut sw = self.stop_watch();
         let mut all = 0;
         let mut fail = 0;
-        for &c in consts {
+        for &b in bodies {
+            let res = match b {
+                DefWithBody::Const(c) => c.render_eval(db, Edition::LATEST),
+                DefWithBody::Static(s) => s.render_eval(db, Edition::LATEST),
+                _ => continue,
+            };
             all += 1;
-            let Err(error) = c.render_eval(db, Edition::LATEST) else {
+            let Err(error) = res else {
                 continue;
             };
             if verbosity.is_spammy() {
                 let full_name =
-                    full_name_of_item(db, c.module(db), c.name(db).unwrap_or(Name::missing()));
+                    full_name_of_item(db, b.module(db), b.name(db).unwrap_or(Name::missing()));
                 println!("Const eval for {full_name} failed due {error:?}");
             }
             fail += 1;

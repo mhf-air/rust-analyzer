@@ -558,6 +558,9 @@ config_data! {
         ///
         /// This option does not take effect until rust-analyzer is restarted.
         cargo_sysroot: Option<String>    = Some("discover".to_owned()),
+        /// How to query metadata for the sysroot crate. Using cargo metadata allows rust-analyzer
+        /// to analyze third-party dependencies of the standard libraries.
+        cargo_sysrootQueryMetadata: SysrootQueryMetadata = SysrootQueryMetadata::CargoMetadata,
         /// Relative path to the sysroot library sources. If left unset, this will default to
         /// `{cargo.sysroot}/lib/rustlib/src/rust/library`.
         ///
@@ -727,7 +730,7 @@ enum RatomlFile {
     Crate(LocalConfigInput),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// Projects that have a Cargo.toml or a rust-project.json in a
     /// parent directory, so we can discover them by walking the
@@ -763,6 +766,26 @@ pub struct Config {
     validation_errors: ConfigErrors,
 
     detached_files: Vec<AbsPathBuf>,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("discovered_projects_from_filesystem", &self.discovered_projects_from_filesystem)
+            .field("discovered_projects_from_command", &self.discovered_projects_from_command)
+            .field("workspace_roots", &self.workspace_roots)
+            .field("caps", &self.caps)
+            .field("root_path", &self.root_path)
+            .field("snippets", &self.snippets)
+            .field("visual_studio_code_version", &self.visual_studio_code_version)
+            .field("client_config", &self.client_config)
+            .field("user_config", &self.user_config)
+            .field("ratoml_file", &self.ratoml_file)
+            .field("source_root_parent_map", &self.source_root_parent_map)
+            .field("validation_errors", &self.validation_errors)
+            .field("detached_files", &self.detached_files)
+            .finish()
+    }
 }
 
 // Delegate capability fetching methods
@@ -1848,6 +1871,12 @@ impl Config {
             },
             target: self.cargo_target(source_root).clone(),
             sysroot,
+            sysroot_query_metadata: match self.cargo_sysrootQueryMetadata(None) {
+                SysrootQueryMetadata::CargoMetadata => {
+                    project_model::SysrootQueryMetadata::CargoMetadata
+                }
+                SysrootQueryMetadata::None => project_model::SysrootQueryMetadata::None,
+            },
             sysroot_src,
             rustc_source,
             cfg_overrides: project_model::CfgOverrides {
@@ -2537,6 +2566,13 @@ pub enum NumThreads {
     Logical,
     #[serde(untagged)]
     Concrete(usize),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SysrootQueryMetadata {
+    CargoMetadata,
+    None,
 }
 
 macro_rules! _default_val {
@@ -3389,6 +3425,14 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
                     }
                 }
             ]
+        },
+        "SysrootQueryMetadata" => set! {
+            "type": "string",
+            "enum": ["none", "cargo_metadata"],
+            "enumDescriptions": [
+                "Do not query sysroot metadata, always use stitched sysroot.",
+                "Use `cargo metadata` to query sysroot metadata."
+            ],
         },
         _ => panic!("missing entry for {ty}: {default} (field {field})"),
     }
