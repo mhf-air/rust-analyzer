@@ -13,8 +13,9 @@ use hir::{
     ModuleDef, Name,
 };
 use hir_def::{
-    body::{BodySourceMap, SyntheticSyntax},
+    expr_store::BodySourceMap,
     hir::{ExprId, PatId},
+    SyntheticSyntax,
 };
 use hir_ty::{Interner, Substitution, TyExt, TypeFlags};
 use ide::{
@@ -64,10 +65,6 @@ impl flags::AnalysisStats {
             sysroot: match self.no_sysroot {
                 true => None,
                 false => Some(RustLibSource::Discover),
-            },
-            sysroot_query_metadata: match self.no_query_sysroot_metadata {
-                true => project_model::SysrootQueryMetadata::None,
-                false => project_model::SysrootQueryMetadata::CargoMetadata,
             },
             all_targets: true,
             set_test: !self.no_test,
@@ -330,8 +327,8 @@ impl flags::AnalysisStats {
         let mut fail = 0;
         for &b in bodies {
             let res = match b {
-                DefWithBody::Const(c) => c.render_eval(db, Edition::LATEST),
-                DefWithBody::Static(s) => s.render_eval(db, Edition::LATEST),
+                DefWithBody::Const(c) => c.eval(db),
+                DefWithBody::Static(s) => s.eval(db),
                 _ => continue,
             };
             all += 1;
@@ -468,6 +465,7 @@ impl flags::AnalysisStats {
                                 prefer_no_std: false,
                                 prefer_prelude: true,
                                 prefer_absolute: false,
+                                allow_unstable: true,
                             },
                             Edition::LATEST,
                         )
@@ -1054,6 +1052,7 @@ impl flags::AnalysisStats {
                 &InlayHintsConfig {
                     render_colons: false,
                     type_hints: true,
+                    sized_bound: false,
                     discriminant_hints: ide::DiscriminantHints::Always,
                     parameter_hints: true,
                     generic_parameter_hints: ide::GenericParameterHints {

@@ -101,10 +101,10 @@ pub(crate) fn reorder_impl_items(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
         |builder| {
             let mut editor = builder.make_editor(&parent_node);
 
-            assoc_items.into_iter().zip(sorted).for_each(|(old, new)| {
-                // FIXME: remove `clone_for_update` when `SyntaxEditor` handles it for us
-                editor.replace(old.syntax(), new.clone_for_update().syntax())
-            });
+            assoc_items
+                .into_iter()
+                .zip(sorted)
+                .for_each(|(old, new)| editor.replace(old.syntax(), new.syntax()));
 
             builder.add_file_edits(ctx.file_id(), editor);
         },
@@ -122,7 +122,7 @@ fn compute_item_ranks(
             .iter()
             .flat_map(|i| i.name(ctx.db()))
             .enumerate()
-            .map(|(idx, name)| (name.unescaped().display(ctx.db()).to_string(), idx))
+            .map(|(idx, name)| (name.as_str().to_owned(), idx))
             .collect(),
     )
 }

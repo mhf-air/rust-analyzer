@@ -3,7 +3,7 @@
 use std::iter::repeat_with;
 
 use hir_def::{
-    body::Body,
+    expr_store::Body,
     hir::{Binding, BindingAnnotation, BindingId, Expr, ExprId, Literal, Pat, PatId},
     path::Path,
 };
@@ -35,7 +35,7 @@ impl InferenceContext<'_> {
         ellipsis: Option<u32>,
         subs: &[PatId],
     ) -> Ty {
-        let (ty, def) = self.resolve_variant(path, true);
+        let (ty, def) = self.resolve_variant(id.into(), path, true);
         let var_data = def.map(|it| it.variant_data(self.db.upcast()));
         if let Some(variant) = def {
             self.write_variant_resolution(id.into(), variant);
@@ -115,7 +115,7 @@ impl InferenceContext<'_> {
         id: PatId,
         subs: impl ExactSizeIterator<Item = (Name, PatId)>,
     ) -> Ty {
-        let (ty, def) = self.resolve_variant(path, false);
+        let (ty, def) = self.resolve_variant(id.into(), path, false);
         if let Some(variant) = def {
             self.write_variant_resolution(id.into(), variant);
         }
@@ -528,7 +528,7 @@ impl InferenceContext<'_> {
         self.infer_expr(expr, &Expectation::has_type(expected.clone()), ExprIsRead::Yes)
     }
 
-    fn is_non_ref_pat(&mut self, body: &hir_def::body::Body, pat: PatId) -> bool {
+    fn is_non_ref_pat(&mut self, body: &hir_def::expr_store::Body, pat: PatId) -> bool {
         match &body[pat] {
             Pat::Tuple { .. }
             | Pat::TupleStruct { .. }
