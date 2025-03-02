@@ -134,9 +134,14 @@ pub(crate) fn u_compile_to_rust(text: &mut String, url_path: &str) -> Vec<SpanPa
 
 pub(crate) fn u_save_span_pairs(this: &mut GlobalState, url: &Url, pairs: Vec<SpanPair>) {
     match url_to_file_id(&this.vfs.read().0, &url) {
-        Ok(file_id) => {
-            this.u.add(file_id, pairs);
-        }
+        Ok(file_id) => match file_id {
+            Some(file_id) => {
+                this.u.add(file_id, pairs);
+            }
+            None => {
+                tracing::error!("File in u_to_rs_position in VFS: none");
+            }
+        },
         Err(err) => {
             tracing::error!("File in u_save_span_pairs not found in VFS: {}", err);
         }
@@ -149,7 +154,13 @@ pub(crate) fn u_to_rs_position(
 ) {
     // tracing::error!("{:?}", params.position);
     let file_id = match snap.url_to_file_id(&params.text_document.uri) {
-        Ok(file_id) => file_id,
+        Ok(file_id) => match file_id {
+            Some(file_id) => file_id,
+            None => {
+                tracing::error!("File in u_to_rs_position in VFS: none");
+                return;
+            }
+        },
         Err(err) => {
             tracing::error!("File in u_to_rs_position not found in VFS: {}", err);
             return;
@@ -191,7 +202,13 @@ pub(crate) fn u_transform_completion_items(
     }
 
     let file_id = match snap.url_to_file_id(url) {
-        Ok(file_id) => file_id,
+        Ok(file_id) => match file_id {
+            Some(file_id) => file_id,
+            None => {
+                tracing::error!("File in u_to_rs_position in VFS: none");
+                return;
+            }
+        },
         Err(err) => {
             tracing::error!("File in u_to_rs_position not found in VFS: {}", err);
             return;
