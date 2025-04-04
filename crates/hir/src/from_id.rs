@@ -4,9 +4,9 @@
 //! are splitting the hir.
 
 use hir_def::{
-    hir::{BindingId, LabelId},
     AdtId, AssocItemId, DefWithBodyId, EnumVariantId, FieldId, GenericDefId, GenericParamId,
     ModuleDefId, VariantId,
+    hir::{BindingId, LabelId},
 };
 
 use crate::{
@@ -30,7 +30,7 @@ macro_rules! from_id {
 }
 
 from_id![
-    (base_db::CrateId, crate::Crate),
+    (base_db::Crate, crate::Crate),
     (hir_def::ModuleId, crate::Module),
     (hir_def::StructId, crate::Struct),
     (hir_def::UnionId, crate::Union),

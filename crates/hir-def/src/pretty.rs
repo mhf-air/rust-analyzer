@@ -80,7 +80,16 @@ pub(crate) fn print_path(
             }
             PathKind::Crate => write!(buf, "crate")?,
             PathKind::Abs => {}
-            PathKind::DollarCrate(_) => write!(buf, "$crate")?,
+            PathKind::DollarCrate(krate) => write!(
+                buf,
+                "{}",
+                krate
+                    .extra_data(db)
+                    .display_name
+                    .as_ref()
+                    .map(|it| it.crate_name().symbol().as_str())
+                    .unwrap_or("$crate")
+            )?,
         },
     }
 
@@ -211,11 +220,11 @@ pub(crate) fn print_type_ref(
         }
         TypeRef::Fn(fn_) => {
             let ((_, return_type), args) =
-                fn_.params().split_last().expect("TypeRef::Fn is missing return type");
-            if fn_.is_unsafe() {
+                fn_.params.split_last().expect("TypeRef::Fn is missing return type");
+            if fn_.is_unsafe {
                 write!(buf, "unsafe ")?;
             }
-            if let Some(abi) = fn_.abi() {
+            if let Some(abi) = &fn_.abi {
                 buf.write_str("extern ")?;
                 buf.write_str(abi.as_str())?;
                 buf.write_char(' ')?;
@@ -227,7 +236,7 @@ pub(crate) fn print_type_ref(
                 }
                 print_type_ref(db, *typeref, map, buf, edition)?;
             }
-            if fn_.is_varargs() {
+            if fn_.is_varargs {
                 if !args.is_empty() {
                     write!(buf, ", ")?;
                 }

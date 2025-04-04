@@ -8,12 +8,15 @@ use hir_expand::{
     mod_path::resolve_crate_root,
     name::{AsName, Name},
 };
-use intern::{sym, Interned};
-use stdx::thin_vec::EmptyOptimizedThinVec;
+use intern::{Interned, sym};
 use syntax::ast::{self, AstNode, HasGenericArgs, HasTypeBounds};
+use thin_vec::ThinVec;
 
 use crate::{
-    path::{AssociatedTypeBinding, GenericArg, GenericArgs, ModPath, Path, PathKind},
+    path::{
+        AssociatedTypeBinding, GenericArg, GenericArgs, GenericArgsParentheses, ModPath, Path,
+        PathKind,
+    },
     type_ref::{LifetimeRef, TypeBound, TypeRef},
 };
 
@@ -73,6 +76,9 @@ pub(super) fn lower_path(ctx: &mut LowerCtx<'_>, mut path: ast::Path) -> Option<
                             segment.parenthesized_arg_list(),
                             segment.ret_type(),
                         )
+                    })
+                    .or_else(|| {
+                        segment.return_type_syntax().map(|_| GenericArgs::return_type_notation())
                     });
                 if args.is_some() {
                     generic_args.resize(segments.len(), None);
@@ -126,7 +132,7 @@ pub(super) fn lower_path(ctx: &mut LowerCtx<'_>, mut path: ast::Path) -> Option<
 
                                 has_self_type: true,
                                 bindings: it.bindings.clone(),
-                                desugared_from_fn: it.desugared_from_fn,
+                                parenthesized: it.parenthesized,
                             },
                             None => GenericArgs {
                                 args: Box::new([self_type]),
@@ -185,7 +191,7 @@ pub(super) fn lower_path(ctx: &mut LowerCtx<'_>, mut path: ast::Path) -> Option<
     if segments.len() == 1 && kind == PathKind::Plain {
         if let Some(_macro_call) = path.syntax().parent().and_then(ast::MacroCall::cast) {
             let syn_ctxt = ctx.span_map().span_for_range(path.segment()?.syntax().text_range()).ctx;
-            if let Some(macro_call_id) = ctx.db.lookup_intern_syntax_context(syn_ctxt).outer_expn {
+            if let Some(macro_call_id) = syn_ctxt.outer_expn(ctx.db) {
                 if ctx.db.lookup_intern_macro_call(macro_call_id).def.local_inner {
                     kind = match resolve_crate_root(ctx.db.upcast(), syn_ctxt) {
                         Some(crate_root) => PathKind::DollarCrate(crate_root),
@@ -207,7 +213,11 @@ pub(super) fn lower_path(ctx: &mut LowerCtx<'_>, mut path: ast::Path) -> Option<
     if type_anchor.is_none() && generic_args.is_empty() {
         return Some(Path::BarePath(mod_path));
     } else {
-        return Some(Path::Normal(NormalPath::new(type_anchor, mod_path, generic_args)));
+        return Some(Path::Normal(Box::new(NormalPath {
+            generic_args: generic_args.into_boxed_slice(),
+            type_anchor,
+            mod_path,
+        })));
     }
 
     fn qualifier(path: &ast::Path) -> Option<ast::Path> {
@@ -281,7 +291,12 @@ pub(super) fn lower_generic_args(
                         let name = name_ref.as_name();
                         let args = assoc_type_arg
                             .generic_arg_list()
-                            .and_then(|args| lower_generic_args(lower_ctx, args));
+                            .and_then(|args| lower_generic_args(lower_ctx, args))
+                            .or_else(|| {
+                                assoc_type_arg
+                                    .return_type_syntax()
+                                    .map(|_| GenericArgs::return_type_notation())
+                            });
                         let type_ref =
                             assoc_type_arg.ty().map(|it| TypeRef::from_ast(lower_ctx, it));
                         let type_ref = type_ref
@@ -315,7 +330,7 @@ pub(super) fn lower_generic_args(
         args: args.into_boxed_slice(),
         has_self_type: false,
         bindings: bindings.into_boxed_slice(),
-        desugared_from_fn: false,
+        parenthesized: GenericArgsParentheses::No,
     })
 }
 
@@ -333,7 +348,7 @@ fn lower_generic_args_from_fn_path(
         param_types.push(type_ref);
     }
     let args = Box::new([GenericArg::Type(
-        ctx.alloc_type_ref_desugared(TypeRef::Tuple(EmptyOptimizedThinVec::from_iter(param_types))),
+        ctx.alloc_type_ref_desugared(TypeRef::Tuple(ThinVec::from_iter(param_types))),
     )]);
     let bindings = if let Some(ret_type) = ret_type {
         let type_ref = TypeRef::from_ast_opt(ctx, ret_type.ty());
@@ -353,5 +368,10 @@ fn lower_generic_args_from_fn_path(
             bounds: Box::default(),
         }])
     };
-    Some(GenericArgs { args, has_self_type: false, bindings, desugared_from_fn: true })
+    Some(GenericArgs {
+        args,
+        has_self_type: false,
+        bindings,
+        parenthesized: GenericArgsParentheses::ParenSugar,
+    })
 }

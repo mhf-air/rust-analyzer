@@ -7,8 +7,9 @@ use itertools::Itertools;
 use rustc_hash::FxHashMap;
 use stdx::to_lower_snake_case;
 use syntax::{
+    AstNode, Edition, SmolStr, SmolStrBuilder, ToSmolStr,
     ast::{self, HasName},
-    match_ast, AstNode, Edition, SmolStr, SmolStrBuilder, ToSmolStr,
+    match_ast,
 };
 
 use crate::RootDatabase;
@@ -457,9 +458,11 @@ mod tests {
     fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected: &str) {
         let (db, file_id, range_or_offset) = RootDatabase::with_range_or_offset(ra_fixture);
         let frange = FileRange { file_id, range: range_or_offset.into() };
-
         let sema = Semantics::new(&db);
-        let source_file = sema.parse(frange.file_id);
+
+        let file_id = crate::base_db::EditionedFileId::new(sema.db, frange.file_id);
+        let source_file = sema.parse(file_id);
+
         let element = source_file.syntax().covering_element(frange.range);
         let expr =
             element.ancestors().find_map(ast::Expr::cast).expect("selection is not an expression");

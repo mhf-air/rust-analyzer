@@ -3,12 +3,12 @@
 use std::ops::ControlFlow;
 
 use hir_def::{
+    AssocItemId, AttrDefId, ModuleDefId,
     attr::AttrsWithOwner,
     item_scope::ItemInNs,
     path::{ModPath, Path},
     per_ns::Namespace,
     resolver::{HasResolver, Resolver, TypeNs},
-    AssocItemId, AttrDefId, ModuleDefId,
 };
 use hir_expand::{mod_path::PathKind, name::Name};
 use hir_ty::{db::HirDatabase, method_resolution};
@@ -194,7 +194,7 @@ fn resolve_assoc_or_field(
             // Doc paths in this context may only resolve to an item of this trait
             // (i.e. no items of its supertraits), so we need to handle them here
             // independently of others.
-            return db.trait_data(id).items.iter().find(|it| it.0 == name).map(|(_, assoc_id)| {
+            return db.trait_items(id).items.iter().find(|it| it.0 == name).map(|(_, assoc_id)| {
                 let def = match *assoc_id {
                     AssocItemId::FunctionId(it) => ModuleDef::Function(it.into()),
                     AssocItemId::ConstId(it) => ModuleDef::Const(it.into()),
@@ -260,7 +260,7 @@ fn resolve_impl_trait_item(
     // attributes here. Use path resolution directly instead.
     //
     // FIXME: resolve type aliases (which are not yielded by iterate_path_candidates)
-    method_resolution::iterate_path_candidates(
+    _ = method_resolution::iterate_path_candidates(
         &canonical,
         db,
         environment,
@@ -273,11 +273,7 @@ fn resolve_impl_trait_item(
             // disambiguation) so we just pick the first one we find as well.
             result = as_module_def_if_namespace_matches(assoc_item_id.into(), ns);
 
-            if result.is_some() {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
+            if result.is_some() { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
         },
     );
 

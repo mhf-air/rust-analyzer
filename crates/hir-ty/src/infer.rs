@@ -26,14 +26,16 @@ pub(crate) mod unify;
 use std::{cell::OnceCell, convert::identity, iter, ops::Index};
 
 use chalk_ir::{
+    DebruijnIndex, Mutability, Safety, Scalar, TyKind, TypeFlags, Variance,
     cast::Cast,
     fold::TypeFoldable,
     interner::HasInterner,
     visit::{TypeSuperVisitable, TypeVisitable, TypeVisitor},
-    DebruijnIndex, Mutability, Safety, Scalar, TyKind, TypeFlags, Variance,
 };
 use either::Either;
 use hir_def::{
+    AdtId, AssocItemId, DefWithBodyId, FieldId, FunctionId, ImplId, ItemContainerId, Lookup,
+    TraitId, TupleFieldId, TupleId, TypeAliasId, VariantId,
     builtin_type::{BuiltinInt, BuiltinType, BuiltinUint},
     data::{ConstData, StaticData},
     expr_store::{Body, HygieneId},
@@ -43,8 +45,6 @@ use hir_def::{
     path::{ModPath, Path},
     resolver::{HasResolver, ResolveValueResult, Resolver, TypeNs, ValueNs},
     type_ref::{LifetimeRef, TypeRefId, TypesMap},
-    AdtId, AssocItemId, DefWithBodyId, FieldId, FunctionId, ImplId, ItemContainerId, Lookup,
-    TraitId, TupleFieldId, TupleId, TypeAliasId, VariantId,
 };
 use hir_expand::name::Name;
 use indexmap::IndexSet;
@@ -55,6 +55,9 @@ use stdx::{always, never};
 use triomphe::Arc;
 
 use crate::{
+    AliasEq, AliasTy, Binders, ClosureId, Const, DomainGoal, GenericArg, Goal, ImplTraitId,
+    ImplTraitIdx, InEnvironment, Interner, Lifetime, OpaqueTyId, ParamLoweringMode,
+    PathLoweringDiagnostic, ProjectionTy, Substitution, TraitEnvironment, Ty, TyBuilder, TyExt,
     db::HirDatabase,
     fold_tys,
     generics::Generics,
@@ -64,14 +67,11 @@ use crate::{
         expr::ExprIsRead,
         unify::InferenceTable,
     },
-    lower::{diagnostics::TyLoweringDiagnostic, ImplTraitLoweringMode},
+    lower::{ImplTraitLoweringMode, diagnostics::TyLoweringDiagnostic},
     mir::MirSpan,
     to_assoc_type_id,
     traits::FnTrait,
     utils::{InTypeConstIdMetadata, UnevaluatedConstEvaluatorFolder},
-    AliasEq, AliasTy, Binders, ClosureId, Const, DomainGoal, GenericArg, Goal, ImplTraitId,
-    ImplTraitIdx, InEnvironment, Interner, Lifetime, OpaqueTyId, ParamLoweringMode,
-    PathLoweringDiagnostic, ProjectionTy, Substitution, TraitEnvironment, Ty, TyBuilder, TyExt,
 };
 
 // This lint has a false positive here. See the link below for details.
@@ -1143,7 +1143,7 @@ impl<'a> InferenceContext<'a> {
             non_assocs: FxHashMap::default(),
         };
         for ty in tait_candidates {
-            ty.visit_with(collector.as_dyn(), DebruijnIndex::INNERMOST);
+            _ = ty.visit_with(collector.as_dyn(), DebruijnIndex::INNERMOST);
         }
 
         // Non-assoc TAITs can be define-used everywhere as long as they are
@@ -1190,11 +1190,7 @@ impl<'a> InferenceContext<'a> {
 
         if let Some(impl_id) = impl_id {
             taits.extend(collector.assocs.into_iter().filter_map(|(id, (impl_, ty))| {
-                if impl_ == impl_id {
-                    Some((id, ty))
-                } else {
-                    None
-                }
+                if impl_ == impl_id { Some((id, ty)) } else { None }
             }));
         }
 
@@ -1587,7 +1583,7 @@ impl<'a> InferenceContext<'a> {
                     // If we can resolve to an enum variant, it takes priority over associated type
                     // of the same name.
                     if let Some((AdtId::EnumId(id), _)) = ty.as_adt() {
-                        let enum_data = self.db.enum_data(id);
+                        let enum_data = self.db.enum_variants(id);
                         if let Some(variant) = enum_data.variant(current_segment.name) {
                             return if remaining_segments.len() == 1 {
                                 (ty, Some(variant.into()))
@@ -1701,7 +1697,7 @@ impl<'a> InferenceContext<'a> {
                 let segment = path.segments().last().unwrap();
                 // this could be an enum variant or associated type
                 if let Some((AdtId::EnumId(enum_id), _)) = ty.as_adt() {
-                    let enum_data = self.db.enum_data(enum_id);
+                    let enum_data = self.db.enum_variants(enum_id);
                     if let Some(variant) = enum_data.variant(segment) {
                         return (ty, Some(variant.into()));
                     }
@@ -1723,7 +1719,7 @@ impl<'a> InferenceContext<'a> {
 
     fn resolve_output_on(&self, trait_: TraitId) -> Option<TypeAliasId> {
         self.db
-            .trait_data(trait_)
+            .trait_items(trait_)
             .associated_type_by_name(&Name::new_symbol_root(sym::Output.clone()))
     }
 
@@ -1914,11 +1910,7 @@ impl Expectation {
         match self {
             Expectation::HasType(ety) => {
                 let ety = table.resolve_ty_shallow(ety);
-                if ety.is_ty_var() {
-                    Expectation::None
-                } else {
-                    Expectation::HasType(ety)
-                }
+                if ety.is_ty_var() { Expectation::None } else { Expectation::HasType(ety) }
             }
             Expectation::RValueLikeUnsized(ety) => Expectation::RValueLikeUnsized(ety.clone()),
             _ => Expectation::None,
@@ -2044,7 +2036,7 @@ impl chalk_ir::zip::Zipper<Interner> for UnknownMismatch<'_> {
             | (_, TyKind::Error)
             | (TyKind::Alias(AliasTy::Projection(_)) | TyKind::AssociatedType(_, _), _)
             | (_, TyKind::Alias(AliasTy::Projection(_)) | TyKind::AssociatedType(_, _)) => {
-                return Err(chalk_ir::NoSolution)
+                return Err(chalk_ir::NoSolution);
             }
             _ => (),
         }

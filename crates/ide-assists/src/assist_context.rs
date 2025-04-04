@@ -2,16 +2,17 @@
 
 use hir::{FileRange, Semantics};
 use ide_db::EditionedFileId;
-use ide_db::{label::Label, FileId, RootDatabase};
+use ide_db::base_db::salsa::AsDynDatabase;
+use ide_db::{FileId, RootDatabase, label::Label};
 use syntax::Edition;
 use syntax::{
-    algo::{self, find_node_at_offset, find_node_at_range},
     AstNode, AstToken, Direction, SourceFile, SyntaxElement, SyntaxKind, SyntaxToken, TextRange,
     TextSize, TokenAtOffset,
+    algo::{self, find_node_at_offset, find_node_at_range},
 };
 
 use crate::{
-    assist_config::AssistConfig, Assist, AssistId, AssistKind, AssistResolveStrategy, GroupLabel,
+    Assist, AssistId, AssistKind, AssistResolveStrategy, GroupLabel, assist_config::AssistConfig,
 };
 
 pub(crate) use ide_db::source_change::{SourceChangeBuilder, TreeMutator};
@@ -52,6 +53,10 @@ pub(crate) struct AssistContext<'a> {
     frange: FileRange,
     trimmed_range: TextRange,
     source_file: SourceFile,
+    // We cache this here to speed up things slightly
+    token_at_offset: TokenAtOffset<SyntaxToken>,
+    // We cache this here to speed up things slightly
+    covering_element: SyntaxElement,
 }
 
 impl<'a> AssistContext<'a> {
@@ -60,7 +65,10 @@ impl<'a> AssistContext<'a> {
         config: &'a AssistConfig,
         frange: FileRange,
     ) -> AssistContext<'a> {
-        let source_file = sema.parse(frange.file_id);
+        let editioned_file_id =
+            ide_db::base_db::EditionedFileId::new(sema.db.as_dyn_database(), frange.file_id);
+
+        let source_file = sema.parse(editioned_file_id);
 
         let start = frange.range.start();
         let end = frange.range.end();
@@ -78,8 +86,18 @@ impl<'a> AssistContext<'a> {
             // Selection solely consists of whitespace so just fall back to the original
             _ => frange.range,
         };
+        let token_at_offset = source_file.syntax().token_at_offset(frange.range.start());
+        let covering_element = source_file.syntax().covering_element(trimmed_range);
 
-        AssistContext { config, sema, frange, source_file, trimmed_range }
+        AssistContext {
+            config,
+            sema,
+            frange,
+            source_file,
+            trimmed_range,
+            token_at_offset,
+            covering_element,
+        }
     }
 
     pub(crate) fn db(&self) -> &RootDatabase {
@@ -114,7 +132,7 @@ impl<'a> AssistContext<'a> {
     }
 
     pub(crate) fn token_at_offset(&self) -> TokenAtOffset<SyntaxToken> {
-        self.source_file.syntax().token_at_offset(self.offset())
+        self.token_at_offset.clone()
     }
     pub(crate) fn find_token_syntax_at_offset(&self, kind: SyntaxKind) -> Option<SyntaxToken> {
         self.token_at_offset().find(|it| it.kind() == kind)
@@ -136,7 +154,7 @@ impl<'a> AssistContext<'a> {
     }
     /// Returns the element covered by the selection range, this excludes trailing whitespace in the selection.
     pub(crate) fn covering_element(&self) -> SyntaxElement {
-        self.source_file.syntax().covering_element(self.selection_trimmed())
+        self.covering_element.clone()
     }
 }
 

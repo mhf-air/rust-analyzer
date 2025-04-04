@@ -12,15 +12,17 @@ use std::{
 
 use either::Either;
 use hir_def::{
-    hir::{Expr, ExprOrPatId},
+    AsMacroCall, DefWithBodyId, FunctionId, MacroId, StructId, TraitId, VariantId,
+    expr_store::{Body, ExprOrPatSource},
+    hir::{BindingId, Expr, ExprId, ExprOrPatId, Pat},
     lower::LowerCtx,
     nameres::{MacroSubNs, ModuleOrigin},
     path::ModPath,
     resolver::{self, HasResolver, Resolver, TypeNs},
     type_ref::{Mutability, TypesMap, TypesSourceMap},
-    AsMacroCall, DefWithBodyId, FunctionId, MacroId, StructId, TraitId, VariantId,
 };
 use hir_expand::{
+    ExpandResult, FileRange, InMacroFile, MacroCallId, MacroFileId, MacroFileIdExt,
     attrs::collect_attrs,
     builtin::{BuiltinFnLikeExpander, EagerExpander},
     db::ExpandDatabase,
@@ -28,31 +30,31 @@ use hir_expand::{
     hygiene::SyntaxContextExt as _,
     inert_attr_macro::find_builtin_attr_idx,
     name::AsName,
-    ExpandResult, FileRange, InMacroFile, MacroCallId, MacroFileId, MacroFileIdExt,
 };
-use intern::{sym, Symbol};
+use hir_ty::diagnostics::unsafe_operations_for_body;
+use intern::{Symbol, sym};
 use itertools::Itertools;
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::{smallvec, SmallVec};
-use span::{AstIdMap, EditionedFileId, FileId, HirFileIdRepr, SyntaxContextId};
+use smallvec::{SmallVec, smallvec};
+use span::{AstIdMap, EditionedFileId, FileId, HirFileIdRepr, SyntaxContext};
 use stdx::TupleExt;
 use syntax::{
-    algo::skip_trivia_token,
-    ast::{self, HasAttrs as _, HasGenericParams},
     AstNode, AstToken, Direction, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange,
     TextSize,
+    algo::skip_trivia_token,
+    ast::{self, HasAttrs as _, HasGenericParams},
 };
 use triomphe::Arc;
 
 use crate::{
-    db::HirDatabase,
-    semantics::source_to_def::{ChildContainer, SourceToDefCache, SourceToDefCtx},
-    source_analyzer::{name_hygiene, resolve_hir_path, SourceAnalyzer},
-    Access, Adjust, Adjustment, Adt, AutoBorrow, BindingMode, BuiltinAttr, Callable, Const,
-    ConstParam, Crate, DeriveHelper, Enum, Field, Function, GenericSubstitution, HasSource,
+    Adjust, Adjustment, Adt, AutoBorrow, BindingMode, BuiltinAttr, Callable, Const, ConstParam,
+    Crate, DefWithBody, DeriveHelper, Enum, Field, Function, GenericSubstitution, HasSource,
     HirFileId, Impl, InFile, InlineAsmOperand, ItemInNs, Label, LifetimeParam, Local, Macro,
     Module, ModuleDef, Name, OverloadedDeref, Path, ScopeDef, Static, Struct, ToolModule, Trait,
     TraitAlias, TupleField, Type, TypeAlias, TypeParam, Union, Variant, VariantDef,
+    db::HirDatabase,
+    semantics::source_to_def::{ChildContainer, SourceToDefCache, SourceToDefCtx},
+    source_analyzer::{SourceAnalyzer, name_hygiene, resolve_hir_path},
 };
 
 const CONTINUE_NO_BREAKS: ControlFlow<Infallible, ()> = ControlFlow::Continue(());
@@ -305,10 +307,19 @@ impl<'db> SemanticsImpl<'db> {
         SemanticsImpl { db, s2d_cache: Default::default(), macro_call_cache: Default::default() }
     }
 
-    pub fn parse(&self, file_id: EditionedFileId) -> ast::SourceFile {
+    pub fn parse(&self, file_id: base_db::EditionedFileId) -> ast::SourceFile {
+        let hir_file_id = file_id.editioned_file_id(self.db).into();
         let tree = self.db.parse(file_id).tree();
-        self.cache(tree.syntax().clone(), file_id.into());
+        self.cache(tree.syntax().clone(), hir_file_id);
         tree
+    }
+
+    /// If not crate is found for the file, try to return the last crate in topological order.
+    pub fn first_crate(&self, file: FileId) -> Option<Crate> {
+        match self.file_to_module_defs(file).next() {
+            Some(module) => Some(module.krate()),
+            None => self.db.all_crates().last().copied().map(Into::into),
+        }
     }
 
     pub fn attach_first_edition(&self, file: FileId) -> Option<EditionedFileId> {
@@ -319,11 +330,14 @@ impl<'db> SemanticsImpl<'db> {
     }
 
     pub fn parse_guess_edition(&self, file_id: FileId) -> ast::SourceFile {
-        let file_id = self
+        let editioned_file_id = self
             .attach_first_edition(file_id)
             .unwrap_or_else(|| EditionedFileId::current_edition(file_id));
+
+        let file_id = base_db::EditionedFileId::new(self.db, editioned_file_id);
+
         let tree = self.db.parse(file_id).tree();
-        self.cache(tree.syntax().clone(), file_id.into());
+        self.cache(tree.syntax().clone(), editioned_file_id.into());
         tree
     }
 
@@ -627,6 +641,31 @@ impl<'db> SemanticsImpl<'db> {
         )
     }
 
+    /// Checks if renaming `renamed` to `new_name` may introduce conflicts with other locals,
+    /// and returns the conflicting locals.
+    pub fn rename_conflicts(&self, to_be_renamed: &Local, new_name: &str) -> Vec<Local> {
+        let body = self.db.body(to_be_renamed.parent);
+        let resolver = to_be_renamed.parent.resolver(self.db.upcast());
+        let starting_expr =
+            body.binding_owners.get(&to_be_renamed.binding_id).copied().unwrap_or(body.body_expr);
+        let mut visitor = RenameConflictsVisitor {
+            body: &body,
+            conflicts: FxHashSet::default(),
+            db: self.db,
+            new_name: Symbol::intern(new_name),
+            old_name: to_be_renamed.name(self.db).symbol().clone(),
+            owner: to_be_renamed.parent,
+            to_be_renamed: to_be_renamed.binding_id,
+            resolver,
+        };
+        visitor.rename_conflicts(starting_expr);
+        visitor
+            .conflicts
+            .into_iter()
+            .map(|binding_id| Local { parent: to_be_renamed.parent, binding_id })
+            .collect()
+    }
+
     /// Retrieves all the formatting parts of the format_args! (or `asm!`) template string.
     pub fn as_format_args_parts(
         &self,
@@ -838,7 +877,7 @@ impl<'db> SemanticsImpl<'db> {
     pub fn descend_into_macros_cb(
         &self,
         token: SyntaxToken,
-        mut cb: impl FnMut(InFile<SyntaxToken>, SyntaxContextId),
+        mut cb: impl FnMut(InFile<SyntaxToken>, SyntaxContext),
     ) {
         if let Ok(token) = self.wrap_token_infile(token).into_real_file() {
             self.descend_into_macros_impl(token, &mut |t, ctx| {
@@ -882,7 +921,7 @@ impl<'db> SemanticsImpl<'db> {
     pub fn descend_into_macros_breakable<T>(
         &self,
         token: InRealFile<SyntaxToken>,
-        mut cb: impl FnMut(InFile<SyntaxToken>, SyntaxContextId) -> ControlFlow<T>,
+        mut cb: impl FnMut(InFile<SyntaxToken>, SyntaxContext) -> ControlFlow<T>,
     ) -> Option<T> {
         self.descend_into_macros_impl(token.clone(), &mut cb)
     }
@@ -924,11 +963,7 @@ impl<'db> SemanticsImpl<'db> {
                         || kind.is_any_identifier() && value.kind().is_any_identifier();
                     let matches =
                         (kind == mapped_kind || any_ident_match()) && text == value.text();
-                    if matches {
-                        ControlFlow::Break(value)
-                    } else {
-                        ControlFlow::Continue(())
-                    }
+                    if matches { ControlFlow::Break(value) } else { ControlFlow::Continue(()) }
                 },
             )
         } else {
@@ -940,7 +975,7 @@ impl<'db> SemanticsImpl<'db> {
     fn descend_into_macros_impl<T>(
         &self,
         InRealFile { value: token, file_id }: InRealFile<SyntaxToken>,
-        f: &mut dyn FnMut(InFile<SyntaxToken>, SyntaxContextId) -> ControlFlow<T>,
+        f: &mut dyn FnMut(InFile<SyntaxToken>, SyntaxContext) -> ControlFlow<T>,
     ) -> Option<T> {
         let _p = tracing::info_span!("descend_into_macros_impl").entered();
 
@@ -977,7 +1012,7 @@ impl<'db> SemanticsImpl<'db> {
             None => {
                 stack.push((
                     file_id.into(),
-                    smallvec![(token, SyntaxContextId::root(file_id.edition()))],
+                    smallvec![(token, SyntaxContext::root(file_id.edition()))],
                 ));
             }
         }
@@ -1353,7 +1388,7 @@ impl<'db> SemanticsImpl<'db> {
 
         let (mut source_ty, _) = analyzer.type_of_expr(self.db, expr)?;
 
-        analyzer.expr_adjustments(self.db, expr).map(|it| {
+        analyzer.expr_adjustments(expr).map(|it| {
             it.iter()
                 .map(|adjust| {
                     let target =
@@ -1486,7 +1521,7 @@ impl<'db> SemanticsImpl<'db> {
     }
 
     pub fn resolve_field(&self, field: &ast::FieldExpr) -> Option<Either<Field, TupleField>> {
-        self.analyze(field.syntax())?.resolve_field(self.db, field)
+        self.analyze(field.syntax())?.resolve_field(field)
     }
 
     pub fn resolve_field_fallback(
@@ -1555,6 +1590,19 @@ impl<'db> SemanticsImpl<'db> {
             .matched_arm
     }
 
+    pub fn get_unsafe_ops(&self, def: DefWithBody) -> FxHashSet<ExprOrPatSource> {
+        let def = DefWithBodyId::from(def);
+        let (body, source_map) = self.db.body_with_source_map(def);
+        let infer = self.db.infer(def);
+        let mut res = FxHashSet::default();
+        unsafe_operations_for_body(self.db, &infer, def, &body, &mut |node| {
+            if let Ok(node) = source_map.expr_or_pat_syntax(node) {
+                res.insert(node);
+            }
+        });
+        res
+    }
+
     pub fn is_unsafe_macro_call(&self, macro_call: &ast::MacroCall) -> bool {
         let Some(mac) = self.resolve_macro_call(macro_call) else { return false };
         if mac.is_asm_or_global_asm(self.db) {
@@ -1603,20 +1651,8 @@ impl<'db> SemanticsImpl<'db> {
         Some(items.iter_items().map(|(item, _)| item.into()))
     }
 
-    pub fn resolve_mod_path_relative(
-        &self,
-        to: Module,
-        segments: impl IntoIterator<Item = Name>,
-    ) -> Option<impl Iterator<Item = ItemInNs>> {
-        let items = to.id.resolver(self.db.upcast()).resolve_module_path_in_items(
-            self.db.upcast(),
-            &ModPath::from_segments(hir_def::path::PathKind::Plain, segments),
-        );
-        Some(items.iter_items().map(|(item, _)| item.into()))
-    }
-
     fn resolve_variant(&self, record_lit: ast::RecordExpr) -> Option<VariantId> {
-        self.analyze(record_lit.syntax())?.resolve_variant(self.db, record_lit)
+        self.analyze(record_lit.syntax())?.resolve_variant(record_lit)
     }
 
     pub fn resolve_bind_pat_to_const(&self, pat: &ast::IdentPat) -> Option<ModuleDef> {
@@ -1682,6 +1718,15 @@ impl<'db> SemanticsImpl<'db> {
         Some(res)
     }
 
+    pub fn body_for(&self, node: InFile<&SyntaxNode>) -> Option<DefWithBody> {
+        let container = self.with_ctx(|ctx| ctx.find_container(node))?;
+
+        match container {
+            ChildContainer::DefWithBodyId(def) => Some(def.into()),
+            _ => None,
+        }
+    }
+
     /// Returns none if the file of the node is not part of a crate.
     fn analyze(&self, node: &SyntaxNode) -> Option<SourceAnalyzer> {
         let node = self.find_file(node);
@@ -1719,7 +1764,7 @@ impl<'db> SemanticsImpl<'db> {
                     SourceAnalyzer::new_for_body(self.db, def, node, offset)
                 } else {
                     SourceAnalyzer::new_for_body_no_infer(self.db, def, node, offset)
-                })
+                });
             }
             ChildContainer::TraitId(it) => it.resolver(self.db.upcast()),
             ChildContainer::TraitAliasId(it) => it.resolver(self.db.upcast()),
@@ -1781,91 +1826,6 @@ impl<'db> SemanticsImpl<'db> {
             )
         });
         InFile::new(file_id, node)
-    }
-
-    pub fn is_unsafe_method_call(&self, method_call_expr: &ast::MethodCallExpr) -> bool {
-        method_call_expr
-            .receiver()
-            .and_then(|expr| {
-                let field_expr = match expr {
-                    ast::Expr::FieldExpr(field_expr) => field_expr,
-                    _ => return None,
-                };
-                let ty = self.type_of_expr(&field_expr.expr()?)?.original;
-                if !ty.is_packed(self.db) {
-                    return None;
-                }
-
-                let func = self.resolve_method_call(method_call_expr)?;
-                let res = match func.self_param(self.db)?.access(self.db) {
-                    Access::Shared | Access::Exclusive => true,
-                    Access::Owned => false,
-                };
-                Some(res)
-            })
-            .unwrap_or(false)
-    }
-
-    pub fn is_unsafe_ref_expr(&self, ref_expr: &ast::RefExpr) -> bool {
-        ref_expr
-            .expr()
-            .and_then(|expr| {
-                let field_expr = match expr {
-                    ast::Expr::FieldExpr(field_expr) => field_expr,
-                    _ => return None,
-                };
-                let expr = field_expr.expr()?;
-                self.type_of_expr(&expr)
-            })
-            // Binding a reference to a packed type is possibly unsafe.
-            .map(|ty| ty.original.is_packed(self.db))
-            .unwrap_or(false)
-
-        // FIXME This needs layout computation to be correct. It will highlight
-        // more than it should with the current implementation.
-    }
-
-    pub fn is_unsafe_ident_pat(&self, ident_pat: &ast::IdentPat) -> bool {
-        if ident_pat.ref_token().is_none() {
-            return false;
-        }
-
-        ident_pat
-            .syntax()
-            .parent()
-            .and_then(|parent| {
-                // `IdentPat` can live under `RecordPat` directly under `RecordPatField` or
-                // `RecordPatFieldList`. `RecordPatField` also lives under `RecordPatFieldList`,
-                // so this tries to lookup the `IdentPat` anywhere along that structure to the
-                // `RecordPat` so we can get the containing type.
-                let record_pat = ast::RecordPatField::cast(parent.clone())
-                    .and_then(|record_pat| record_pat.syntax().parent())
-                    .or_else(|| Some(parent.clone()))
-                    .and_then(|parent| {
-                        ast::RecordPatFieldList::cast(parent)?
-                            .syntax()
-                            .parent()
-                            .and_then(ast::RecordPat::cast)
-                    });
-
-                // If this doesn't match a `RecordPat`, fallback to a `LetStmt` to see if
-                // this is initialized from a `FieldExpr`.
-                if let Some(record_pat) = record_pat {
-                    self.type_of_pat(&ast::Pat::RecordPat(record_pat))
-                } else if let Some(let_stmt) = ast::LetStmt::cast(parent) {
-                    let field_expr = match let_stmt.initializer()? {
-                        ast::Expr::FieldExpr(field_expr) => field_expr,
-                        _ => return None,
-                    };
-
-                    self.type_of_expr(&field_expr.expr()?)
-                } else {
-                    None
-                }
-            })
-            // Binding a reference to a packed type is possibly unsafe.
-            .map(|ty| ty.original.is_packed(self.db))
-            .unwrap_or(false)
     }
 
     /// Returns `true` if the `node` is inside an `unsafe` context.
@@ -1931,7 +1891,9 @@ fn macro_call_to_macro_id(
     match loc.def.ast_id() {
         Either::Left(it) => {
             let node = match it.file_id.repr() {
-                HirFileIdRepr::FileId(file_id) => {
+                HirFileIdRepr::FileId(editioned_file_id) => {
+                    let file_id = base_db::EditionedFileId::new(db, editioned_file_id);
+
                     it.to_ptr(db).to_node(&db.parse(file_id).syntax_node())
                 }
                 HirFileIdRepr::MacroFile(macro_file) => {
@@ -1943,7 +1905,9 @@ fn macro_call_to_macro_id(
         }
         Either::Right(it) => {
             let node = match it.file_id.repr() {
-                HirFileIdRepr::FileId(file_id) => {
+                HirFileIdRepr::FileId(editioned_file_id) => {
+                    let file_id = base_db::EditionedFileId::new(db, editioned_file_id);
+
                     it.to_ptr(db).to_node(&db.parse(file_id).syntax_node())
                 }
                 HirFileIdRepr::MacroFile(macro_file) => {
@@ -2107,7 +2071,7 @@ impl SemanticsScope<'_> {
         )
     }
 
-    pub fn resolve_mod_path(&self, path: &ModPath) -> impl Iterator<Item = ItemInNs> {
+    pub fn resolve_mod_path(&self, path: &ModPath) -> impl Iterator<Item = ItemInNs> + use<> {
         let items = self.resolver.resolve_module_path_in_items(self.db.upcast(), path);
         items.iter_items().map(|(item, _)| item.into())
     }
@@ -2153,5 +2117,71 @@ impl ops::Deref for VisibleTraits {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+struct RenameConflictsVisitor<'a> {
+    db: &'a dyn HirDatabase,
+    owner: DefWithBodyId,
+    resolver: Resolver,
+    body: &'a Body,
+    to_be_renamed: BindingId,
+    new_name: Symbol,
+    old_name: Symbol,
+    conflicts: FxHashSet<BindingId>,
+}
+
+impl RenameConflictsVisitor<'_> {
+    fn resolve_path(&mut self, node: ExprOrPatId, path: &Path) {
+        if let Path::BarePath(path) = path {
+            if let Some(name) = path.as_ident() {
+                if *name.symbol() == self.new_name {
+                    if let Some(conflicting) = self.resolver.rename_will_conflict_with_renamed(
+                        self.db.upcast(),
+                        name,
+                        path,
+                        self.body.expr_or_pat_path_hygiene(node),
+                        self.to_be_renamed,
+                    ) {
+                        self.conflicts.insert(conflicting);
+                    }
+                } else if *name.symbol() == self.old_name {
+                    if let Some(conflicting) =
+                        self.resolver.rename_will_conflict_with_another_variable(
+                            self.db.upcast(),
+                            name,
+                            path,
+                            self.body.expr_or_pat_path_hygiene(node),
+                            &self.new_name,
+                            self.to_be_renamed,
+                        )
+                    {
+                        self.conflicts.insert(conflicting);
+                    }
+                }
+            }
+        }
+    }
+
+    fn rename_conflicts(&mut self, expr: ExprId) {
+        match &self.body[expr] {
+            Expr::Path(path) => {
+                let guard = self.resolver.update_to_inner_scope(self.db.upcast(), self.owner, expr);
+                self.resolve_path(expr.into(), path);
+                self.resolver.reset_to_guard(guard);
+            }
+            &Expr::Assignment { target, .. } => {
+                let guard = self.resolver.update_to_inner_scope(self.db.upcast(), self.owner, expr);
+                self.body.walk_pats(target, &mut |pat| {
+                    if let Pat::Path(path) = &self.body[pat] {
+                        self.resolve_path(pat.into(), path);
+                    }
+                });
+                self.resolver.reset_to_guard(guard);
+            }
+            _ => {}
+        }
+
+        self.body.walk_child_exprs(expr, |expr| self.rename_conflicts(expr));
     }
 }

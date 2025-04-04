@@ -1,10 +1,11 @@
 use itertools::Itertools;
 use syntax::{
-    ast::{self, make, AstNode, AstToken},
-    match_ast, ted, Edition, NodeOrToken, SyntaxElement, TextRange, TextSize, T,
+    Edition, NodeOrToken, SyntaxElement, T, TextRange, TextSize,
+    ast::{self, AstNode, AstToken, make},
+    match_ast, ted,
 };
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: remove_dbg
 //
@@ -41,7 +42,7 @@ pub(crate) fn remove_dbg(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<(
         macro_calls.into_iter().filter_map(compute_dbg_replacement).collect::<Vec<_>>();
 
     acc.add(
-        AssistId("remove_dbg", AssistKind::QuickFix),
+        AssistId::quick_fix("remove_dbg"),
         "Remove dbg!()",
         replacements.iter().map(|&(range, _)| range).reduce(|acc, range| acc.cover(range))?,
         |builder| {
@@ -73,7 +74,7 @@ fn compute_dbg_replacement(macro_expr: ast::MacroExpr) -> Option<(TextRange, Opt
     }
 
     let mac_input = tt.syntax().children_with_tokens().skip(1).take_while(|it| *it != r_delim);
-    let input_expressions = mac_input.group_by(|tok| tok.kind() == T![,]);
+    let input_expressions = mac_input.chunk_by(|tok| tok.kind() == T![,]);
     let input_expressions = input_expressions
         .into_iter()
         .filter_map(|(is_sep, group)| (!is_sep).then_some(group))

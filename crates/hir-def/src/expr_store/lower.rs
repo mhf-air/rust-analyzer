@@ -5,29 +5,30 @@ mod asm;
 
 use std::mem;
 
-use base_db::CrateId;
+use base_db::Crate;
 use either::Either;
 use hir_expand::{
+    InFile, MacroDefId,
     mod_path::tool_path,
     name::{AsName, Name},
     span_map::{ExpansionSpanMap, SpanMap},
-    InFile, MacroDefId,
 };
-use intern::{sym, Symbol};
+use intern::{Symbol, sym};
 use rustc_hash::FxHashMap;
 use span::AstIdMap;
 use stdx::never;
 use syntax::{
+    AstNode, AstPtr, AstToken as _, SyntaxNodePtr,
     ast::{
         self, ArrayExprKind, AstChildren, BlockExpr, HasArgList, HasAttrs, HasGenericArgs,
         HasLoopBody, HasName, RangeItem, SlicePatComponents,
     },
-    AstNode, AstPtr, AstToken as _, SyntaxNodePtr,
 };
 use text_size::TextSize;
 use triomphe::Arc;
 
 use crate::{
+    AdtId, BlockId, BlockLoc, ConstBlockLoc, DefWithBodyId, MacroId, ModuleDefId, UnresolvedMacro,
     attr::Attrs,
     builtin_type::BuiltinUint,
     data::adt::StructKind,
@@ -38,22 +39,21 @@ use crate::{
         ExpressionStoreDiagnostics, ExpressionStoreSourceMap, HygieneId, LabelPtr, PatPtr,
     },
     hir::{
+        Array, Binding, BindingAnnotation, BindingId, BindingProblems, CaptureBy, ClosureKind,
+        Expr, ExprId, Item, Label, LabelId, Literal, MatchArm, Movability, OffsetOf, Pat, PatId,
+        RecordFieldPat, RecordLitField, Statement,
         format_args::{
             self, FormatAlignment, FormatArgs, FormatArgsPiece, FormatArgument, FormatArgumentKind,
             FormatArgumentsCollector, FormatCount, FormatDebugHex, FormatOptions,
             FormatPlaceholder, FormatSign, FormatTrait,
         },
-        Array, Binding, BindingAnnotation, BindingId, BindingProblems, CaptureBy, ClosureKind,
-        Expr, ExprId, Item, Label, LabelId, Literal, MatchArm, Movability, OffsetOf, Pat, PatId,
-        RecordFieldPat, RecordLitField, Statement,
     },
     item_scope::BuiltinShadowMode,
     lang_item::LangItem,
     lower::LowerCtx,
-    nameres::{DefMap, MacroSubNs},
+    nameres::{DefMap, LocalDefMap, MacroSubNs},
     path::{GenericArgs, Path},
     type_ref::{Mutability, Rawness, TypeRef},
-    AdtId, BlockId, BlockLoc, ConstBlockLoc, DefWithBodyId, MacroId, ModuleDefId, UnresolvedMacro,
 };
 
 type FxIndexSet<K> = indexmap::IndexSet<K, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
@@ -64,7 +64,7 @@ pub(super) fn lower_body(
     expander: Expander,
     parameters: Option<(ast::ParamList, impl Iterator<Item = bool>)>,
     body: Option<ast::Expr>,
-    krate: CrateId,
+    krate: Crate,
     is_async_fn: bool,
 ) -> (Body, BodySourceMap) {
     // We cannot leave the root span map empty and let any identifier from it be treated as root,
@@ -189,7 +189,7 @@ pub(super) fn lower(
     owner: ExprStoreOwnerId,
     expander: Expander,
     body: Option<ast::Expr>,
-    krate: CrateId,
+    krate: Crate,
 ) -> (ExpressionStore, ExpressionStoreSourceMap) {
     // We cannot leave the root span map empty and let any identifier from it be treated as root,
     // because when inside nested macros `SyntaxContextId`s from the outer macro will be interleaved
@@ -214,8 +214,9 @@ struct ExprCollector<'a> {
     expander: Expander,
     owner: ExprStoreOwnerId,
     def_map: Arc<DefMap>,
+    local_def_map: Arc<LocalDefMap>,
     ast_id_map: Arc<AstIdMap>,
-    krate: CrateId,
+    krate: Crate,
     store: ExpressionStoreBuilder,
     source_map: ExpressionStoreSourceMap,
 
@@ -327,14 +328,16 @@ impl ExprCollector<'_> {
         db: &dyn DefDatabase,
         owner: ExprStoreOwnerId,
         expander: Expander,
-        krate: CrateId,
+        krate: Crate,
         span_map: Option<Arc<ExpansionSpanMap>>,
     ) -> ExprCollector<'_> {
+        let (def_map, local_def_map) = expander.module.local_def_map(db);
         ExprCollector {
             db,
             owner,
             krate,
-            def_map: expander.module.def_map(db),
+            def_map,
+            local_def_map,
             source_map: ExpressionStoreSourceMap::default(),
             ast_id_map: db.ast_id_map(expander.current_file_id()),
             store: ExpressionStoreBuilder::default(),
@@ -638,11 +641,7 @@ impl ExprCollector<'_> {
                 let expr = self.collect_expr_opt(e.expr());
                 let raw_tok = e.raw_token().is_some();
                 let mutability = if raw_tok {
-                    if e.mut_token().is_some() {
-                        Mutability::Mut
-                    } else {
-                        Mutability::Shared
-                    }
+                    if e.mut_token().is_some() { Mutability::Mut } else { Mutability::Shared }
                 } else {
                     Mutability::from_mutable(e.mut_token().is_some())
                 };
@@ -1306,6 +1305,7 @@ impl ExprCollector<'_> {
             None => self.expander.enter_expand(self.db, mcall, |path| {
                 self.def_map
                     .resolve_path(
+                        &self.local_def_map,
                         self.db,
                         module,
                         path,
@@ -1360,8 +1360,7 @@ impl ExprCollector<'_> {
                 else {
                     panic!("just expanded a macro, ExpansionSpanMap should be available");
                 };
-                let old_span_map =
-                    mem::replace(&mut self.current_span_map, Some(new_span_map.clone()));
+                let old_span_map = self.current_span_map.replace(new_span_map.clone());
                 let id = collector(self, Some(expansion.tree()));
                 self.current_span_map = old_span_map;
                 self.ast_id_map = prev_ast_id_map;
@@ -1608,6 +1607,7 @@ impl ExprCollector<'_> {
                     // This could also be a single-segment path pattern. To
                     // decide that, we need to try resolving the name.
                     let (resolved, _) = self.def_map.resolve_path(
+                        &self.local_def_map,
                         self.db,
                         self.expander.module.local_id,
                         &name.clone().into(),
@@ -1626,7 +1626,7 @@ impl ExprCollector<'_> {
                             (None, Pat::Path(name.into()))
                         }
                         Some(ModuleDefId::AdtId(AdtId::StructId(s)))
-                            if self.db.struct_data(s).variant_data.kind() != StructKind::Record =>
+                            if self.db.variant_data(s.into()).kind() != StructKind::Record =>
                         {
                             (None, Pat::Path(name.into()))
                         }
@@ -1893,14 +1893,14 @@ impl ExprCollector<'_> {
     fn check_cfg(&mut self, owner: &dyn ast::HasAttrs) -> Option<()> {
         match self.expander.parse_attrs(self.db, owner).cfg() {
             Some(cfg) => {
-                if self.expander.cfg_options().check(&cfg) != Some(false) {
+                if self.expander.cfg_options(self.db).check(&cfg) != Some(false) {
                     return Some(());
                 }
 
                 self.source_map.diagnostics.push(ExpressionStoreDiagnostics::InactiveCode {
                     node: self.expander.in_file(SyntaxNodePtr::new(owner.syntax())),
                     cfg,
-                    opts: self.expander.cfg_options().clone(),
+                    opts: self.expander.cfg_options(self.db).clone(),
                 });
 
                 None
@@ -1931,11 +1931,11 @@ impl ExprCollector<'_> {
             None => (HygieneId::ROOT, None),
             Some(span_map) => {
                 let span = span_map.span_at(lifetime.syntax().text_range().start());
-                let ctx = self.db.lookup_intern_syntax_context(span.ctx);
-                let hygiene_id = HygieneId::new(ctx.opaque_and_semitransparent);
-                let hygiene_info = ctx.outer_expn.map(|expansion| {
+                let ctx = span.ctx;
+                let hygiene_id = HygieneId::new(ctx.opaque_and_semitransparent(self.db));
+                let hygiene_info = ctx.outer_expn(self.db).map(|expansion| {
                     let expansion = self.db.lookup_intern_macro_call(expansion);
-                    (ctx.parent, expansion.def)
+                    (ctx.parent(self.db), expansion.def)
                 });
                 (hygiene_id, hygiene_info)
             }
@@ -1962,11 +1962,12 @@ impl ExprCollector<'_> {
                             // A macro is allowed to refer to labels from before its declaration.
                             // Therefore, if we got to the rib of its declaration, give up its hygiene
                             // and use its parent expansion.
-                            let parent_ctx = self.db.lookup_intern_syntax_context(parent_ctx);
-                            hygiene_id = HygieneId::new(parent_ctx.opaque_and_semitransparent);
-                            hygiene_info = parent_ctx.outer_expn.map(|expansion| {
+
+                            hygiene_id =
+                                HygieneId::new(parent_ctx.opaque_and_semitransparent(self.db));
+                            hygiene_info = parent_ctx.outer_expn(self.db).map(|expansion| {
                                 let expansion = self.db.lookup_intern_macro_call(expansion);
-                                (parent_ctx.parent, expansion.def)
+                                (parent_ctx.parent(self.db), expansion.def)
                             });
                         }
                     }
@@ -2035,7 +2036,7 @@ impl ExprCollector<'_> {
                 return match l.kind() {
                     ast::LiteralKind::String(s) => Some((s, true)),
                     _ => None,
-                }
+                };
             }
             _ => return None,
         };
@@ -2398,7 +2399,8 @@ impl ExprCollector<'_> {
             Some(FormatCount::Literal(n)) => {
                 let args = self.alloc_expr_desugared(Expr::Literal(Literal::Uint(
                     *n as u128,
-                    Some(BuiltinUint::Usize),
+                    // FIXME: Change this to Some(BuiltinUint::U16) once we drop support for toolchains < 1.88
+                    None,
                 )));
                 let count_is = match LangItem::FormatCount.ty_rel_path(
                     self.db,
@@ -2593,7 +2595,7 @@ impl ExprCollector<'_> {
             None => HygieneId::ROOT,
             Some(span_map) => {
                 let ctx = span_map.span_at(span_start).ctx;
-                HygieneId::new(self.db.lookup_intern_syntax_context(ctx).opaque_and_semitransparent)
+                HygieneId::new(ctx.opaque_and_semitransparent(self.db))
             }
         }
     }

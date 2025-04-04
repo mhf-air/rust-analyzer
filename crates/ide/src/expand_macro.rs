@@ -1,12 +1,12 @@
 use hir::db::ExpandDatabase;
 use hir::{ExpandResult, InFile, MacroFileIdExt, Semantics};
-use ide_db::base_db::CrateId;
 use ide_db::{
-    helpers::pick_best_token, syntax_helpers::prettify_macro_expansion, FileId, RootDatabase,
+    FileId, RootDatabase, base_db::Crate, helpers::pick_best_token,
+    syntax_helpers::prettify_macro_expansion,
 };
-use span::{Edition, SpanMap, SyntaxContextId, TextRange, TextSize};
+use span::{Edition, SpanMap, SyntaxContext, TextRange, TextSize};
 use stdx::format_to;
-use syntax::{ast, ted, AstNode, NodeOrToken, SyntaxKind, SyntaxNode, T};
+use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxNode, T, ast, ted};
 
 use crate::FilePosition;
 
@@ -142,7 +142,7 @@ fn expand_macro_recur(
     sema: &Semantics<'_, RootDatabase>,
     macro_call: &ast::Item,
     error: &mut String,
-    result_span_map: &mut SpanMap<SyntaxContextId>,
+    result_span_map: &mut SpanMap<SyntaxContext>,
     offset_in_original_node: TextSize,
 ) -> Option<SyntaxNode> {
     let ExpandResult { value: expanded, err } = match macro_call {
@@ -170,7 +170,7 @@ fn expand(
     sema: &Semantics<'_, RootDatabase>,
     expanded: SyntaxNode,
     error: &mut String,
-    result_span_map: &mut SpanMap<SyntaxContextId>,
+    result_span_map: &mut SpanMap<SyntaxContext>,
     mut offset_in_original_node: i32,
 ) -> SyntaxNode {
     let children = expanded.descendants().filter_map(ast::Item::cast);
@@ -207,8 +207,8 @@ fn format(
     kind: SyntaxKind,
     file_id: FileId,
     expanded: SyntaxNode,
-    span_map: &SpanMap<SyntaxContextId>,
-    krate: CrateId,
+    span_map: &SpanMap<SyntaxContext>,
+    krate: Crate,
 ) -> String {
     let expansion = prettify_macro_expansion(db, expanded, span_map, krate).to_string();
 
@@ -234,7 +234,6 @@ fn _format(
     file_id: FileId,
     expansion: &str,
 ) -> Option<String> {
-    use ide_db::base_db::{FileLoader, SourceDatabase};
     // hack until we get hygiene working (same character amount to preserve formatting as much as possible)
     const DOLLAR_CRATE_REPLACE: &str = "__r_a_";
     const BUILTIN_REPLACE: &str = "builtin__POUND";
@@ -248,8 +247,9 @@ fn _format(
     };
     let expansion = format!("{prefix}{expansion}{suffix}");
 
-    let &crate_id = db.relevant_crates(file_id).iter().next()?;
-    let edition = db.crate_graph()[crate_id].edition;
+    let upcast_db = ide_db::base_db::Upcast::<dyn ide_db::base_db::RootQueryDb>::upcast(db);
+    let &crate_id = upcast_db.relevant_crates(file_id).iter().next()?;
+    let edition = crate_id.data(upcast_db).edition;
 
     #[allow(clippy::disallowed_methods)]
     let mut cmd = std::process::Command::new(toolchain::Tool::Rustfmt.path());
@@ -289,7 +289,7 @@ fn _format(
 
 #[cfg(test)]
 mod tests {
-    use expect_test::{expect, Expect};
+    use expect_test::{Expect, expect};
 
     use crate::fixture;
 

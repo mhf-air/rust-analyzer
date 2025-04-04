@@ -14,12 +14,12 @@
 //! while installing firewall per item queries to prevent invalidation issues.
 
 use crate::db::HirDatabase;
-use crate::generics::{generics, Generics};
+use crate::generics::{Generics, generics};
 use crate::{
     AliasTy, Const, ConstScalar, DynTyExt, GenericArg, GenericArgData, Interner, Lifetime,
     LifetimeData, Ty, TyKind,
 };
-use base_db::ra_salsa::Cycle;
+use base_db::salsa::Cycle;
 use chalk_ir::Mutability;
 use hir_def::data::adt::StructFlags;
 use hir_def::{AdtId, GenericDefId, GenericParamId, VariantId};
@@ -58,9 +58,9 @@ pub(crate) fn variances_of(db: &dyn HirDatabase, def: GenericDefId) -> Option<Ar
 pub(crate) fn variances_of_cycle(
     db: &dyn HirDatabase,
     _cycle: &Cycle,
-    def: &GenericDefId,
+    def: GenericDefId,
 ) -> Option<Arc<[Variance]>> {
-    let generics = generics(db.upcast(), *def);
+    let generics = generics(db.upcast(), def);
     let count = generics.len();
 
     if count == 0 {
@@ -206,7 +206,7 @@ impl Context<'_> {
                     AdtId::StructId(s) => add_constraints_from_variant(VariantId::StructId(s)),
                     AdtId::UnionId(u) => add_constraints_from_variant(VariantId::UnionId(u)),
                     AdtId::EnumId(e) => {
-                        db.enum_data(e).variants.iter().for_each(|&(variant, _)| {
+                        db.enum_variants(e).variants.iter().for_each(|&(variant, _)| {
                             add_constraints_from_variant(VariantId::EnumVariantId(variant))
                         });
                     }
@@ -487,13 +487,13 @@ impl Context<'_> {
 
 #[cfg(test)]
 mod tests {
-    use expect_test::{expect, Expect};
+    use expect_test::{Expect, expect};
     use hir_def::{
-        generics::GenericParamDataRef, src::HasSource, AdtId, GenericDefId, ModuleDefId,
+        AdtId, GenericDefId, ModuleDefId, generics::GenericParamDataRef, src::HasSource,
     };
     use itertools::Itertools;
     use stdx::format_to;
-    use syntax::{ast::HasName, AstNode};
+    use syntax::{AstNode, ast::HasName};
     use test_fixture::WithFixture;
 
     use hir_def::Lookup;

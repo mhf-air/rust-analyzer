@@ -4,11 +4,12 @@ use ide_db::{
     syntax_helpers::node_ext::{for_each_tail_expr, walk_expr},
 };
 use syntax::{
-    ast::{self, syntax_factory::SyntaxFactory, HasArgList, HasGenericArgs},
-    match_ast, AstNode, NodeOrToken, SyntaxKind,
+    AstNode, NodeOrToken, SyntaxKind,
+    ast::{self, HasArgList, HasGenericArgs, syntax_factory::SyntaxFactory},
+    match_ast,
 };
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: unwrap_option_return_type
 //
@@ -186,7 +187,7 @@ impl UnwrapperKind {
             UnwrapperKind::Result => "unwrap_result_return_type",
         };
 
-        AssistId(s, AssistKind::RefactorRewrite)
+        AssistId::refactor_rewrite(s)
     }
 
     fn label(&self) -> &'static str {

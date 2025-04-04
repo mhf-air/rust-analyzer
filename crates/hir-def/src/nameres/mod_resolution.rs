@@ -1,10 +1,10 @@
 //! This module resolves `mod foo;` declaration to file.
 use arrayvec::ArrayVec;
-use base_db::AnchoredPath;
-use hir_expand::{name::Name, HirFileIdExt};
+use base_db::{AnchoredPath, RootQueryDb};
+use hir_expand::{HirFileIdExt, name::Name};
 use span::EditionedFileId;
 
-use crate::{db::DefDatabase, HirFileId};
+use crate::{HirFileId, db::DefDatabase};
 
 const MOD_DEPTH_LIMIT: usize = 32;
 
@@ -80,7 +80,8 @@ impl ModDir {
         let orig_file_id = file_id.original_file_respecting_includes(db.upcast());
         for candidate in candidate_files.iter() {
             let path = AnchoredPath { anchor: orig_file_id.file_id(), path: candidate.as_str() };
-            if let Some(file_id) = db.resolve_path(path) {
+            if let Some(file_id) = base_db::Upcast::<dyn RootQueryDb>::upcast(db).resolve_path(path)
+            {
                 let is_mod_rs = candidate.ends_with("/mod.rs");
 
                 let root_dir_owner = is_mod_rs || attr_path.is_some();

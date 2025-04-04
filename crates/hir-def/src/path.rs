@@ -16,10 +16,9 @@ use crate::{
 use hir_expand::name::Name;
 use intern::Interned;
 use span::Edition;
-use stdx::thin_vec::thin_vec_with_header_struct;
 use syntax::ast;
 
-pub use hir_expand::mod_path::{path, ModPath, PathKind};
+pub use hir_expand::mod_path::{ModPath, PathKind, path};
 
 pub use lower::hir_segment_to_ast_segment;
 
@@ -57,8 +56,8 @@ pub enum Path {
     /// or type anchor, it is `Path::Normal` with the generics filled with `None` even if there are none (practically
     /// this is not a problem since many more paths have generics than a type anchor).
     BarePath(Interned<ModPath>),
-    /// `Path::Normal` may have empty generics and type anchor (but generic args will be filled with `None`).
-    Normal(NormalPath),
+    /// `Path::Normal` will always have either generics or type anchor.
+    Normal(Box<NormalPath>),
     /// A link to a lang item. It is used in desugaring of things like `it?`. We can show these
     /// links via a normal path since they might be private and not accessible in the usage place.
     LangItem(LangItemTarget, Option<Name>),
@@ -71,12 +70,24 @@ const _: () = {
     assert!(size_of::<Option<Path>>() == 16);
 };
 
-thin_vec_with_header_struct! {
-    pub new(pub(crate)) struct NormalPath, NormalPathHeader {
-        pub generic_args: [Option<GenericArgs>],
-        pub type_anchor: Option<TypeRefId>,
-        pub mod_path: Interned<ModPath>; ref,
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NormalPath {
+    pub generic_args: Box<[Option<GenericArgs>]>,
+    pub type_anchor: Option<TypeRefId>,
+    pub mod_path: Interned<ModPath>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenericArgsParentheses {
+    No,
+    /// Bounds of the form `Type::method(..): Send` or `impl Trait<method(..): Send>`,
+    /// aka. Return Type Notation or RTN.
+    ReturnTypeNotation,
+    /// `Fn`-family parenthesized traits, e.g. `impl Fn(u32) -> String`.
+    ///
+    /// This is desugared into one generic argument containing a tuple of all arguments,
+    /// and an associated type binding for `Output` for the return type.
+    ParenSugar,
 }
 
 /// Generic arguments to a path segment (e.g. the `i32` in `Option<i32>`). This
@@ -92,9 +103,8 @@ pub struct GenericArgs {
     pub has_self_type: bool,
     /// Associated type bindings like in `Iterator<Item = T>`.
     pub bindings: Box<[AssociatedTypeBinding]>,
-    /// Whether these generic args were desugared from `Trait(Arg) -> Output`
-    /// parenthesis notation typically used for the `Fn` traits.
-    pub desugared_from_fn: bool,
+    /// Whether these generic args were written with parentheses and how.
+    pub parenthesized: GenericArgsParentheses,
 }
 
 /// An associated type binding like in `Iterator<Item = T>`.
@@ -131,7 +141,11 @@ impl Path {
 
     /// Converts a known mod path to `Path`.
     pub fn from_known_path(path: ModPath, generic_args: Vec<Option<GenericArgs>>) -> Path {
-        Path::Normal(NormalPath::new(None, Interned::new(path), generic_args))
+        Path::Normal(Box::new(NormalPath {
+            generic_args: generic_args.into_boxed_slice(),
+            type_anchor: None,
+            mod_path: Interned::new(path),
+        }))
     }
 
     /// Converts a known mod path to `Path`.
@@ -143,7 +157,7 @@ impl Path {
     pub fn kind(&self) -> &PathKind {
         match self {
             Path::BarePath(mod_path) => &mod_path.kind,
-            Path::Normal(path) => &path.mod_path().kind,
+            Path::Normal(path) => &path.mod_path.kind,
             Path::LangItem(..) => &PathKind::Abs,
         }
     }
@@ -151,7 +165,7 @@ impl Path {
     #[inline]
     pub fn type_anchor(&self) -> Option<TypeRefId> {
         match self {
-            Path::Normal(path) => path.type_anchor(),
+            Path::Normal(path) => path.type_anchor,
             Path::LangItem(..) | Path::BarePath(_) => None,
         }
     }
@@ -159,7 +173,7 @@ impl Path {
     #[inline]
     pub fn generic_args(&self) -> Option<&[Option<GenericArgs>]> {
         match self {
-            Path::Normal(path) => Some(path.generic_args()),
+            Path::Normal(path) => Some(&path.generic_args),
             Path::LangItem(..) | Path::BarePath(_) => None,
         }
     }
@@ -170,8 +184,8 @@ impl Path {
                 PathSegments { segments: mod_path.segments(), generic_args: None }
             }
             Path::Normal(path) => PathSegments {
-                segments: path.mod_path().segments(),
-                generic_args: Some(path.generic_args()),
+                segments: path.mod_path.segments(),
+                generic_args: Some(&path.generic_args),
             },
             Path::LangItem(_, seg) => PathSegments { segments: seg.as_slice(), generic_args: None },
         }
@@ -180,7 +194,7 @@ impl Path {
     pub fn mod_path(&self) -> Option<&ModPath> {
         match self {
             Path::BarePath(mod_path) => Some(mod_path),
-            Path::Normal(path) => Some(path.mod_path()),
+            Path::Normal(path) => Some(&path.mod_path),
             Path::LangItem(..) => None,
         }
     }
@@ -197,22 +211,26 @@ impl Path {
                 ))))
             }
             Path::Normal(path) => {
-                let mod_path = path.mod_path();
+                let mod_path = &path.mod_path;
                 if mod_path.is_ident() {
                     return None;
                 }
-                let type_anchor = path.type_anchor();
-                let generic_args = path.generic_args();
+                let type_anchor = path.type_anchor;
+                let generic_args = &path.generic_args;
                 let qualifier_mod_path = Interned::new(ModPath::from_segments(
                     mod_path.kind,
                     mod_path.segments()[..mod_path.segments().len() - 1].iter().cloned(),
                 ));
                 let qualifier_generic_args = &generic_args[..generic_args.len() - 1];
-                Some(Path::Normal(NormalPath::new(
-                    type_anchor,
-                    qualifier_mod_path,
-                    qualifier_generic_args.iter().cloned(),
-                )))
+                if type_anchor.is_none() && qualifier_generic_args.iter().all(|it| it.is_none()) {
+                    Some(Path::BarePath(qualifier_mod_path))
+                } else {
+                    Some(Path::Normal(Box::new(NormalPath {
+                        type_anchor,
+                        mod_path: qualifier_mod_path,
+                        generic_args: qualifier_generic_args.iter().cloned().collect(),
+                    })))
+                }
             }
             Path::LangItem(..) => None,
         }
@@ -222,9 +240,9 @@ impl Path {
         match self {
             Path::BarePath(mod_path) => mod_path.is_Self(),
             Path::Normal(path) => {
-                path.type_anchor().is_none()
-                    && path.mod_path().is_Self()
-                    && path.generic_args().iter().all(|args| args.is_none())
+                path.type_anchor.is_none()
+                    && path.mod_path.is_Self()
+                    && path.generic_args.iter().all(|args| args.is_none())
             }
             Path::LangItem(..) => false,
         }
@@ -322,7 +340,16 @@ impl GenericArgs {
             args: Box::default(),
             has_self_type: false,
             bindings: Box::default(),
-            desugared_from_fn: false,
+            parenthesized: GenericArgsParentheses::No,
+        }
+    }
+
+    pub(crate) fn return_type_notation() -> GenericArgs {
+        GenericArgs {
+            args: Box::default(),
+            has_self_type: false,
+            bindings: Box::default(),
+            parenthesized: GenericArgsParentheses::ReturnTypeNotation,
         }
     }
 }

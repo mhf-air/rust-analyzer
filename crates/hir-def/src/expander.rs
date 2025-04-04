@@ -2,26 +2,24 @@
 
 use std::cell::OnceCell;
 
-use base_db::CrateId;
+use base_db::Crate;
 use cfg::CfgOptions;
 use drop_bomb::DropBomb;
 use hir_expand::{
-    attrs::RawAttrs, mod_path::ModPath, span_map::SpanMap, ExpandError, ExpandErrorKind,
-    ExpandResult, HirFileId, InFile, Lookup, MacroCallId,
+    ExpandError, ExpandErrorKind, ExpandResult, HirFileId, InFile, Lookup, MacroCallId,
+    attrs::RawAttrs, mod_path::ModPath, span_map::SpanMap,
 };
-use span::{Edition, SyntaxContextId};
-use syntax::{ast, Parse};
-use triomphe::Arc;
+use span::{Edition, SyntaxContext};
+use syntax::{Parse, ast};
 
 use crate::type_ref::{TypesMap, TypesSourceMap};
 use crate::{
-    attr::Attrs, db::DefDatabase, lower::LowerCtx, path::Path, AsMacroCall, MacroId, ModuleId,
-    UnresolvedMacro,
+    AsMacroCall, MacroId, ModuleId, UnresolvedMacro, attr::Attrs, db::DefDatabase, lower::LowerCtx,
+    path::Path,
 };
 
 #[derive(Debug)]
 pub struct Expander {
-    cfg_options: Arc<CfgOptions>,
     span_map: OnceCell<SpanMap>,
     current_file_id: HirFileId,
     pub(crate) module: ModuleId,
@@ -44,7 +42,6 @@ impl Expander {
             module,
             recursion_depth: 0,
             recursion_limit,
-            cfg_options: db.crate_graph()[module.krate].cfg_options.clone(),
             span_map: OnceCell::new(),
         }
     }
@@ -53,13 +50,13 @@ impl Expander {
         self.span_map.get_or_init(|| db.span_map(self.current_file_id))
     }
 
-    pub fn krate(&self) -> CrateId {
+    pub fn krate(&self) -> Crate {
         self.module.krate
     }
 
-    pub fn syntax_context(&self) -> SyntaxContextId {
+    pub fn syntax_context(&self) -> SyntaxContext {
         // FIXME:
-        SyntaxContextId::root(Edition::CURRENT)
+        SyntaxContext::root(Edition::CURRENT_FIXME)
     }
 
     pub fn enter_expand<T: ast::AstNode>(
@@ -84,11 +81,7 @@ impl Expander {
             }
         });
 
-        if let Some(err) = unresolved_macro_err {
-            Err(err)
-        } else {
-            Ok(result)
-        }
+        if let Some(err) = unresolved_macro_err { Err(err) } else { Ok(result) }
     }
 
     pub fn enter_expand_id<T: ast::AstNode>(
@@ -145,8 +138,8 @@ impl Expander {
         )
     }
 
-    pub(crate) fn cfg_options(&self) -> &CfgOptions {
-        &self.cfg_options
+    pub(crate) fn cfg_options<'db>(&self, db: &'db dyn DefDatabase) -> &'db CfgOptions {
+        self.module.krate.cfg_options(db)
     }
 
     pub fn current_file_id(&self) -> HirFileId {

@@ -1,9 +1,11 @@
 //! MIR lowering for patterns
 
-use hir_def::{hir::ExprId, AssocItemId};
+use hir_def::{AssocItemId, hir::ExprId};
 
 use crate::{
+    BindingMode,
     mir::{
+        LocalId, MutBorrowKind,
         lower::{
             BasicBlockId, BinOp, BindingId, BorrowKind, Either, Expr, FieldId, Idx, Interner,
             MemoryMap, MirLowerCtx, MirLowerError, MirSpan, Mutability, Operand, Pat, PatId, Place,
@@ -11,9 +13,7 @@ use crate::{
             Substitution, SwitchTargets, TerminatorKind, TupleFieldId, TupleId, TyBuilder, TyKind,
             ValueNs, VariantData, VariantId,
         },
-        LocalId, MutBorrowKind,
     },
-    BindingMode,
 };
 
 macro_rules! not_supported {
@@ -139,7 +139,7 @@ impl MirLowerCtx<'_> {
                     _ => {
                         return Err(MirLowerError::TypeError(
                             "non tuple type matched with tuple pattern",
-                        ))
+                        ));
                     }
                 };
                 self.pattern_match_tuple_like(
@@ -350,7 +350,12 @@ impl MirLowerCtx<'_> {
                 )?,
                 None => {
                     let unresolved_name = || {
-                        MirLowerError::unresolved_path(self.db, p, self.edition(), &self.body.types)
+                        MirLowerError::unresolved_path(
+                            self.db,
+                            p,
+                            self.display_target(),
+                            &self.body.types,
+                        )
                     };
                     let hygiene = self.body.pat_path_hygiene(pattern);
                     let pr = self
@@ -592,7 +597,7 @@ impl MirLowerCtx<'_> {
                 }
                 self.pattern_matching_variant_fields(
                     shape,
-                    &self.db.enum_variant_data(v).variant_data,
+                    &self.db.variant_data(v.into()),
                     variant,
                     current,
                     current_else,
@@ -602,7 +607,7 @@ impl MirLowerCtx<'_> {
             }
             VariantId::StructId(s) => self.pattern_matching_variant_fields(
                 shape,
-                &self.db.struct_data(s).variant_data,
+                &self.db.variant_data(s.into()),
                 variant,
                 current,
                 current_else,
@@ -610,7 +615,7 @@ impl MirLowerCtx<'_> {
                 mode,
             )?,
             VariantId::UnionId(_) => {
-                return Err(MirLowerError::TypeError("pattern matching on union"))
+                return Err(MirLowerError::TypeError("pattern matching on union"));
             }
         })
     }

@@ -7,18 +7,17 @@ use ide_db::{
     helpers::mod_path_to_ast,
     imports::import_assets::{ImportCandidate, LocatedImport},
 };
-use syntax::ast::HasGenericArgs;
 use syntax::Edition;
+use syntax::ast::HasGenericArgs;
 use syntax::{
-    ast,
-    ast::{make, HasArgList},
-    AstNode, NodeOrToken,
+    AstNode, NodeOrToken, ast,
+    ast::{HasArgList, make},
 };
 
 use crate::{
+    AssistId, GroupLabel,
     assist_context::{AssistContext, Assists},
     handlers::auto_import::find_importable_node,
-    AssistId, AssistKind, GroupLabel,
 };
 
 // Assist: qualify_path
@@ -105,7 +104,7 @@ pub(crate) fn qualify_path(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option
     for import in proposed_imports {
         acc.add_group(
             &group_label,
-            AssistId("qualify_path", AssistKind::QuickFix),
+            AssistId::quick_fix("qualify_path"),
             label(ctx.db(), candidate, &import, current_edition),
             range,
             |builder| {

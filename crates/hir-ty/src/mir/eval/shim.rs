@@ -10,18 +10,19 @@ use hir_def::{
     resolver::HasResolver,
 };
 use hir_expand::name::Name;
-use intern::{sym, Symbol};
+use intern::{Symbol, sym};
 use stdx::never;
 
 use crate::{
+    DropGlue,
+    display::DisplayTarget,
     error_lifetime,
     mir::eval::{
-        pad16, Address, AdtId, Arc, BuiltinType, Evaluator, FunctionId, HasModule, HirDisplay,
+        Address, AdtId, Arc, BuiltinType, Evaluator, FunctionId, HasModule, HirDisplay,
         InternedClosure, Interner, Interval, IntervalAndTy, IntervalOrOwned, ItemContainerId,
         LangItem, Layout, Locals, Lookup, MirEvalError, MirSpan, Mutability, Result, Substitution,
-        Ty, TyBuilder, TyExt,
+        Ty, TyBuilder, TyExt, pad16,
     },
-    DropGlue,
 };
 
 mod simd;
@@ -568,7 +569,7 @@ impl Evaluator<'_> {
                     }
                     String::from_utf8_lossy(&name_buf)
                 };
-                let value = self.db.crate_graph()[self.crate_id].env.get(&name);
+                let value = self.crate_id.env(self.db).get(&name);
                 match value {
                     None => {
                         // Write null as fail
@@ -835,8 +836,7 @@ impl Evaluator<'_> {
                     // render full paths.
                     Err(_) => {
                         let krate = locals.body.owner.krate(self.db.upcast());
-                        let edition = self.db.crate_graph()[krate].edition;
-                        ty.display(self.db, edition).to_string()
+                        ty.display(self.db, DisplayTarget::from_crate(self.db, krate)).to_string()
                     }
                 };
                 let len = ty_name.len();
@@ -1261,7 +1261,7 @@ impl Evaluator<'_> {
                 if let Some(target) = self.db.lang_item(self.crate_id, LangItem::FnOnce) {
                     if let Some(def) = target.as_trait().and_then(|it| {
                         self.db
-                            .trait_data(it)
+                            .trait_items(it)
                             .method_by_name(&Name::new_symbol_root(sym::call_once.clone()))
                     }) {
                         self.exec_fn_trait(
@@ -1357,7 +1357,7 @@ impl Evaluator<'_> {
                     _ => {
                         return Err(MirEvalError::InternalError(
                             "three_way_compare expects an integral type".into(),
-                        ))
+                        ));
                     }
                 };
                 let rhs = rhs.get(self)?;

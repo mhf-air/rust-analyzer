@@ -1,17 +1,17 @@
 use chalk_ir::{AdtId, TyKind};
 use either::Either;
 use hir_def::db::DefDatabase;
-use project_model::{toolchain_info::QueryConfig, Sysroot};
+use project_model::{Sysroot, toolchain_info::QueryConfig};
 use rustc_hash::FxHashMap;
 use syntax::ToSmolStr;
 use test_fixture::WithFixture;
 use triomphe::Arc;
 
 use crate::{
+    Interner, Substitution,
     db::HirDatabase,
     layout::{Layout, LayoutError},
     test_db::TestDB,
-    Interner, Substitution,
 };
 
 mod closure;
@@ -285,6 +285,18 @@ fn repr_packed() {
 }
 
 #[test]
+fn multiple_repr_attrs() {
+    size_and_align!(
+        #[repr(C)]
+        #[repr(packed)]
+        struct Goal {
+            id: i32,
+            u: u8,
+        }
+    )
+}
+
+#[test]
 fn generic() {
     size_and_align! {
         struct Pair<A, B>(A, B);
@@ -342,7 +354,7 @@ fn simd_types() {
     check_size_and_align(
         r#"
             #[repr(simd)]
-            struct SimdType(i64, i64);
+            struct SimdType([i64; 2]);
             struct Goal(SimdType);
         "#,
         "",
@@ -466,6 +478,16 @@ fn tuple() {
     size_and_align! {
         struct Goal((), (i32, u64, bool));
     }
+}
+
+#[test]
+fn tuple_ptr_with_dst_tail() {
+    size_and_align!(
+        struct Goal(*const ([u8],));
+    );
+    size_and_align!(
+        struct Goal(*const (u128, [u8]));
+    );
 }
 
 #[test]

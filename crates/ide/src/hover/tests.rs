@@ -1,9 +1,9 @@
-use expect_test::{expect, Expect};
-use ide_db::{base_db::SourceDatabase, FileRange};
+use expect_test::{Expect, expect};
+use ide_db::{FileRange, base_db::SourceDatabase};
 use syntax::TextRange;
 
 use crate::{
-    fixture, HoverConfig, HoverDocFormat, MemoryLayoutHoverConfig, MemoryLayoutHoverRenderKind,
+    HoverConfig, HoverDocFormat, MemoryLayoutHoverConfig, MemoryLayoutHoverRenderKind, fixture,
 };
 
 const HOVER_BASE_CONFIG: HoverConfig = HoverConfig {
@@ -47,7 +47,7 @@ fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
         .unwrap();
 
     let content = analysis.db.file_text(position.file_id);
-    let hovered_element = &content[hover.range];
+    let hovered_element = &content.text(&analysis.db)[hover.range];
 
     let actual = format!("*{hovered_element}*\n{}\n", hover.info.markup);
     expect.assert_eq(&actual)
@@ -72,7 +72,7 @@ fn check_hover_fields_limit(
         .unwrap()
         .unwrap();
 
-    let content = analysis.db.file_text(position.file_id);
+    let content = analysis.db.file_text(position.file_id).text(&analysis.db);
     let hovered_element = &content[hover.range];
 
     let actual = format!("*{hovered_element}*\n{}\n", hover.info.markup);
@@ -98,7 +98,7 @@ fn check_hover_enum_variants_limit(
         .unwrap()
         .unwrap();
 
-    let content = analysis.db.file_text(position.file_id);
+    let content = analysis.db.file_text(position.file_id).text(&analysis.db);
     let hovered_element = &content[hover.range];
 
     let actual = format!("*{hovered_element}*\n{}\n", hover.info.markup);
@@ -124,7 +124,7 @@ fn check_assoc_count(
         .unwrap()
         .unwrap();
 
-    let content = analysis.db.file_text(position.file_id);
+    let content = analysis.db.file_text(position.file_id).text(&analysis.db);
     let hovered_element = &content[hover.range];
 
     let actual = format!("*{hovered_element}*\n{}\n", hover.info.markup);
@@ -141,7 +141,7 @@ fn check_hover_no_links(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect:
         .unwrap()
         .unwrap();
 
-    let content = analysis.db.file_text(position.file_id);
+    let content = analysis.db.file_text(position.file_id).text(&analysis.db);
     let hovered_element = &content[hover.range];
 
     let actual = format!("*{hovered_element}*\n{}\n", hover.info.markup);
@@ -158,7 +158,7 @@ fn check_hover_no_memory_layout(#[rust_analyzer::rust_fixture] ra_fixture: &str,
         .unwrap()
         .unwrap();
 
-    let content = analysis.db.file_text(position.file_id);
+    let content = analysis.db.file_text(position.file_id).text(&analysis.db);
     let hovered_element = &content[hover.range];
 
     let actual = format!("*{hovered_element}*\n{}\n", hover.info.markup);
@@ -179,7 +179,7 @@ fn check_hover_no_markdown(#[rust_analyzer::rust_fixture] ra_fixture: &str, expe
         .unwrap()
         .unwrap();
 
-    let content = analysis.db.file_text(position.file_id);
+    let content = analysis.db.file_text(position.file_id).text(&analysis.db);
     let hovered_element = &content[hover.range];
 
     let actual = format!("*{hovered_element}*\n{}\n", hover.info.markup);
@@ -2089,6 +2089,10 @@ impl Thing {
                 x: u32,
             }
             ```
+
+            ---
+
+            size = 4, align = 4
         "#]],
     );
     check_hover_fields_limit(
@@ -2109,6 +2113,10 @@ impl Thing {
             ```rust
             struct Thing
             ```
+
+            ---
+
+            size = 4, align = 4
         "#]],
     );
     check(
@@ -2130,6 +2138,10 @@ impl Thing {
                 x: u32,
             }
             ```
+
+            ---
+
+            size = 4, align = 4
         "#]],
     );
     check(
@@ -2151,6 +2163,10 @@ impl Thing {
                 A,
             }
             ```
+
+            ---
+
+            size = 0, align = 1
         "#]],
     );
     check(
@@ -2172,6 +2188,10 @@ impl Thing {
                 A,
             }
             ```
+
+            ---
+
+            size = 0, align = 1
         "#]],
     );
     check(
@@ -2190,6 +2210,10 @@ impl usize {
             ```rust
             usize
             ```
+
+            ---
+
+            size = 8, align = 8
         "#]],
     );
     check(
@@ -2208,6 +2232,36 @@ impl fn() -> usize {
             ```rust
             fn() -> usize
             ```
+
+            ---
+
+            size = 8, align = 8, niches = 1
+        "#]],
+    );
+    check(
+        r#"
+pub struct Foo
+where
+    Self$0:;
+"#,
+        expect![[r#"
+            *Self*
+
+            ```rust
+            ra_test_fixture
+            ```
+
+            ```rust
+            pub struct Foo
+            ```
+
+            ---
+
+            size = 0, align = 1
+
+            ---
+
+            does not contain types with destructors (drop glue); doesn't have a destructor
         "#]],
     );
 }
@@ -9252,7 +9306,7 @@ fn main() {
             S
             ```
             ___
-            Implements notable traits: Notable, Future<Output = u32>, Iterator<Item = S>"#]],
+            Implements notable traits: Future<Output = u32>, Iterator<Item = S>, Notable"#]],
     );
 }
 
@@ -10944,6 +10998,45 @@ pub struct ManuallyDrop$0<T: ?Sized> {
             ---
 
             does not contain types with destructors (drop glue); doesn't have a destructor
+        "#]],
+    );
+}
+
+#[test]
+fn projection_const() {
+    // This uses two crates, which have *no* relation between them, to test another thing:
+    // `render_const_scalar()` used to just use the last crate for the trait env, which will
+    // fail in this scenario.
+    check(
+        r#"
+//- /foo.rs crate:foo
+pub trait PublicFlags {
+    type Internal;
+}
+
+pub struct NoteDialects(<NoteDialects as PublicFlags>::Internal);
+
+impl NoteDialects {
+    pub const CLAP$0: Self = Self(InternalBitFlags);
+}
+
+pub struct InternalBitFlags;
+
+impl PublicFlags for NoteDialects {
+    type Internal = InternalBitFlags;
+}
+//- /bar.rs crate:bar
+    "#,
+        expect![[r#"
+            *CLAP*
+
+            ```rust
+            foo::NoteDialects
+            ```
+
+            ```rust
+            pub const CLAP: Self = NoteDialects(InternalBitFlags)
+            ```
         "#]],
     );
 }

@@ -2,23 +2,22 @@
 
 use either::Either;
 use hir_def::{
+    AdtId, AssocItemId, Complete, DefWithBodyId, ExternCrateId, HasModule, ImplId, Lookup, MacroId,
+    ModuleDefId, ModuleId, TraitId,
     db::DefDatabase,
     item_scope::{ImportId, ImportOrExternCrate, ImportOrGlob},
     per_ns::Item,
     src::{HasChildSource, HasSource},
     visibility::{Visibility, VisibilityExplicitness},
-    AdtId, AssocItemId, DefWithBodyId, ExternCrateId, HasModule, ImplId, Lookup, MacroId,
-    ModuleDefId, ModuleId, TraitId,
 };
-use hir_expand::{name::Name, HirFileId};
+use hir_expand::{HirFileId, name::Name};
 use hir_ty::{
     db::HirDatabase,
-    display::{hir_display_with_types_map, HirDisplay},
+    display::{DisplayTarget, HirDisplay, hir_display_with_types_map},
 };
 use intern::Symbol;
 use rustc_hash::FxHashMap;
-use span::Edition;
-use syntax::{ast::HasName, AstNode, AstPtr, SmolStr, SyntaxNode, SyntaxNodePtr, ToSmolStr};
+use syntax::{AstNode, AstPtr, SmolStr, SyntaxNode, SyntaxNodePtr, ToSmolStr, ast::HasName};
 
 use crate::{Module, ModuleDef, Semantics};
 
@@ -35,6 +34,7 @@ pub struct FileSymbol {
     /// Whether this symbol is a doc alias for the original symbol.
     pub is_alias: bool,
     pub is_assoc: bool,
+    pub do_not_complete: Complete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -66,7 +66,7 @@ pub struct SymbolCollector<'a> {
     symbols: FxIndexSet<FileSymbol>,
     work: Vec<SymbolCollectorWork>,
     current_container_name: Option<SmolStr>,
-    edition: Edition,
+    display_target: DisplayTarget,
 }
 
 /// Given a [`ModuleId`] and a [`HirDatabase`], use the DefMap for the module's crate to collect
@@ -78,7 +78,10 @@ impl<'a> SymbolCollector<'a> {
             symbols: Default::default(),
             work: Default::default(),
             current_container_name: None,
-            edition: Edition::Edition2015,
+            display_target: DisplayTarget::from_crate(
+                db,
+                *db.all_crates().last().expect("no crate graph present"),
+            ),
         }
     }
 
@@ -91,7 +94,7 @@ impl<'a> SymbolCollector<'a> {
     pub fn collect(&mut self, module: Module) {
         let _p = tracing::info_span!("SymbolCollector::collect", ?module).entered();
         tracing::info!(?module, "SymbolCollector::collect",);
-        self.edition = module.krate().edition(self.db);
+        self.display_target = module.krate().to_display_target(self.db);
 
         // The initial work is the root module we're collecting, additional work will
         // be populated as we traverse the module's definitions.
@@ -109,7 +112,7 @@ impl<'a> SymbolCollector<'a> {
     fn do_work(&mut self, work: SymbolCollectorWork) {
         let _p = tracing::info_span!("SymbolCollector::do_work", ?work).entered();
         tracing::info!(?work, "SymbolCollector::do_work");
-        self.db.unwind_if_cancelled();
+        self.db.unwind_if_revision_cancelled();
 
         let parent_name = work.parent.map(|name| name.as_str().to_smolstr());
         self.with_container_name(parent_name, |s| s.collect_from_module(work.module_id));
@@ -120,35 +123,43 @@ impl<'a> SymbolCollector<'a> {
             match def {
                 ModuleDefId::ModuleId(id) => this.push_module(id, name),
                 ModuleDefId::FunctionId(id) => {
-                    this.push_decl(id, name, false);
+                    this.push_decl(id, name, false, None);
                     this.collect_from_body(id, Some(name.clone()));
                 }
-                ModuleDefId::AdtId(AdtId::StructId(id)) => this.push_decl(id, name, false),
-                ModuleDefId::AdtId(AdtId::EnumId(id)) => this.push_decl(id, name, false),
-                ModuleDefId::AdtId(AdtId::UnionId(id)) => this.push_decl(id, name, false),
+                ModuleDefId::AdtId(AdtId::StructId(id)) => {
+                    this.push_decl(id, name, false, None);
+                }
+                ModuleDefId::AdtId(AdtId::EnumId(id)) => {
+                    this.push_decl(id, name, false, None);
+                }
+                ModuleDefId::AdtId(AdtId::UnionId(id)) => {
+                    this.push_decl(id, name, false, None);
+                }
                 ModuleDefId::ConstId(id) => {
-                    this.push_decl(id, name, false);
+                    this.push_decl(id, name, false, None);
                     this.collect_from_body(id, Some(name.clone()));
                 }
                 ModuleDefId::StaticId(id) => {
-                    this.push_decl(id, name, false);
+                    this.push_decl(id, name, false, None);
                     this.collect_from_body(id, Some(name.clone()));
                 }
                 ModuleDefId::TraitId(id) => {
-                    this.push_decl(id, name, false);
-                    this.collect_from_trait(id);
+                    let trait_do_not_complete = this.push_decl(id, name, false, None);
+                    this.collect_from_trait(id, trait_do_not_complete);
                 }
                 ModuleDefId::TraitAliasId(id) => {
-                    this.push_decl(id, name, false);
+                    this.push_decl(id, name, false, None);
                 }
                 ModuleDefId::TypeAliasId(id) => {
-                    this.push_decl(id, name, false);
+                    this.push_decl(id, name, false, None);
                 }
-                ModuleDefId::MacroId(id) => match id {
-                    MacroId::Macro2Id(id) => this.push_decl(id, name, false),
-                    MacroId::MacroRulesId(id) => this.push_decl(id, name, false),
-                    MacroId::ProcMacroId(id) => this.push_decl(id, name, false),
-                },
+                ModuleDefId::MacroId(id) => {
+                    match id {
+                        MacroId::Macro2Id(id) => this.push_decl(id, name, false, None),
+                        MacroId::MacroRulesId(id) => this.push_decl(id, name, false, None),
+                        MacroId::ProcMacroId(id) => this.push_decl(id, name, false, None),
+                    };
+                }
                 // Don't index these.
                 ModuleDefId::BuiltinType(_) => {}
                 ModuleDefId::EnumVariantId(_) => {}
@@ -192,6 +203,7 @@ impl<'a> SymbolCollector<'a> {
                 loc: dec_loc,
                 is_alias: false,
                 is_assoc: false,
+                do_not_complete: Complete::Yes,
             });
         };
 
@@ -221,6 +233,7 @@ impl<'a> SymbolCollector<'a> {
                     loc: dec_loc,
                     is_alias: false,
                     is_assoc: false,
+                    do_not_complete: Complete::Yes,
                 });
             };
 
@@ -279,10 +292,10 @@ impl<'a> SymbolCollector<'a> {
             for &id in id {
                 if id.module(self.db.upcast()) == module_id {
                     match id {
-                        MacroId::Macro2Id(id) => self.push_decl(id, name, false),
-                        MacroId::MacroRulesId(id) => self.push_decl(id, name, false),
-                        MacroId::ProcMacroId(id) => self.push_decl(id, name, false),
-                    }
+                        MacroId::Macro2Id(id) => self.push_decl(id, name, false, None),
+                        MacroId::MacroRulesId(id) => self.push_decl(id, name, false, None),
+                        MacroId::ProcMacroId(id) => self.push_decl(id, name, false, None),
+                    };
                 }
             }
         }
@@ -307,21 +320,21 @@ impl<'a> SymbolCollector<'a> {
         let impl_data = self.db.impl_data(impl_id);
         let impl_name = Some(
             hir_display_with_types_map(impl_data.self_ty, &impl_data.types_map)
-                .display(self.db, self.edition)
+                .display(self.db, self.display_target)
                 .to_smolstr(),
         );
         self.with_container_name(impl_name, |s| {
-            for &(ref name, assoc_item_id) in &impl_data.items {
-                s.push_assoc_item(assoc_item_id, name)
+            for &(ref name, assoc_item_id) in &self.db.impl_items(impl_id).items {
+                s.push_assoc_item(assoc_item_id, name, None)
             }
         })
     }
 
-    fn collect_from_trait(&mut self, trait_id: TraitId) {
+    fn collect_from_trait(&mut self, trait_id: TraitId, trait_do_not_complete: Complete) {
         let trait_data = self.db.trait_data(trait_id);
         self.with_container_name(Some(trait_data.name.as_str().into()), |s| {
-            for &(ref name, assoc_item_id) in &trait_data.items {
-                s.push_assoc_item(assoc_item_id, name);
+            for &(ref name, assoc_item_id) in &self.db.trait_items(trait_id).items {
+                s.push_assoc_item(assoc_item_id, name, Some(trait_do_not_complete));
             }
         });
     }
@@ -336,23 +349,34 @@ impl<'a> SymbolCollector<'a> {
         }
     }
 
-    fn push_assoc_item(&mut self, assoc_item_id: AssocItemId, name: &Name) {
+    fn push_assoc_item(
+        &mut self,
+        assoc_item_id: AssocItemId,
+        name: &Name,
+        trait_do_not_complete: Option<Complete>,
+    ) {
         match assoc_item_id {
-            AssocItemId::FunctionId(id) => self.push_decl(id, name, true),
-            AssocItemId::ConstId(id) => self.push_decl(id, name, true),
-            AssocItemId::TypeAliasId(id) => self.push_decl(id, name, true),
-        }
+            AssocItemId::FunctionId(id) => self.push_decl(id, name, true, trait_do_not_complete),
+            AssocItemId::ConstId(id) => self.push_decl(id, name, true, trait_do_not_complete),
+            AssocItemId::TypeAliasId(id) => self.push_decl(id, name, true, trait_do_not_complete),
+        };
     }
 
-    fn push_decl<'db, L>(&mut self, id: L, name: &Name, is_assoc: bool)
+    fn push_decl<L>(
+        &mut self,
+        id: L,
+        name: &Name,
+        is_assoc: bool,
+        trait_do_not_complete: Option<Complete>,
+    ) -> Complete
     where
-        L: Lookup<Database<'db> = dyn DefDatabase + 'db> + Into<ModuleDefId>,
+        L: Lookup<Database = dyn DefDatabase> + Into<ModuleDefId>,
         <L as Lookup>::Data: HasSource,
         <<L as Lookup>::Data as HasSource>::Value: HasName,
     {
         let loc = id.lookup(self.db.upcast());
         let source = loc.source(self.db.upcast());
-        let Some(name_node) = source.value.name() else { return };
+        let Some(name_node) = source.value.name() else { return Complete::Yes };
         let def = ModuleDef::from(id.into());
         let dec_loc = DeclarationLocation {
             hir_file_id: source.file_id,
@@ -360,7 +384,14 @@ impl<'a> SymbolCollector<'a> {
             name_ptr: AstPtr::new(&name_node).wrap_left(),
         };
 
+        let mut do_not_complete = Complete::Yes;
+
         if let Some(attrs) = def.attrs(self.db) {
+            do_not_complete = Complete::extract(matches!(def, ModuleDef::Trait(_)), &attrs);
+            if let Some(trait_do_not_complete) = trait_do_not_complete {
+                do_not_complete = Complete::for_trait_item(trait_do_not_complete, do_not_complete);
+            }
+
             for alias in attrs.doc_aliases() {
                 self.symbols.insert(FileSymbol {
                     name: alias.clone(),
@@ -369,6 +400,7 @@ impl<'a> SymbolCollector<'a> {
                     container_name: self.current_container_name.clone(),
                     is_alias: true,
                     is_assoc,
+                    do_not_complete,
                 });
             }
         }
@@ -380,7 +412,10 @@ impl<'a> SymbolCollector<'a> {
             loc: dec_loc,
             is_alias: false,
             is_assoc,
+            do_not_complete,
         });
+
+        do_not_complete
     }
 
     fn push_module(&mut self, module_id: ModuleId, name: &Name) {
@@ -397,7 +432,10 @@ impl<'a> SymbolCollector<'a> {
 
         let def = ModuleDef::Module(module_id.into());
 
+        let mut do_not_complete = Complete::Yes;
         if let Some(attrs) = def.attrs(self.db) {
+            do_not_complete = Complete::extract(matches!(def, ModuleDef::Trait(_)), &attrs);
+
             for alias in attrs.doc_aliases() {
                 self.symbols.insert(FileSymbol {
                     name: alias.clone(),
@@ -406,6 +444,7 @@ impl<'a> SymbolCollector<'a> {
                     container_name: self.current_container_name.clone(),
                     is_alias: true,
                     is_assoc: false,
+                    do_not_complete,
                 });
             }
         }
@@ -417,6 +456,7 @@ impl<'a> SymbolCollector<'a> {
             loc: dec_loc,
             is_alias: false,
             is_assoc: false,
+            do_not_complete,
         });
     }
 }

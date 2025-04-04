@@ -1,10 +1,10 @@
 use syntax::{
+    AstNode, SyntaxKind, T,
     ast::{self, syntax_factory::SyntaxFactory},
     syntax_editor::Position,
-    AstNode, SyntaxKind, T,
 };
 
-use crate::{AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: remove_parentheses
 //
@@ -40,7 +40,7 @@ pub(crate) fn remove_parentheses(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
 
     let target = parens.syntax().text_range();
     acc.add(
-        AssistId("remove_parentheses", AssistKind::Refactor),
+        AssistId::refactor("remove_parentheses"),
         "Remove redundant parentheses",
         target,
         |builder| {

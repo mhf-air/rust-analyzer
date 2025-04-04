@@ -1,13 +1,13 @@
 //! Type cast logic. Basically coercion + additional casts.
 
 use chalk_ir::{Mutability, Scalar, TyVariableKind, UintTy};
-use hir_def::{hir::ExprId, AdtId};
+use hir_def::{AdtId, hir::ExprId};
 use stdx::never;
 
 use crate::{
-    infer::{coerce::CoerceNever, unify::InferenceTable},
     Adjustment, Binders, DynTy, InferenceDiagnostic, Interner, PlaceholderIndex,
     QuantifiedWhereClauses, Ty, TyExt, TyKind, TypeFlags, WhereClause,
+    infer::{coerce::CoerceNever, unify::InferenceTable},
 };
 
 #[derive(Debug)]
@@ -43,7 +43,7 @@ impl CastTy {
                 let (AdtId::EnumId(id), _) = t.as_adt()? else {
                     return None;
                 };
-                let enum_data = table.db.enum_data(id);
+                let enum_data = table.db.enum_variants(id);
                 if enum_data.is_payload_free(table.db.upcast()) {
                     Some(Self::Int(Int::CEnum))
                 } else {
@@ -389,8 +389,8 @@ fn pointer_kind(ty: &Ty, table: &mut InferenceTable<'_>) -> Result<Option<Pointe
                 return Err(());
             };
 
-            let struct_data = table.db.struct_data(id);
-            if let Some((last_field, _)) = struct_data.variant_data.fields().iter().last() {
+            let struct_data = table.db.variant_data(id.into());
+            if let Some((last_field, _)) = struct_data.fields().iter().last() {
                 let last_field_ty =
                     table.db.field_types(id.into())[last_field].clone().substitute(Interner, subst);
                 pointer_kind(&last_field_ty, table)
@@ -431,8 +431,8 @@ fn contains_dyn_trait(ty: &Ty) -> bool {
     use std::ops::ControlFlow;
 
     use chalk_ir::{
-        visit::{TypeSuperVisitable, TypeVisitable, TypeVisitor},
         DebruijnIndex,
+        visit::{TypeSuperVisitable, TypeVisitable, TypeVisitor},
     };
 
     struct DynTraitVisitor;

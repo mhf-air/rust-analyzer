@@ -3,10 +3,10 @@ mod generated;
 use expect_test::expect;
 use hir::{FileRange, Semantics};
 use ide_db::{
-    base_db::{SourceDatabase, SourceRootDatabase},
+    EditionedFileId, RootDatabase, SnippetCap,
+    base_db::SourceDatabase,
     imports::insert_use::{ImportGranularity, InsertUseConfig},
     source_change::FileSystemEdit,
-    EditionedFileId, RootDatabase, SnippetCap,
 };
 use stdx::{format_to, trim_indent};
 use syntax::TextRange;
@@ -14,8 +14,8 @@ use test_fixture::WithFixture;
 use test_utils::{assert_eq_text, extract_offset};
 
 use crate::{
-    assists, handlers::Handler, Assist, AssistConfig, AssistContext, AssistKind,
-    AssistResolveStrategy, Assists, SingleResolve,
+    Assist, AssistConfig, AssistContext, AssistKind, AssistResolveStrategy, Assists, SingleResolve,
+    assists, handlers::Handler,
 };
 
 pub(crate) const TEST_CONFIG: AssistConfig = AssistConfig {
@@ -222,7 +222,7 @@ pub(crate) fn check_assist_unresolved(
 fn check_doc_test(assist_id: &str, before: &str, after: &str) {
     let after = trim_indent(after);
     let (db, file_id, selection) = RootDatabase::with_range_or_offset(before);
-    let before = db.file_text(file_id.file_id()).to_string();
+    let before = db.file_text(file_id.file_id()).text(&db).to_string();
     let frange = FileRange { file_id, range: selection.into() };
 
     let assist = assists(&db, &TEST_CONFIG, AssistResolveStrategy::All, frange.into())
@@ -281,7 +281,7 @@ fn check_with_config(
 ) {
     let (mut db, file_with_caret_id, range_or_offset) = RootDatabase::with_range_or_offset(before);
     db.enable_proc_attr_macros();
-    let text_without_caret = db.file_text(file_with_caret_id.into()).to_string();
+    let text_without_caret = db.file_text(file_with_caret_id.into()).text(&db).to_string();
 
     let frange = FileRange { file_id: file_with_caret_id, range: range_or_offset.into() };
 
@@ -311,14 +311,14 @@ fn check_with_config(
 
             let mut buf = String::new();
             for (file_id, (edit, snippet_edit)) in source_change.source_file_edits {
-                let mut text = db.file_text(file_id).as_ref().to_owned();
+                let mut text = db.file_text(file_id).text(&db).as_ref().to_owned();
                 edit.apply(&mut text);
                 if let Some(snippet_edit) = snippet_edit {
                     snippet_edit.apply(&mut text);
                 }
                 if !skip_header {
-                    let sr = db.file_source_root(file_id);
-                    let sr = db.source_root(sr);
+                    let source_root_id = db.file_source_root(file_id).source_root_id(&db);
+                    let sr = db.source_root(source_root_id).source_root(&db);
                     let path = sr.path_for_file(&file_id).unwrap();
                     format_to!(buf, "//- {}\n", path)
                 }
@@ -329,15 +329,16 @@ fn check_with_config(
                 let (dst, contents) = match file_system_edit {
                     FileSystemEdit::CreateFile { dst, initial_contents } => (dst, initial_contents),
                     FileSystemEdit::MoveFile { src, dst } => {
-                        (dst, db.file_text(src).as_ref().to_owned())
+                        (dst, db.file_text(src).text(&db).as_ref().to_owned())
                     }
                     FileSystemEdit::MoveDir { src, src_id, dst } => {
                         // temporary placeholder for MoveDir since we are not using MoveDir in ide assists yet.
                         (dst, format!("{src_id:?}\n{src:?}"))
                     }
                 };
-                let sr = db.file_source_root(dst.anchor);
-                let sr = db.source_root(sr);
+
+                let source_root_id = db.file_source_root(dst.anchor).source_root_id(&db);
+                let sr = db.source_root(source_root_id).source_root(&db);
                 let mut base = sr.path_for_file(&dst.anchor).unwrap().clone();
                 base.pop();
                 let created_file_path = base.join(&dst.path).unwrap();
@@ -503,6 +504,7 @@ pub fn test_some_range(a: int) -> bool {
                 id: AssistId(
                     "extract_variable",
                     RefactorExtract,
+                    None,
                 ),
                 label: "Extract into variable",
                 group: Some(
@@ -523,6 +525,7 @@ pub fn test_some_range(a: int) -> bool {
                 id: AssistId(
                     "extract_constant",
                     RefactorExtract,
+                    None,
                 ),
                 label: "Extract into constant",
                 group: Some(
@@ -543,6 +546,7 @@ pub fn test_some_range(a: int) -> bool {
                 id: AssistId(
                     "extract_static",
                     RefactorExtract,
+                    None,
                 ),
                 label: "Extract into static",
                 group: Some(
@@ -563,6 +567,7 @@ pub fn test_some_range(a: int) -> bool {
                 id: AssistId(
                     "extract_function",
                     RefactorExtract,
+                    None,
                 ),
                 label: "Extract into function",
                 group: Some(
@@ -585,6 +590,7 @@ pub fn test_some_range(a: int) -> bool {
             AssistResolveStrategy::Single(SingleResolve {
                 assist_id: "SOMETHING_MISMATCHING".to_owned(),
                 assist_kind: AssistKind::RefactorExtract,
+                assist_subtype: None,
             }),
             frange.into(),
         );
@@ -597,6 +603,7 @@ pub fn test_some_range(a: int) -> bool {
                 id: AssistId(
                     "extract_variable",
                     RefactorExtract,
+                    None,
                 ),
                 label: "Extract into variable",
                 group: Some(
@@ -617,6 +624,7 @@ pub fn test_some_range(a: int) -> bool {
                 id: AssistId(
                     "extract_constant",
                     RefactorExtract,
+                    None,
                 ),
                 label: "Extract into constant",
                 group: Some(
@@ -637,6 +645,7 @@ pub fn test_some_range(a: int) -> bool {
                 id: AssistId(
                     "extract_static",
                     RefactorExtract,
+                    None,
                 ),
                 label: "Extract into static",
                 group: Some(
@@ -657,6 +666,7 @@ pub fn test_some_range(a: int) -> bool {
                 id: AssistId(
                     "extract_function",
                     RefactorExtract,
+                    None,
                 ),
                 label: "Extract into function",
                 group: Some(
@@ -679,6 +689,7 @@ pub fn test_some_range(a: int) -> bool {
             AssistResolveStrategy::Single(SingleResolve {
                 assist_id: "extract_variable".to_owned(),
                 assist_kind: AssistKind::RefactorExtract,
+                assist_subtype: None,
             }),
             frange.into(),
         );
@@ -691,6 +702,7 @@ pub fn test_some_range(a: int) -> bool {
                 id: AssistId(
                     "extract_variable",
                     RefactorExtract,
+                    None,
                 ),
                 label: "Extract into variable",
                 group: Some(
@@ -724,6 +736,7 @@ pub fn test_some_range(a: int) -> bool {
                                             delete: 82..108,
                                         },
                                     ],
+                                    annotation: None,
                                 },
                                 Some(
                                     SnippetEdit(
@@ -739,6 +752,8 @@ pub fn test_some_range(a: int) -> bool {
                         },
                         file_system_edits: [],
                         is_snippet: true,
+                        annotations: {},
+                        next_annotation_id: 0,
                     },
                 ),
                 command: Some(
@@ -754,6 +769,7 @@ pub fn test_some_range(a: int) -> bool {
                 id: AssistId(
                     "extract_constant",
                     RefactorExtract,
+                    None,
                 ),
                 label: "Extract into constant",
                 group: Some(
@@ -774,6 +790,7 @@ pub fn test_some_range(a: int) -> bool {
                 id: AssistId(
                     "extract_static",
                     RefactorExtract,
+                    None,
                 ),
                 label: "Extract into static",
                 group: Some(
@@ -794,6 +811,7 @@ pub fn test_some_range(a: int) -> bool {
                 id: AssistId(
                     "extract_function",
                     RefactorExtract,
+                    None,
                 ),
                 label: "Extract into function",
                 group: Some(
@@ -820,6 +838,7 @@ pub fn test_some_range(a: int) -> bool {
                 id: AssistId(
                     "extract_variable",
                     RefactorExtract,
+                    None,
                 ),
                 label: "Extract into variable",
                 group: Some(
@@ -853,6 +872,7 @@ pub fn test_some_range(a: int) -> bool {
                                             delete: 82..108,
                                         },
                                     ],
+                                    annotation: None,
                                 },
                                 Some(
                                     SnippetEdit(
@@ -868,6 +888,8 @@ pub fn test_some_range(a: int) -> bool {
                         },
                         file_system_edits: [],
                         is_snippet: true,
+                        annotations: {},
+                        next_annotation_id: 0,
                     },
                 ),
                 command: Some(
@@ -883,6 +905,7 @@ pub fn test_some_range(a: int) -> bool {
                 id: AssistId(
                     "extract_constant",
                     RefactorExtract,
+                    None,
                 ),
                 label: "Extract into constant",
                 group: Some(
@@ -920,6 +943,7 @@ pub fn test_some_range(a: int) -> bool {
                                             delete: 87..108,
                                         },
                                     ],
+                                    annotation: None,
                                 },
                                 Some(
                                     SnippetEdit(
@@ -935,6 +959,8 @@ pub fn test_some_range(a: int) -> bool {
                         },
                         file_system_edits: [],
                         is_snippet: true,
+                        annotations: {},
+                        next_annotation_id: 0,
                     },
                 ),
                 command: Some(
@@ -950,6 +976,7 @@ pub fn test_some_range(a: int) -> bool {
                 id: AssistId(
                     "extract_static",
                     RefactorExtract,
+                    None,
                 ),
                 label: "Extract into static",
                 group: Some(
@@ -987,6 +1014,7 @@ pub fn test_some_range(a: int) -> bool {
                                             delete: 87..108,
                                         },
                                     ],
+                                    annotation: None,
                                 },
                                 Some(
                                     SnippetEdit(
@@ -1002,6 +1030,8 @@ pub fn test_some_range(a: int) -> bool {
                         },
                         file_system_edits: [],
                         is_snippet: true,
+                        annotations: {},
+                        next_annotation_id: 0,
                     },
                 ),
                 command: Some(
@@ -1017,6 +1047,7 @@ pub fn test_some_range(a: int) -> bool {
                 id: AssistId(
                     "extract_function",
                     RefactorExtract,
+                    None,
                 ),
                 label: "Extract into function",
                 group: Some(
@@ -1042,6 +1073,7 @@ pub fn test_some_range(a: int) -> bool {
                                             delete: 110..110,
                                         },
                                     ],
+                                    annotation: None,
                                 },
                                 Some(
                                     SnippetEdit(
@@ -1057,6 +1089,8 @@ pub fn test_some_range(a: int) -> bool {
                         },
                         file_system_edits: [],
                         is_snippet: true,
+                        annotations: {},
+                        next_annotation_id: 0,
                     },
                 ),
                 command: None,

@@ -1,7 +1,7 @@
 mod block;
 
-use crate::{hir::MatchArm, test_db::TestDB, ModuleDefId};
-use expect_test::{expect, Expect};
+use crate::{ModuleDefId, hir::MatchArm, test_db::TestDB};
+use expect_test::{Expect, expect};
 use la_arena::RawIdx;
 use test_fixture::WithFixture;
 
@@ -216,7 +216,7 @@ fn main() {
                         8u32,
                         builtin#lang(Count::Implied),
                         builtin#lang(Count::Is)(
-                            2usize,
+                            2,
                         ),
                     ), builtin#lang(Placeholder::new)(
                         1usize,
@@ -293,7 +293,7 @@ impl SsrError {
     assert_eq!(db.body_with_source_map(def).1.diagnostics(), &[]);
     expect![[r#"
         fn main() -> () {
-            _ = $crate::error::SsrError::new(
+            _ = ra_test_fixture::error::SsrError::new(
                 builtin#lang(Arguments::new_v1_formatted)(
                     &[
                         "Failed to resolve path `", "`",
@@ -353,7 +353,7 @@ fn f(a: i32, b: u32) -> String {
     expect![[r#"
         fn f(a: i32, b: u32) -> String {
             {
-                $crate::panicking::panic_fmt(
+                core::panicking::panic_fmt(
                     builtin#lang(Arguments::new_v1_formatted)(
                         &[
                             "cc",

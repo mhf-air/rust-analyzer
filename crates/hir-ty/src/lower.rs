@@ -14,18 +14,21 @@ use std::{
     ops::{self, Not as _},
 };
 
-use base_db::{ra_salsa::Cycle, CrateId};
+use base_db::Crate;
 use chalk_ir::{
+    Mutability, Safety, TypeOutlives,
     cast::Cast,
     fold::{Shift, TypeFoldable},
     interner::HasInterner,
-    Mutability, Safety, TypeOutlives,
 };
 
 use either::Either;
 use hir_def::{
+    AdtId, AssocItemId, CallableDefId, ConstId, ConstParamId, DefWithBodyId, EnumId, EnumVariantId,
+    FunctionId, GenericDefId, GenericParamId, HasModule, ImplId, InTypeConstLoc, LocalFieldId,
+    Lookup, StaticId, StructId, TypeAliasId, TypeOrConstParamId, TypeOwnerId, UnionId, VariantId,
     builtin_type::BuiltinType,
-    data::{adt::StructKind, TraitFlags},
+    data::{TraitFlags, adt::StructKind},
     expander::Expander,
     generics::{
         GenericParamDataRef, TypeOrConstParamData, TypeParamProvenance, WherePredicate,
@@ -39,40 +42,37 @@ use hir_def::{
         ConstRef, LifetimeRef, PathId, TraitBoundModifier, TraitRef as HirTraitRef, TypeBound,
         TypeRef, TypeRefId, TypesMap, TypesSourceMap,
     },
-    AdtId, AssocItemId, CallableDefId, ConstId, ConstParamId, DefWithBodyId, EnumId, EnumVariantId,
-    FunctionId, GenericDefId, GenericParamId, HasModule, ImplId, InTypeConstLoc, LocalFieldId,
-    Lookup, StaticId, StructId, TypeAliasId, TypeOrConstParamId, TypeOwnerId, UnionId, VariantId,
 };
-use hir_expand::{name::Name, ExpandResult};
+use hir_expand::{ExpandResult, name::Name};
 use la_arena::{Arena, ArenaMap};
 use rustc_hash::FxHashSet;
 use rustc_pattern_analysis::Captures;
+use salsa::Cycle;
 use stdx::{impl_from, never};
 use syntax::ast;
 use triomphe::{Arc, ThinArc};
 
 use crate::{
-    all_super_traits,
+    AliasTy, Binders, BoundVar, CallableSig, Const, ConstScalar, DebruijnIndex, DynTy, FnAbi,
+    FnPointer, FnSig, FnSubst, ImplTrait, ImplTraitId, ImplTraits, Interner, Lifetime,
+    LifetimeData, LifetimeOutlives, ParamKind, PolyFnSig, ProgramClause, QuantifiedWhereClause,
+    QuantifiedWhereClauses, Substitution, TraitEnvironment, TraitRef, TraitRefExt, Ty, TyBuilder,
+    TyKind, WhereClause, all_super_traits,
     consteval::{
         intern_const_ref, intern_const_scalar, path_to_const, unknown_const,
         unknown_const_as_generic,
     },
-    db::HirDatabase,
+    db::{HirDatabase, HirDatabaseData},
     error_lifetime,
-    generics::{generics, trait_self_param_idx, Generics},
+    generics::{Generics, generics, trait_self_param_idx},
     lower::{
         diagnostics::*,
         path::{PathDiagnosticCallback, PathLoweringContext},
     },
     make_binders,
-    mapping::{from_chalk_trait_id, lt_to_placeholder_idx, ToChalk},
+    mapping::{ToChalk, from_chalk_trait_id, lt_to_placeholder_idx},
     static_lifetime, to_chalk_trait_id, to_placeholder_idx,
-    utils::{all_super_trait_refs, InTypeConstIdMetadata},
-    AliasTy, Binders, BoundVar, CallableSig, Const, ConstScalar, DebruijnIndex, DynTy, FnAbi,
-    FnPointer, FnSig, FnSubst, ImplTrait, ImplTraitId, ImplTraits, Interner, Lifetime,
-    LifetimeData, LifetimeOutlives, ParamKind, PolyFnSig, ProgramClause, QuantifiedWhereClause,
-    QuantifiedWhereClauses, Substitution, TraitEnvironment, TraitRef, TraitRefExt, Ty, TyBuilder,
-    TyKind, WhereClause,
+    utils::{InTypeConstIdMetadata, all_super_trait_refs},
 };
 
 #[derive(Debug, Default)]
@@ -318,15 +318,15 @@ impl<'a> TyLoweringContext<'a> {
                 let substs = self.with_shifted_in(DebruijnIndex::ONE, |ctx| {
                     Substitution::from_iter(
                         Interner,
-                        fn_.params().iter().map(|&(_, tr)| ctx.lower_ty(tr)),
+                        fn_.params.iter().map(|&(_, tr)| ctx.lower_ty(tr)),
                     )
                 });
                 TyKind::Function(FnPointer {
                     num_binders: 0, // FIXME lower `for<'a> fn()` correctly
                     sig: FnSig {
-                        abi: fn_.abi().as_ref().map_or(FnAbi::Rust, FnAbi::from_symbol),
-                        safety: if fn_.is_unsafe() { Safety::Unsafe } else { Safety::Safe },
-                        variadic: fn_.is_varargs(),
+                        abi: fn_.abi.as_ref().map_or(FnAbi::Rust, FnAbi::from_symbol),
+                        safety: if fn_.is_unsafe { Safety::Unsafe } else { Safety::Safe },
+                        variadic: fn_.is_varargs,
                     },
                     substitution: FnSubst(substs),
                 })
@@ -800,7 +800,7 @@ impl<'a> TyLoweringContext<'a> {
         }
     }
 
-    fn lower_impl_trait(&mut self, bounds: &[TypeBound], krate: CrateId) -> ImplTrait {
+    fn lower_impl_trait(&mut self, bounds: &[TypeBound], krate: Crate) -> ImplTrait {
         cov_mark::hit!(lower_rpit);
         let self_ty = TyKind::BoundVar(BoundVar::new(DebruijnIndex::INNERMOST, 0)).intern(Interner);
         let predicates = self.with_shifted_in(DebruijnIndex::ONE, |ctx| {
@@ -897,7 +897,7 @@ fn named_associated_type_shorthand_candidates<R>(
 ) -> Option<R> {
     let mut search = |t| {
         all_super_trait_refs(db, t, |t| {
-            let data = db.trait_data(t.hir_trait_id());
+            let data = db.trait_items(t.hir_trait_id());
 
             for (name, assoc_id) in &data.items {
                 if let AssocItemId::TypeAliasId(alias) = assoc_id {
@@ -1067,7 +1067,7 @@ pub(crate) fn generic_predicates_for_param_query(
                     };
 
                     all_super_traits(db.upcast(), tr).iter().any(|tr| {
-                        db.trait_data(*tr).items.iter().any(|(name, item)| {
+                        db.trait_items(*tr).items.iter().any(|(name, item)| {
                             matches!(item, AssocItemId::TypeAliasId(_)) && name == assoc_name
                         })
                     })
@@ -1111,10 +1111,11 @@ pub(crate) fn generic_predicates_for_param_query(
 
 pub(crate) fn generic_predicates_for_param_recover(
     _db: &dyn HirDatabase,
-    _cycle: &Cycle,
-    _def: &GenericDefId,
-    _param_id: &TypeOrConstParamId,
-    _assoc_name: &Option<Name>,
+    _cycle: &salsa::Cycle,
+    _: HirDatabaseData,
+    _def: GenericDefId,
+    _param_id: TypeOrConstParamId,
+    _assoc_name: Option<Name>,
 ) -> GenericPredicates {
     GenericPredicates(None)
 }
@@ -1271,6 +1272,7 @@ where
             );
         };
     }
+
     (
         GenericPredicates(predicates.is_empty().not().then(|| predicates.into())),
         create_diagnostics(ctx.diagnostics),
@@ -1298,11 +1300,7 @@ fn implicitly_sized_clauses<'a, 'subst: 'a>(
             .enumerate()
             .filter_map(
                 move |(idx, generic_arg)| {
-                    if Some(idx) == trait_self_idx {
-                        None
-                    } else {
-                        Some(generic_arg)
-                    }
+                    if Some(idx) == trait_self_idx { None } else { Some(generic_arg) }
                 },
             )
             .filter_map(|generic_arg| generic_arg.ty(Interner))
@@ -1414,9 +1412,9 @@ pub(crate) fn generic_defaults_with_diagnostics_query(
 pub(crate) fn generic_defaults_with_diagnostics_recover(
     db: &dyn HirDatabase,
     _cycle: &Cycle,
-    def: &GenericDefId,
+    def: GenericDefId,
 ) -> (GenericDefaults, Diagnostics) {
-    let generic_params = generics(db.upcast(), *def);
+    let generic_params = generics(db.upcast(), def);
     if generic_params.len() == 0 {
         return (GenericDefaults(None), None);
     }
@@ -1488,16 +1486,12 @@ fn type_for_static(db: &dyn HirDatabase, def: StaticId) -> Binders<Ty> {
 }
 
 fn fn_sig_for_struct_constructor(db: &dyn HirDatabase, def: StructId) -> PolyFnSig {
-    let struct_data = db.struct_data(def);
-    let fields = struct_data.variant_data.fields();
+    let struct_data = db.variant_data(def.into());
+    let fields = struct_data.fields();
     let resolver = def.resolver(db.upcast());
-    let mut ctx = TyLoweringContext::new(
-        db,
-        &resolver,
-        struct_data.variant_data.types_map(),
-        AdtId::from(def).into(),
-    )
-    .with_type_param_mode(ParamLoweringMode::Variable);
+    let mut ctx =
+        TyLoweringContext::new(db, &resolver, struct_data.types_map(), AdtId::from(def).into())
+            .with_type_param_mode(ParamLoweringMode::Variable);
     let params = fields.iter().map(|(_, field)| ctx.lower_ty(field.type_ref));
     let (ret, binders) = type_for_adt(db, def.into()).into_value_and_skipped_binders();
     Binders::new(
@@ -1508,8 +1502,8 @@ fn fn_sig_for_struct_constructor(db: &dyn HirDatabase, def: StructId) -> PolyFnS
 
 /// Build the type of a tuple struct constructor.
 fn type_for_struct_constructor(db: &dyn HirDatabase, def: StructId) -> Option<Binders<Ty>> {
-    let struct_data = db.struct_data(def);
-    match struct_data.variant_data.kind() {
+    let struct_data = db.variant_data(def.into());
+    match struct_data.kind() {
         StructKind::Record => None,
         StructKind::Unit => Some(type_for_adt(db, def.into())),
         StructKind::Tuple => {
@@ -1525,13 +1519,13 @@ fn type_for_struct_constructor(db: &dyn HirDatabase, def: StructId) -> Option<Bi
 }
 
 fn fn_sig_for_enum_variant_constructor(db: &dyn HirDatabase, def: EnumVariantId) -> PolyFnSig {
-    let var_data = db.enum_variant_data(def);
-    let fields = var_data.variant_data.fields();
+    let var_data = db.variant_data(def.into());
+    let fields = var_data.fields();
     let resolver = def.resolver(db.upcast());
     let mut ctx = TyLoweringContext::new(
         db,
         &resolver,
-        var_data.variant_data.types_map(),
+        var_data.types_map(),
         DefWithBodyId::VariantId(def).into(),
     )
     .with_type_param_mode(ParamLoweringMode::Variable);
@@ -1550,7 +1544,7 @@ fn type_for_enum_variant_constructor(
     def: EnumVariantId,
 ) -> Option<Binders<Ty>> {
     let e = def.lookup(db.upcast()).parent;
-    match db.enum_variant_data(def).variant_data.kind() {
+    match db.variant_data(def.into()).kind() {
         StructKind::Record => None,
         StructKind::Unit => Some(type_for_adt(db, e.into())),
         StructKind::Tuple => {
@@ -1564,6 +1558,20 @@ fn type_for_enum_variant_constructor(
             ))
         }
     }
+}
+
+#[salsa::tracked(recovery_fn = type_for_adt_recovery)]
+fn type_for_adt_tracked(db: &dyn HirDatabase, adt: AdtId) -> Binders<Ty> {
+    type_for_adt(db, adt)
+}
+
+pub(crate) fn type_for_adt_recovery(
+    db: &dyn HirDatabase,
+    _cycle: &salsa::Cycle,
+    adt: AdtId,
+) -> Binders<Ty> {
+    let generics = generics(db.upcast(), adt.into());
+    make_binders(db, &generics, TyKind::Error.intern(Interner))
 }
 
 fn type_for_adt(db: &dyn HirDatabase, adt: AdtId) -> Binders<Ty> {
@@ -1583,7 +1591,7 @@ pub(crate) fn type_for_type_alias_with_diagnostics_query(
     let mut ctx = TyLoweringContext::new(db, &resolver, &type_alias_data.types_map, t.into())
         .with_impl_trait_mode(ImplTraitLoweringMode::Opaque)
         .with_type_param_mode(ParamLoweringMode::Variable);
-    let inner = if type_alias_data.is_extern {
+    let inner = if type_alias_data.is_extern() {
         TyKind::Foreign(crate::to_foreign_def_id(t)).intern(Interner)
     } else {
         type_alias_data
@@ -1591,7 +1599,17 @@ pub(crate) fn type_for_type_alias_with_diagnostics_query(
             .map(|type_ref| ctx.lower_ty(type_ref))
             .unwrap_or_else(|| TyKind::Error.intern(Interner))
     };
+
     (make_binders(db, &generics, inner), create_diagnostics(ctx.diagnostics))
+}
+
+pub(crate) fn type_for_type_alias_with_diagnostics_query_recover(
+    db: &dyn HirDatabase,
+    _cycle: &salsa::Cycle,
+    adt: TypeAliasId,
+) -> (Binders<Ty>, Diagnostics) {
+    let generics = generics(db.upcast(), adt.into());
+    (make_binders(db, &generics, TyKind::Error.intern(Interner)), None)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1602,7 +1620,7 @@ pub enum TyDefId {
 }
 impl_from!(BuiltinType, AdtId(StructId, EnumId, UnionId), TypeAliasId for TyDefId);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
 pub enum ValueTyDefId {
     FunctionId(FunctionId),
     StructId(StructId),
@@ -1633,18 +1651,9 @@ impl ValueTyDefId {
 pub(crate) fn ty_query(db: &dyn HirDatabase, def: TyDefId) -> Binders<Ty> {
     match def {
         TyDefId::BuiltinType(it) => Binders::empty(Interner, TyBuilder::builtin(it)),
-        TyDefId::AdtId(it) => type_for_adt(db, it),
+        TyDefId::AdtId(it) => type_for_adt_tracked(db, it),
         TyDefId::TypeAliasId(it) => db.type_for_type_alias_with_diagnostics(it).0,
     }
-}
-
-pub(crate) fn ty_recover(db: &dyn HirDatabase, _cycle: &Cycle, def: &TyDefId) -> Binders<Ty> {
-    let generics = match *def {
-        TyDefId::BuiltinType(_) => return Binders::empty(Interner, TyKind::Error.intern(Interner)),
-        TyDefId::AdtId(it) => generics(db.upcast(), it.into()),
-        TyDefId::TypeAliasId(it) => generics(db.upcast(), it.into()),
-    };
-    make_binders(db, &generics, TyKind::Error.intern(Interner))
 }
 
 pub(crate) fn value_ty_query(db: &dyn HirDatabase, def: ValueTyDefId) -> Option<Binders<Ty>> {
@@ -1703,10 +1712,10 @@ pub(crate) fn const_param_ty_with_diagnostics_query(
 
 pub(crate) fn impl_self_ty_with_diagnostics_recover(
     db: &dyn HirDatabase,
-    _cycle: &Cycle,
-    impl_id: &ImplId,
+    _cycle: &salsa::Cycle,
+    impl_id: ImplId,
 ) -> (Binders<Ty>, Diagnostics) {
-    let generics = generics(db.upcast(), (*impl_id).into());
+    let generics = generics(db.upcast(), (impl_id).into());
     (make_binders(db, &generics, TyKind::Error.intern(Interner)), None)
 }
 
@@ -1854,8 +1863,11 @@ pub(crate) fn const_or_path_to_chalk<'g>(
             .unwrap_or_else(|| unknown_const(expected_ty))
         }
         &ConstRef::Complex(it) => {
-            let crate_data = &db.crate_graph()[resolver.krate()];
-            if crate_data.env.get("__ra_is_test_fixture").is_none() && crate_data.origin.is_local()
+            let krate = resolver.krate();
+            // Keep the `&&` this way, because it's better to access the crate data, as we access it for
+            // a bunch of other things nevertheless.
+            if krate.data(db).origin.is_local()
+                && krate.env(db).get("__ra_is_test_fixture").is_none()
             {
                 // FIXME: current `InTypeConstId` is very unstable, so we only use it in non local crate
                 // that are unlikely to be edited.

@@ -1,12 +1,12 @@
 //! Term search assist
 use hir::term_search::{TermSearchConfig, TermSearchCtx};
 use ide_db::{
-    assists::{AssistId, AssistKind, GroupLabel},
+    assists::{AssistId, GroupLabel},
     famous_defs::FamousDefs,
 };
 
 use itertools::Itertools;
-use syntax::{ast, AstNode};
+use syntax::{AstNode, ast};
 
 use crate::assist_context::{AssistContext, Assists};
 
@@ -52,8 +52,13 @@ pub(crate) fn term_search(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<
     let paths = paths
         .into_iter()
         .filter_map(|path| {
-            path.gen_source_code(&scope, &mut formatter, ctx.config.import_path_config(), edition)
-                .ok()
+            path.gen_source_code(
+                &scope,
+                &mut formatter,
+                ctx.config.import_path_config(),
+                scope.krate().to_display_target(ctx.db()),
+            )
+            .ok()
         })
         .unique();
 
@@ -63,7 +68,7 @@ pub(crate) fn term_search(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<
     for code in paths {
         acc.add_group(
             &GroupLabel(String::from("Term search")),
-            AssistId("term_search", AssistKind::Generate),
+            AssistId::generate("term_search"),
             format!("Replace {macro_name}!() with {code}"),
             goal_range,
             |builder| {

@@ -2,21 +2,22 @@
 
 use chalk_ir::cast::Cast;
 use hir_def::{
+    AdtId, AssocItemId, GenericDefId, ItemContainerId, Lookup,
     path::{Path, PathSegment},
     resolver::{ResolveValueResult, TypeNs, ValueNs},
-    AdtId, AssocItemId, GenericDefId, ItemContainerId, Lookup,
 };
 use hir_expand::name::Name;
 use stdx::never;
 
 use crate::{
+    InferenceDiagnostic, Interner, Substitution, TraitRef, TraitRefExt, Ty, TyBuilder, TyExt,
+    TyKind, ValueTyDefId,
     builder::ParamKind,
     consteval, error_lifetime,
     generics::generics,
     infer::diagnostics::InferenceTyLoweringContext as TyLoweringContext,
     method_resolution::{self, VisibleFromModule},
-    to_chalk_trait_id, InferenceDiagnostic, Interner, Substitution, TraitRef, TraitRefExt, Ty,
-    TyBuilder, TyExt, TyKind, ValueTyDefId,
+    to_chalk_trait_id,
 };
 
 use super::{ExprOrPatId, InferenceContext, InferenceTyDiagnosticSource};
@@ -63,7 +64,7 @@ impl InferenceContext<'_> {
                         never!("uninferred pattern?");
                         None
                     }
-                }
+                };
             }
             ValueNs::ImplSelf(impl_id) => {
                 let generics = crate::generics::generics(self.db.upcast(), impl_id.into());
@@ -81,7 +82,7 @@ impl InferenceContext<'_> {
                 };
             }
             ValueNs::GenericParam(it) => {
-                return Some(ValuePathResolution::NonGeneric(self.db.const_param_ty(it)))
+                return Some(ValuePathResolution::NonGeneric(self.db.const_param_ty(it)));
             }
         };
 
@@ -277,7 +278,7 @@ impl InferenceContext<'_> {
     ) -> Option<(ValueNs, Substitution)> {
         let trait_ = trait_ref.hir_trait_id();
         let item =
-            self.db.trait_data(trait_).items.iter().map(|(_name, id)| *id).find_map(|item| {
+            self.db.trait_items(trait_).items.iter().map(|(_name, id)| *id).find_map(|item| {
                 match item {
                     AssocItemId::FunctionId(func) => {
                         if segment.name == &self.db.function_data(func).name {
@@ -398,7 +399,7 @@ impl InferenceContext<'_> {
             Some((AdtId::EnumId(e), subst)) => (e, subst),
             _ => return None,
         };
-        let enum_data = self.db.enum_data(enum_id);
+        let enum_data = self.db.enum_variants(enum_id);
         let variant = enum_data.variant(name)?;
         self.write_variant_resolution(id, variant.into());
         Some((ValueNs::EnumVariantId(variant), subst.clone()))

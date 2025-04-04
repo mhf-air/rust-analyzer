@@ -3,33 +3,34 @@
 use std::{cell::OnceCell, collections::hash_map::Entry};
 
 use hir_expand::{
+    HirFileId,
     mod_path::path,
     name::AsName,
     span_map::{SpanMap, SpanMapRef},
-    HirFileId,
 };
-use intern::{sym, Symbol};
+use intern::{Symbol, sym};
 use la_arena::Arena;
 use rustc_hash::FxHashMap;
-use span::{AstIdMap, SyntaxContextId};
-use stdx::thin_vec::ThinVec;
+use span::{AstIdMap, SyntaxContext};
 use syntax::{
-    ast::{self, HasModuleItem, HasName, HasTypeBounds, IsString},
     AstNode,
+    ast::{self, HasModuleItem, HasName, HasTypeBounds, IsString},
 };
+use thin_vec::ThinVec;
 use triomphe::Arc;
 
 use crate::{
+    LocalLifetimeParamId, LocalTypeOrConstParamId,
     db::DefDatabase,
-    generics::{GenericParams, GenericParamsCollector, TypeParamData, TypeParamProvenance},
+    generics::{GenericParams, GenericParamsCollector},
     item_tree::{
         AssocItem, AttrOwner, Const, Either, Enum, ExternBlock, ExternCrate, Field, FieldParent,
         FieldsShape, FileItemTreeId, FnFlags, Function, GenericArgs, GenericItemSourceMapBuilder,
         GenericModItem, Idx, Impl, ImportAlias, Interned, ItemTree, ItemTreeData,
         ItemTreeSourceMaps, ItemTreeSourceMapsBuilder, Macro2, MacroCall, MacroRules, Mod, ModItem,
         ModKind, ModPath, Mutability, Name, Param, Path, Range, RawAttrs, RawIdx, RawVisibilityId,
-        Static, Struct, StructKind, Trait, TraitAlias, TypeAlias, Union, Use, UseTree, UseTreeKind,
-        Variant,
+        Static, StaticFlags, Struct, StructKind, Trait, TraitAlias, TypeAlias, Union, Use, UseTree,
+        UseTreeKind, Variant,
     },
     lower::LowerCtx,
     path::AssociatedTypeBinding,
@@ -38,7 +39,6 @@ use crate::{
         TypesMap, TypesSourceMap,
     },
     visibility::RawVisibility,
-    LocalLifetimeParamId, LocalTypeOrConstParamId,
 };
 
 fn id<N>(index: Idx<N>) -> FileItemTreeId<N> {
@@ -320,7 +320,7 @@ impl<'a> Ctx<'a> {
         let visibility = self.lower_visibility(field);
         let type_ref = TypeRef::from_ast_opt(body_ctx, field.ty());
 
-        Field { name, type_ref, visibility }
+        Field { name, type_ref, visibility, is_unsafe: field.unsafe_token().is_some() }
     }
 
     fn lower_tuple_field(
@@ -332,7 +332,7 @@ impl<'a> Ctx<'a> {
         let name = Name::new_tuple_field(idx);
         let visibility = self.lower_visibility(field);
         let type_ref = TypeRef::from_ast_opt(body_ctx, field.ty());
-        Field { name, type_ref, visibility }
+        Field { name, type_ref, visibility, is_unsafe: false }
     }
 
     fn lower_union(&mut self, union: &ast::Union) -> Option<FileItemTreeId<Union>> {
@@ -428,7 +428,7 @@ impl<'a> Ctx<'a> {
         for (idx, attr) in attrs {
             self.add_attrs(
                 AttrOwner::Field(
-                    FieldParent::Variant(FileItemTreeId(id)),
+                    FieldParent::EnumVariant(FileItemTreeId(id)),
                     Idx::from_raw(RawIdx::from_u32(idx as u32)),
                 ),
                 attr,
@@ -620,22 +620,23 @@ impl<'a> Ctx<'a> {
         let name = static_.name()?.as_name();
         let type_ref = TypeRef::from_ast_opt(&mut body_ctx, static_.ty());
         let visibility = self.lower_visibility(static_);
-        let mutable = static_.mut_token().is_some();
-        let has_safe_kw = static_.safe_token().is_some();
-        let has_unsafe_kw = static_.unsafe_token().is_some();
+
+        let mut flags = StaticFlags::empty();
+        if static_.mut_token().is_some() {
+            flags |= StaticFlags::MUTABLE;
+        }
+        if static_.safe_token().is_some() {
+            flags |= StaticFlags::HAS_SAFE_KW;
+        }
+        if static_.unsafe_token().is_some() {
+            flags |= StaticFlags::HAS_UNSAFE_KW;
+        }
+
         let ast_id = self.source_ast_id_map.ast_id(static_);
         types_map.shrink_to_fit();
         types_source_map.shrink_to_fit();
-        let res = Static {
-            name,
-            visibility,
-            mutable,
-            type_ref,
-            ast_id,
-            has_safe_kw,
-            has_unsafe_kw,
-            types_map: Arc::new(types_map),
-        };
+        let res =
+            Static { name, visibility, type_ref, ast_id, flags, types_map: Arc::new(types_map) };
         self.source_maps.statics.push(types_source_map);
         Some(id(self.data().statics.alloc(res)))
     }
@@ -881,14 +882,7 @@ impl<'a> Ctx<'a> {
 
         if let HasImplicitSelf::Yes(bounds) = has_implicit_self {
             // Traits and trait aliases get the Self type as an implicit first type parameter.
-            generics.type_or_consts.alloc(
-                TypeParamData {
-                    name: Some(Name::new_symbol_root(sym::Self_.clone())),
-                    default: None,
-                    provenance: TypeParamProvenance::TraitSelf,
-                }
-                .into(),
-            );
+            generics.fill_self_param();
             // add super traits as bounds on Self
             // i.e., `trait Foo: Bar` is equivalent to `trait Foo where Self: Bar`
             let bound_target = Either::Left(body_ctx.alloc_type_ref_desugared(TypeRef::Path(
@@ -938,8 +932,7 @@ impl<'a> Ctx<'a> {
 
 fn desugar_future_path(ctx: &mut LowerCtx<'_>, orig: TypeRefId) -> PathId {
     let path = path![core::future::Future];
-    let mut generic_args: Vec<_> =
-        std::iter::repeat(None).take(path.segments().len() - 1).collect();
+    let mut generic_args: Vec<_> = std::iter::repeat_n(None, path.segments().len() - 1).collect();
     let binding = AssociatedTypeBinding {
         name: Name::new_symbol_root(sym::Output.clone()),
         args: None,
@@ -975,7 +968,7 @@ impl UseTreeLowering<'_> {
     fn lower_use_tree(
         &mut self,
         tree: ast::UseTree,
-        span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContextId,
+        span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContext,
     ) -> Option<UseTree> {
         if let Some(use_tree_list) = tree.use_tree_list() {
             let prefix = match tree.path() {
@@ -1042,7 +1035,7 @@ impl UseTreeLowering<'_> {
 pub(crate) fn lower_use_tree(
     db: &dyn DefDatabase,
     tree: ast::UseTree,
-    span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContextId,
+    span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContext,
 ) -> Option<(UseTree, Arena<ast::UseTree>)> {
     let mut lowering = UseTreeLowering { db, mapping: Arena::new() };
     let tree = lowering.lower_use_tree(tree, span_for_range)?;

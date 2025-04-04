@@ -11,8 +11,8 @@ use crate::{
         AttrOwner, Const, DefDatabase, Enum, ExternBlock, ExternCrate, Field, FieldParent,
         FieldsShape, FileItemTreeId, FnFlags, Function, GenericModItem, GenericParams, Impl,
         ItemTree, Macro2, MacroCall, MacroRules, Mod, ModItem, ModKind, Param, Path, RawAttrs,
-        RawVisibilityId, Static, Struct, Trait, TraitAlias, TypeAlias, TypeBound, Union, Use,
-        UseTree, UseTreeKind, Variant,
+        RawVisibilityId, Static, StaticFlags, Struct, Trait, TraitAlias, TypeAlias, TypeBound,
+        Union, Use, UseTree, UseTreeKind, Variant,
     },
     pretty::{print_path, print_type_bounds, print_type_ref},
     type_ref::{TypeRefId, TypesMap},
@@ -135,12 +135,17 @@ impl Printer<'_> {
                 self.whitespace();
                 w!(self, "{{");
                 self.indented(|this| {
-                    for (idx, Field { name, type_ref, visibility }) in fields.iter().enumerate() {
+                    for (idx, Field { name, type_ref, visibility, is_unsafe }) in
+                        fields.iter().enumerate()
+                    {
                         this.print_attrs_of(
                             AttrOwner::Field(parent, Idx::from_raw(RawIdx::from(idx as u32))),
                             "\n",
                         );
                         this.print_visibility(*visibility);
+                        if *is_unsafe {
+                            w!(this, "unsafe ");
+                        }
                         w!(this, "{}: ", name.display(self.db.upcast(), edition));
                         this.print_type_ref(*type_ref, map);
                         wln!(this, ",");
@@ -151,12 +156,17 @@ impl Printer<'_> {
             FieldsShape::Tuple => {
                 w!(self, "(");
                 self.indented(|this| {
-                    for (idx, Field { name, type_ref, visibility }) in fields.iter().enumerate() {
+                    for (idx, Field { name, type_ref, visibility, is_unsafe }) in
+                        fields.iter().enumerate()
+                    {
                         this.print_attrs_of(
                             AttrOwner::Field(parent, Idx::from_raw(RawIdx::from(idx as u32))),
                             "\n",
                         );
                         this.print_visibility(*visibility);
+                        if *is_unsafe {
+                            w!(this, "unsafe ");
+                        }
                         w!(this, "{}: ", name.display(self.db.upcast(), edition));
                         this.print_type_ref(*type_ref, map);
                         wln!(this, ",");
@@ -382,7 +392,12 @@ impl Printer<'_> {
                         this.print_ast_id(ast_id.erase());
                         this.print_attrs_of(variant, "\n");
                         w!(this, "{}", name.display(self.db.upcast(), edition));
-                        this.print_fields(FieldParent::Variant(variant), *kind, fields, types_map);
+                        this.print_fields(
+                            FieldParent::EnumVariant(variant),
+                            *kind,
+                            fields,
+                            types_map,
+                        );
                         wln!(this, ",");
                     }
                 });
@@ -403,26 +418,18 @@ impl Printer<'_> {
                 wln!(self, " = _;");
             }
             ModItem::Static(it) => {
-                let Static {
-                    name,
-                    visibility,
-                    mutable,
-                    type_ref,
-                    ast_id,
-                    has_safe_kw,
-                    has_unsafe_kw,
-                    types_map,
-                } = &self.tree[it];
+                let Static { name, visibility, type_ref, ast_id, types_map, flags } =
+                    &self.tree[it];
                 self.print_ast_id(ast_id.erase());
                 self.print_visibility(*visibility);
-                if *has_safe_kw {
+                if flags.contains(StaticFlags::HAS_SAFE_KW) {
                     w!(self, "safe ");
                 }
-                if *has_unsafe_kw {
+                if flags.contains(StaticFlags::HAS_UNSAFE_KW) {
                     w!(self, "unsafe ");
                 }
                 w!(self, "static ");
-                if *mutable {
+                if flags.contains(StaticFlags::MUTABLE) {
                     w!(self, "mut ");
                 }
                 w!(self, "{}: ", name.display(self.db.upcast(), self.edition));
@@ -546,7 +553,7 @@ impl Printer<'_> {
                 let MacroCall { path, ast_id, expand_to, ctxt } = &self.tree[it];
                 let _ = writeln!(
                     self,
-                    "// AstId: {:?}, SyntaxContext: {}, ExpandTo: {:?}",
+                    "// AstId: {:?}, SyntaxContextId: {}, ExpandTo: {:?}",
                     ast_id.erase().into_raw(),
                     ctxt,
                     expand_to

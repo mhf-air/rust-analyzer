@@ -11,19 +11,19 @@ pub(crate) mod pat_analysis;
 
 use chalk_ir::Mutability;
 use hir_def::{
-    data::adt::VariantData, expr_store::Body, hir::PatId, AdtId, EnumVariantId, LocalFieldId,
-    VariantId,
+    AdtId, EnumVariantId, LocalFieldId, VariantId, data::adt::VariantData, expr_store::Body,
+    hir::PatId,
 };
 use hir_expand::name::Name;
 use span::Edition;
 use stdx::{always, never};
 
 use crate::{
+    InferenceResult, Interner, Substitution, Ty, TyExt, TyKind,
     db::HirDatabase,
     display::{HirDisplay, HirDisplayError, HirFormatter},
     infer::BindingMode,
     lang_items::is_box,
-    InferenceResult, Interner, Substitution, Ty, TyExt, TyKind,
 };
 
 use self::pat_util::EnumerateAndAdjustIterator;
@@ -242,7 +242,7 @@ impl<'a> PatCtxt<'a> {
         ty: &Ty,
         subpatterns: Vec<FieldPat>,
     ) -> PatKind {
-        let kind = match self.infer.variant_resolution_for_pat(pat) {
+        match self.infer.variant_resolution_for_pat(pat) {
             Some(variant_id) => {
                 if let VariantId::EnumVariantId(enum_variant) = variant_id {
                     let substs = match ty.kind(Interner) {
@@ -266,8 +266,7 @@ impl<'a> PatCtxt<'a> {
                 self.errors.push(PatternError::UnresolvedVariant);
                 PatKind::Wild
             }
-        };
-        kind
+        }
     }
 
     fn lower_path(&mut self, pat: PatId, _path: &hir_def::path::Path) -> Pat {

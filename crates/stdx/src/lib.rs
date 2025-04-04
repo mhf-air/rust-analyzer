@@ -12,7 +12,6 @@ pub mod non_empty_vec;
 pub mod panic_context;
 pub mod process;
 pub mod rand;
-pub mod thin_vec;
 pub mod thread;
 
 pub use itertools;
@@ -202,11 +201,7 @@ pub fn trim_indent(mut text: &str) -> String {
     text.split_inclusive('\n')
         .map(
             |line| {
-                if line.len() <= indent {
-                    line.trim_start_matches(' ')
-                } else {
-                    &line[indent..]
-                }
+                if line.len() <= indent { line.trim_start_matches(' ') } else { &line[indent..] }
             },
         )
         .collect()

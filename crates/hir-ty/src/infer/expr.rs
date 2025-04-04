@@ -5,9 +5,10 @@ use std::{
     mem,
 };
 
-use chalk_ir::{cast::Cast, fold::Shift, DebruijnIndex, Mutability, TyVariableKind};
+use chalk_ir::{DebruijnIndex, Mutability, TyVariableKind, cast::Cast, fold::Shift};
 use either::Either;
 use hir_def::{
+    BlockId, FieldId, GenericDefId, GenericParamId, ItemContainerId, Lookup, TupleFieldId, TupleId,
     hir::{
         ArithOp, Array, AsmOperand, AsmOptions, BinaryOp, ClosureKind, Expr, ExprId, ExprOrPatId,
         LabelId, Literal, Pat, PatId, Statement, UnaryOp,
@@ -15,7 +16,6 @@ use hir_def::{
     lang_item::{LangItem, LangItemTarget},
     path::{GenericArg, GenericArgs, Path},
     resolver::ValueNs,
-    BlockId, FieldId, GenericDefId, GenericParamId, ItemContainerId, Lookup, TupleFieldId, TupleId,
 };
 use hir_expand::name::Name;
 use intern::sym;
@@ -23,34 +23,34 @@ use stdx::always;
 use syntax::ast::RangeOp;
 
 use crate::{
-    autoderef::{builtin_deref, deref_by_trait, Autoderef},
+    Adjust, Adjustment, AdtId, AutoBorrow, Binders, CallableDefId, CallableSig, DeclContext,
+    DeclOrigin, FnAbi, FnPointer, FnSig, FnSubst, Interner, Rawness, Scalar, Substitution,
+    TraitEnvironment, TraitRef, Ty, TyBuilder, TyExt, TyKind,
+    autoderef::{Autoderef, builtin_deref, deref_by_trait},
     consteval,
     db::{InternedClosure, InternedCoroutine},
     error_lifetime,
-    generics::{generics, Generics},
+    generics::{Generics, generics},
     infer::{
+        BreakableKind,
         coerce::{CoerceMany, CoerceNever, CoercionCause},
         find_continuable,
         pat::contains_explicit_ref_binding,
-        BreakableKind,
     },
     lang_items::lang_items_for_bin_op,
     lower::{
-        const_or_path_to_chalk, generic_arg_to_chalk, lower_to_chalk_mutability, ParamLoweringMode,
+        ParamLoweringMode, const_or_path_to_chalk, generic_arg_to_chalk, lower_to_chalk_mutability,
     },
-    mapping::{from_chalk, ToChalk},
+    mapping::{ToChalk, from_chalk},
     method_resolution::{self, VisibleFromModule},
     primitive::{self, UintTy},
     static_lifetime, to_chalk_trait_id,
     traits::FnTrait,
-    Adjust, Adjustment, AdtId, AutoBorrow, Binders, CallableDefId, CallableSig, DeclContext,
-    DeclOrigin, FnAbi, FnPointer, FnSig, FnSubst, Interner, Rawness, Scalar, Substitution,
-    TraitEnvironment, TraitRef, Ty, TyBuilder, TyExt, TyKind,
 };
 
 use super::{
-    cast::CastCheck, coerce::auto_deref_adjust_steps, find_breakable, BreakableContext, Diverges,
-    Expectation, InferenceContext, InferenceDiagnostic, TypeMismatch,
+    BreakableContext, Diverges, Expectation, InferenceContext, InferenceDiagnostic, TypeMismatch,
+    cast::CastCheck, coerce::auto_deref_adjust_steps, find_breakable,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -198,7 +198,7 @@ impl InferenceContext<'_> {
         match &self.body[expr] {
             // Lang item paths cannot currently be local variables or statics.
             Expr::Path(Path::LangItem(_, _)) => false,
-            Expr::Path(Path::Normal(path)) => path.type_anchor().is_none(),
+            Expr::Path(Path::Normal(path)) => path.type_anchor.is_none(),
             Expr::Path(path) => self
                 .resolver
                 .resolve_path_in_value_ns_fully(
@@ -289,7 +289,7 @@ impl InferenceContext<'_> {
         expected: &Expectation,
         is_read: ExprIsRead,
     ) -> Ty {
-        self.db.unwind_if_cancelled();
+        self.db.unwind_if_revision_cancelled();
 
         let ty = match &self.body[tgt_expr] {
             Expr::Missing => self.err_ty(),
@@ -472,8 +472,7 @@ impl InferenceContext<'_> {
                 let prev_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
                 let prev_closure = mem::replace(&mut self.current_closure, id);
                 let prev_ret_ty = mem::replace(&mut self.return_ty, ret_ty.clone());
-                let prev_ret_coercion =
-                    mem::replace(&mut self.return_coercion, Some(CoerceMany::new(ret_ty)));
+                let prev_ret_coercion = self.return_coercion.replace(CoerceMany::new(ret_ty));
                 let prev_resume_yield_tys =
                     mem::replace(&mut self.resume_yield_tys, resume_yield_tys);
 
@@ -772,7 +771,7 @@ impl InferenceContext<'_> {
                         if let Some(deref_trait) = self.resolve_lang_trait(LangItem::Deref) {
                             if let Some(deref_fn) = self
                                 .db
-                                .trait_data(deref_trait)
+                                .trait_items(deref_trait)
                                 .method_by_name(&Name::new_symbol_root(sym::deref.clone()))
                             {
                                 // FIXME: this is wrong in multiple ways, subst is empty, and we emit it even for builtin deref (note that
@@ -930,7 +929,7 @@ impl InferenceContext<'_> {
                     self.write_expr_adj(*base, adj);
                     if let Some(func) = self
                         .db
-                        .trait_data(index_trait)
+                        .trait_items(index_trait)
                         .method_by_name(&Name::new_symbol_root(sym::index.clone()))
                     {
                         let subst = TyBuilder::subst_for_def(self.db, index_trait, None);
@@ -1168,8 +1167,7 @@ impl InferenceContext<'_> {
         let ret_ty = self.table.new_type_var();
         let prev_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
         let prev_ret_ty = mem::replace(&mut self.return_ty, ret_ty.clone());
-        let prev_ret_coercion =
-            mem::replace(&mut self.return_coercion, Some(CoerceMany::new(ret_ty.clone())));
+        let prev_ret_coercion = self.return_coercion.replace(CoerceMany::new(ret_ty.clone()));
 
         // FIXME: We should handle async blocks like we handle closures
         let expected = &Expectation::has_type(ret_ty);
@@ -1258,7 +1256,7 @@ impl InferenceContext<'_> {
         let Some(trait_) = fn_x.get_id(self.db, self.table.trait_env.krate) else {
             return;
         };
-        let trait_data = self.db.trait_data(trait_);
+        let trait_data = self.db.trait_items(trait_);
         if let Some(func) = trait_data.method_by_name(&fn_x.method_name()) {
             let subst = TyBuilder::subst_for_def(self.db, trait_, None)
                 .push(callee_ty.clone())
@@ -1426,7 +1424,7 @@ impl InferenceContext<'_> {
 
         let trait_func = lang_items_for_bin_op(op).and_then(|(name, lang_item)| {
             let trait_id = self.resolve_lang_item(lang_item)?.as_trait()?;
-            let func = self.db.trait_data(trait_id).method_by_name(&name)?;
+            let func = self.db.trait_items(trait_id).method_by_name(&name)?;
             Some((trait_id, func))
         });
         let (trait_, func) = match trait_func {
@@ -1556,11 +1554,7 @@ impl InferenceContext<'_> {
                                         target_is_read,
                                     )
                                 };
-                                if type_ref.is_some() {
-                                    decl_ty
-                                } else {
-                                    ty
-                                }
+                                if type_ref.is_some() { decl_ty } else { ty }
                             } else {
                                 decl_ty
                             };
@@ -1681,14 +1675,14 @@ impl InferenceContext<'_> {
                             })
                     });
                 }
-                TyKind::Adt(AdtId(hir_def::AdtId::StructId(s)), parameters) => {
-                    let local_id = self.db.struct_data(*s).variant_data.field(name)?;
-                    let field = FieldId { parent: (*s).into(), local_id };
+                &TyKind::Adt(AdtId(hir_def::AdtId::StructId(s)), ref parameters) => {
+                    let local_id = self.db.variant_data(s.into()).field(name)?;
+                    let field = FieldId { parent: s.into(), local_id };
                     (field, parameters.clone())
                 }
-                TyKind::Adt(AdtId(hir_def::AdtId::UnionId(u)), parameters) => {
-                    let local_id = self.db.union_data(*u).variant_data.field(name)?;
-                    let field = FieldId { parent: (*u).into(), local_id };
+                &TyKind::Adt(AdtId(hir_def::AdtId::UnionId(u)), ref parameters) => {
+                    let local_id = self.db.variant_data(u.into()).field(name)?;
+                    let field = FieldId { parent: u.into(), local_id };
                     (field, parameters.clone())
                 }
                 _ => return None,
@@ -2402,11 +2396,7 @@ impl InferenceContext<'_> {
             BinaryOp::Assignment { .. } => unreachable!("handled above"),
         };
 
-        if is_assign {
-            self.result.standard_types.unit.clone()
-        } else {
-            output_ty
-        }
+        if is_assign { self.result.standard_types.unit.clone() } else { output_ty }
     }
 
     fn is_builtin_binop(&mut self, lhs: &Ty, rhs: &Ty, op: BinaryOp) -> bool {

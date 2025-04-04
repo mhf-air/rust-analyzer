@@ -7,30 +7,29 @@ use std::{ops, sync::LazyLock};
 
 use either::Either;
 use hir_expand::{
-    name::{AsName, Name},
     ExpandResult,
+    name::{AsName, Name},
 };
+use intern::sym;
 use la_arena::{Arena, RawIdx};
-use stdx::{
-    impl_from,
-    thin_vec::{EmptyOptimizedThinVec, ThinVec},
-};
+use stdx::impl_from;
 use syntax::ast::{self, HasGenericParams, HasName, HasTypeBounds};
+use thin_vec::ThinVec;
 use triomphe::Arc;
 
 use crate::{
+    AdtId, ConstParamId, GenericDefId, HasModule, ItemTreeLoc, LifetimeParamId,
+    LocalLifetimeParamId, LocalTypeOrConstParamId, Lookup, TypeOrConstParamId, TypeParamId,
     db::DefDatabase,
     expander::Expander,
     item_tree::{AttrOwner, FileItemTreeId, GenericModItem, GenericsItemTreeNode, ItemTree},
     lower::LowerCtx,
-    nameres::{DefMap, MacroSubNs},
+    nameres::{DefMap, LocalDefMap, MacroSubNs},
     path::{AssociatedTypeBinding, GenericArg, GenericArgs, NormalPath, Path},
     type_ref::{
         ArrayType, ConstRef, FnType, LifetimeRef, PathId, RefType, TypeBound, TypeRef, TypeRefId,
         TypesMap, TypesSourceMap,
     },
-    AdtId, ConstParamId, GenericDefId, HasModule, ItemTreeLoc, LifetimeParamId,
-    LocalLifetimeParamId, LocalTypeOrConstParamId, Lookup, TypeOrConstParamId, TypeParamId,
 };
 
 /// The index of the self param in the generic of the non-parent definition.
@@ -291,11 +290,7 @@ impl GenericParams {
         parent: GenericDefId,
     ) -> Option<LifetimeParamId> {
         self.lifetimes.iter().find_map(|(id, p)| {
-            if &p.name == name {
-                Some(LifetimeParamId { local_id: id, parent })
-            } else {
-                None
-            }
+            if &p.name == name { Some(LifetimeParamId { local_id: id, parent }) } else { None }
         })
     }
 
@@ -313,8 +308,7 @@ impl GenericParams {
         let _p = tracing::info_span!("generic_params_query").entered();
 
         let krate = def.krate(db);
-        let cfg_options = db.crate_graph();
-        let cfg_options = &cfg_options[krate].cfg_options;
+        let cfg_options = &krate.cfg_options(db);
 
         // Returns the generic parameters that are enabled under the current `#[cfg]` options
         let enabled_params =
@@ -335,26 +329,30 @@ impl GenericParams {
                     params.clone()
                 } else {
                     Arc::new(GenericParams {
-                        type_or_consts: all_type_or_consts_enabled
-                            .then(|| params.type_or_consts.clone())
-                            .unwrap_or_else(|| {
+                        type_or_consts: if all_type_or_consts_enabled {
+                            params.type_or_consts.clone()
+                        } else {
+                            {
                                 params
                                     .type_or_consts
                                     .iter()
                                     .filter(|&(idx, _)| enabled(attr_owner_ct(idx)))
                                     .map(|(_, param)| param.clone())
                                     .collect()
-                            }),
-                        lifetimes: all_lifetimes_enabled
-                            .then(|| params.lifetimes.clone())
-                            .unwrap_or_else(|| {
+                            }
+                        },
+                        lifetimes: if all_lifetimes_enabled {
+                            params.lifetimes.clone()
+                        } else {
+                            {
                                 params
                                     .lifetimes
                                     .iter()
                                     .filter(|&(idx, _)| enabled(attr_owner_lt(idx)))
                                     .map(|(_, param)| param.clone())
                                     .collect()
-                            }),
+                            }
+                        },
                         where_predicates: params.where_predicates.clone(),
                         types_map: params.types_map.clone(),
                     })
@@ -362,10 +360,7 @@ impl GenericParams {
             };
         fn id_to_generics<Id: GenericsItemTreeNode>(
             db: &dyn DefDatabase,
-            id: impl for<'db> Lookup<
-                Database<'db> = dyn DefDatabase + 'db,
-                Data = impl ItemTreeLoc<Id = Id>,
-            >,
+            id: impl Lookup<Database = dyn DefDatabase, Data = impl ItemTreeLoc<Id = Id>>,
             enabled_params: impl Fn(
                 &Arc<GenericParams>,
                 &ItemTree,
@@ -378,6 +373,7 @@ impl GenericParams {
             let id = id.lookup(db).item_tree_id();
             let tree = id.item_tree(db);
             let item = &tree[id.value];
+
             (enabled_params(item.generic_params(), &tree, id.value.into()), None)
         }
 
@@ -415,7 +411,12 @@ impl GenericParams {
                             &mut types_source_maps,
                             &mut expander,
                             &mut || {
-                                (module.def_map(db), Expander::new(db, loc.id.file_id(), module))
+                                let (def_map, local_def_map) = module.local_def_map(db);
+                                (
+                                    def_map,
+                                    local_def_map,
+                                    Expander::new(db, loc.id.file_id(), module),
+                                )
                             },
                             param,
                             &item.types_map,
@@ -448,12 +449,23 @@ impl GenericParams {
 
 #[derive(Clone, Default)]
 pub(crate) struct GenericParamsCollector {
-    pub(crate) type_or_consts: Arena<TypeOrConstParamData>,
+    type_or_consts: Arena<TypeOrConstParamData>,
     lifetimes: Arena<LifetimeParamData>,
     where_predicates: Vec<WherePredicate>,
 }
 
 impl GenericParamsCollector {
+    pub(crate) fn fill_self_param(&mut self) {
+        self.type_or_consts.alloc(
+            TypeParamData {
+                name: Some(Name::new_symbol_root(sym::Self_.clone())),
+                default: None,
+                provenance: TypeParamProvenance::TraitSelf,
+            }
+            .into(),
+        );
+    }
+
     pub(crate) fn fill(
         &mut self,
         lower_ctx: &mut LowerCtx<'_>,
@@ -628,8 +640,8 @@ impl GenericParamsCollector {
         generics_types_map: &mut TypesMap,
         generics_types_source_map: &mut TypesSourceMap,
         // FIXME: Change this back to `LazyCell` if https://github.com/rust-lang/libs-team/issues/429 is accepted.
-        exp: &mut Option<(Arc<DefMap>, Expander)>,
-        exp_fill: &mut dyn FnMut() -> (Arc<DefMap>, Expander),
+        exp: &mut Option<(Arc<DefMap>, Arc<LocalDefMap>, Expander)>,
+        exp_fill: &mut dyn FnMut() -> (Arc<DefMap>, Arc<LocalDefMap>, Expander),
         type_ref: TypeRefId,
         types_map: &TypesMap,
         types_source_map: &TypesSourceMap,
@@ -659,12 +671,13 @@ impl GenericParamsCollector {
 
             if let TypeRef::Macro(mc) = type_ref {
                 let macro_call = mc.to_node(db.upcast());
-                let (def_map, expander) = exp.get_or_insert_with(&mut *exp_fill);
+                let (def_map, local_def_map, expander) = exp.get_or_insert_with(&mut *exp_fill);
 
                 let module = expander.module.local_id;
                 let resolver = |path: &_| {
                     def_map
                         .resolve_path(
+                            local_def_map,
                             db,
                             module,
                             path,
@@ -692,7 +705,7 @@ impl GenericParamsCollector {
                         &macro_types_map,
                         &macro_types_source_map,
                     );
-                    exp.get_or_insert_with(&mut *exp_fill).1.exit(mark);
+                    exp.get_or_insert_with(&mut *exp_fill).2.exit(mark);
                 }
             }
         });
@@ -742,12 +755,17 @@ fn copy_type_ref(
 ) -> TypeRefId {
     let result = match &from[type_ref] {
         TypeRef::Fn(fn_) => {
-            let params = fn_.params().iter().map(|(name, param_type)| {
+            let params = fn_.params.iter().map(|(name, param_type)| {
                 (name.clone(), copy_type_ref(*param_type, from, from_source_map, to, to_source_map))
             });
-            TypeRef::Fn(FnType::new(fn_.is_varargs(), fn_.is_unsafe(), fn_.abi().clone(), params))
+            TypeRef::Fn(Box::new(FnType {
+                params: params.collect(),
+                is_varargs: fn_.is_varargs,
+                is_unsafe: fn_.is_unsafe,
+                abi: fn_.abi.clone(),
+            }))
         }
-        TypeRef::Tuple(types) => TypeRef::Tuple(EmptyOptimizedThinVec::from_iter(
+        TypeRef::Tuple(types) => TypeRef::Tuple(ThinVec::from_iter(
             types.iter().map(|&t| copy_type_ref(t, from, from_source_map, to, to_source_map)),
         )),
         &TypeRef::RawPtr(type_ref, mutbl) => TypeRef::RawPtr(
@@ -806,13 +824,17 @@ fn copy_path(
         Path::BarePath(mod_path) => Path::BarePath(mod_path.clone()),
         Path::Normal(path) => {
             let type_anchor = path
-                .type_anchor()
+                .type_anchor
                 .map(|type_ref| copy_type_ref(type_ref, from, from_source_map, to, to_source_map));
-            let mod_path = path.mod_path().clone();
-            let generic_args = path.generic_args().iter().map(|generic_args| {
+            let mod_path = path.mod_path.clone();
+            let generic_args = path.generic_args.iter().map(|generic_args| {
                 copy_generic_args(generic_args, from, from_source_map, to, to_source_map)
             });
-            Path::Normal(NormalPath::new(type_anchor, mod_path, generic_args))
+            Path::Normal(Box::new(NormalPath {
+                generic_args: generic_args.collect(),
+                type_anchor,
+                mod_path,
+            }))
         }
         Path::LangItem(lang_item, name) => Path::LangItem(*lang_item, name.clone()),
     }
@@ -857,7 +879,7 @@ fn copy_generic_args(
             args,
             has_self_type: generic_args.has_self_type,
             bindings,
-            desugared_from_fn: generic_args.desugared_from_fn,
+            parenthesized: generic_args.parenthesized,
         }
     })
 }
@@ -868,7 +890,7 @@ fn copy_type_bounds<'a>(
     from_source_map: &'a TypesSourceMap,
     to: &'a mut TypesMap,
     to_source_map: &'a mut TypesSourceMap,
-) -> impl stdx::thin_vec::TrustedLen<Item = TypeBound> + 'a {
+) -> impl Iterator<Item = TypeBound> + 'a {
     bounds.iter().map(|bound| copy_type_bound(bound, from, from_source_map, to, to_source_map))
 }
 

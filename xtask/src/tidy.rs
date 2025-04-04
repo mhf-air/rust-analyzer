@@ -46,7 +46,7 @@ lsp/ext.rs was changed without touching lsp-extensions.md.
 Expected hash: {expected_hash:x}
 Actual hash:   {actual_hash:x}
 
-Please adjust docs/dev/lsp-extensions.md.
+Please adjust docs/book/src/contributing/lsp-extensions.md.
 "
         )
     }
@@ -127,7 +127,7 @@ fn check_cargo_toml(path: &Path, text: String) {
 
 fn check_licenses(sh: &Shell) {
     let expected = "
-(MIT OR Apache-2.0) AND Unicode-DFS-2016
+(MIT OR Apache-2.0) AND Unicode-3.0
 0BSD OR MIT OR Apache-2.0
 Apache-2.0
 Apache-2.0 OR BSL-1.0
@@ -135,19 +135,18 @@ Apache-2.0 OR MIT
 Apache-2.0 WITH LLVM-exception
 Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 Apache-2.0/MIT
-BSD-2-Clause OR Apache-2.0 OR MIT
 CC0-1.0
 ISC
 MIT
 MIT / Apache-2.0
 MIT OR Apache-2.0
-MIT OR Apache-2.0 OR Zlib
 MIT OR Zlib OR Apache-2.0
 MIT/Apache-2.0
 MPL-2.0
+Unicode-3.0
 Unlicense OR MIT
 Unlicense/MIT
-Zlib OR Apache-2.0 OR MIT
+Zlib
 "
     .lines()
     .filter(|it| !it.is_empty())
@@ -185,8 +184,7 @@ Zlib OR Apache-2.0 OR MIT
 }
 
 fn check_test_attrs(path: &Path, text: &str) {
-    let panic_rule =
-        "https://github.com/rust-lang/rust-analyzer/blob/master/docs/book/src/contributing/style.md#should_panic";
+    let panic_rule = "https://github.com/rust-lang/rust-analyzer/blob/master/docs/book/src/contributing/style.md#should_panic";
     let need_panic: &[&str] = &[
         // This file.
         "slow-tests/tidy.rs",
@@ -223,7 +221,7 @@ struct TidyDocs {
 impl TidyDocs {
     fn visit(&mut self, path: &Path, text: &str) {
         // Tests and diagnostic fixes don't need module level comments.
-        if is_exclude_dir(path, &["tests", "test_data", "fixes", "grammar", "ra-salsa", "stdx"]) {
+        if is_exclude_dir(path, &["tests", "test_data", "fixes", "grammar", "stdx"]) {
             return;
         }
 
@@ -256,7 +254,7 @@ impl TidyDocs {
             d.file_name()
                 .unwrap_or_default()
                 .to_str()
-                .map(|f_n| file_names.iter().any(|name| *name == f_n))
+                .map(|f_n| file_names.contains(&f_n))
                 .unwrap_or(false)
         }
     }

@@ -3,28 +3,27 @@
 use std::ops::ControlFlow;
 
 use chalk_ir::{
+    DebruijnIndex,
     cast::Cast,
     visit::{TypeSuperVisitable, TypeVisitable, TypeVisitor},
-    DebruijnIndex,
 };
 use chalk_solve::rust_ir::InlineBound;
 use hir_def::{
-    data::TraitFlags, lang_item::LangItem, AssocItemId, ConstId, FunctionId, GenericDefId,
-    HasModule, TraitId, TypeAliasId,
+    AssocItemId, ConstId, FunctionId, GenericDefId, HasModule, TraitId, TypeAliasId,
+    data::TraitFlags, lang_item::LangItem,
 };
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
 use crate::{
-    all_super_traits,
+    AliasEq, AliasTy, Binders, BoundVar, CallableSig, GoalData, ImplTraitId, Interner, OpaqueTyId,
+    ProjectionTyExt, Solution, Substitution, TraitRef, Ty, TyKind, WhereClause, all_super_traits,
     db::HirDatabase,
     from_assoc_type_id, from_chalk_trait_id,
     generics::{generics, trait_self_param_idx},
     lower::callable_item_sig,
-    to_assoc_type_id, to_chalk_trait_id,
+    to_chalk_trait_id,
     utils::elaborate_clause_supertraits,
-    AliasEq, AliasTy, Binders, BoundVar, CallableSig, GoalData, ImplTraitId, Interner, OpaqueTyId,
-    ProjectionTyExt, Solution, Substitution, TraitRef, Ty, TyKind, WhereClause,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -103,7 +102,7 @@ where
 
     // rustc checks for non-lifetime binders here, but we don't support HRTB yet
 
-    let trait_data = db.trait_data(trait_);
+    let trait_data = db.trait_items(trait_);
     for (_, assoc_item) in &trait_data.items {
         dyn_compatibility_violation_for_assoc_item(db, trait_, *assoc_item, cb)?;
     }
@@ -116,7 +115,7 @@ pub fn dyn_compatibility_of_trait_query(
     trait_: TraitId,
 ) -> Option<DynCompatibilityViolation> {
     let mut res = None;
-    dyn_compatibility_of_trait_with_callback(db, trait_, &mut |osv| {
+    _ = dyn_compatibility_of_trait_with_callback(db, trait_, &mut |osv| {
         res = Some(osv);
         ControlFlow::Break(())
     });
@@ -166,14 +165,13 @@ fn predicates_reference_self(db: &dyn HirDatabase, trait_: TraitId) -> bool {
 
 // Same as the above, `predicates_reference_self`
 fn bounds_reference_self(db: &dyn HirDatabase, trait_: TraitId) -> bool {
-    let trait_data = db.trait_data(trait_);
+    let trait_data = db.trait_items(trait_);
     trait_data
         .items
         .iter()
         .filter_map(|(_, it)| match *it {
             AssocItemId::TypeAliasId(id) => {
-                let assoc_ty_id = to_assoc_type_id(id);
-                let assoc_ty_data = db.associated_ty_data(assoc_ty_id);
+                let assoc_ty_data = db.associated_ty_data(id);
                 Some(assoc_ty_data)
             }
             _ => None,
@@ -558,11 +556,7 @@ fn receiver_for_self_ty(db: &dyn HirDatabase, func: FunctionId, ty: Ty) -> Optio
     let subst = Substitution::from_iter(
         Interner,
         subst.iter(Interner).enumerate().map(|(idx, arg)| {
-            if idx == trait_self_idx {
-                ty.clone().cast(Interner)
-            } else {
-                arg.clone()
-            }
+            if idx == trait_self_idx { ty.clone().cast(Interner) } else { arg.clone() }
         }),
     );
     let sig = callable_item_sig(db, func.into());
@@ -597,7 +591,7 @@ fn contains_illegal_impl_trait_in_trait(
 
     let ret = sig.skip_binders().ret();
     let mut visitor = OpaqueTypeCollector(FxHashSet::default());
-    ret.visit_with(visitor.as_dyn(), DebruijnIndex::INNERMOST);
+    _ = ret.visit_with(visitor.as_dyn(), DebruijnIndex::INNERMOST);
 
     // Since we haven't implemented RPITIT in proper way like rustc yet,
     // just check whether `ret` contains RPIT for now

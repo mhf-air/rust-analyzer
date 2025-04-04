@@ -15,10 +15,10 @@ use ide::{
     Snippet, SnippetScope, SourceRootId,
 };
 use ide_db::{
-    imports::insert_use::{ImportGranularity, InsertUseConfig, PrefixKind},
     SnippetCap,
+    imports::insert_use::{ImportGranularity, InsertUseConfig, PrefixKind},
 };
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 use paths::{Utf8Path, Utf8PathBuf};
 use project_model::{
     CargoConfig, CargoFeatures, ProjectJson, ProjectJsonData, ProjectJsonFromCommand,
@@ -27,8 +27,8 @@ use project_model::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use semver::Version;
 use serde::{
-    de::{DeserializeOwned, Error},
     Deserialize, Serialize,
+    de::{DeserializeOwned, Error},
 };
 use stdx::format_to_acc;
 use triomphe::Arc;
@@ -40,6 +40,8 @@ use crate::{
     lsp::capabilities::ClientCapabilities,
     lsp_ext::{WorkspaceSymbolSearchKind, WorkspaceSymbolSearchScope},
 };
+
+type FxIndexMap<K, V> = indexmap::IndexMap<K, V, rustc_hash::FxBuildHasher>;
 
 mod patch_old_style;
 
@@ -81,7 +83,7 @@ config_data! {
         cachePriming_numThreads: NumThreads = NumThreads::Physical,
 
         /// Custom completion snippets.
-        completion_snippets_custom: FxHashMap<String, SnippetDef> = Config::completion_snippets_default(),
+        completion_snippets_custom: FxIndexMap<String, SnippetDef> = Config::completion_snippets_default(),
 
 
         /// These paths (file/directories) will be ignored by rust-analyzer. They are
@@ -589,6 +591,10 @@ config_data! {
         /// avoid checking unnecessary things.
         cargo_buildScripts_useRustcWrapper: bool = true,
         /// List of cfg options to enable with the given values.
+        ///
+        /// To enable a name without a value, use `"key"`.
+        /// To enable a name with a value, use `"key=value"`.
+        /// To disable, prefix the entry with a `!`.
         cargo_cfgs: Vec<String> = {
             vec!["debug_assertions".into(), "miri".into()]
         },
@@ -927,7 +933,7 @@ impl Config {
                 patch_old_style::patch_json_for_outdated_configs(&mut json);
 
                 let mut json_errors = vec![];
-                let snips = get_field_json::<FxHashMap<String, SnippetDef>>(
+                let snips = get_field_json::<FxIndexMap<String, SnippetDef>>(
                     &mut json,
                     &mut json_errors,
                     "completion_snippets_custom",
@@ -1098,10 +1104,10 @@ impl Config {
             config
                 .client_config
                 .1
-                 .0
+                .0
                 .iter()
-                .chain(config.user_config.as_ref().into_iter().flat_map(|it| it.1 .0.iter()))
-                .chain(config.ratoml_file.values().flat_map(|it| it.1 .0.iter()))
+                .chain(config.user_config.as_ref().into_iter().flat_map(|it| it.1.0.iter()))
+                .chain(config.ratoml_file.values().flat_map(|it| it.1.0.iter()))
                 .chain(config.validation_errors.0.iter())
                 .cloned()
                 .collect(),
@@ -1980,27 +1986,35 @@ impl Config {
             rustc_source,
             extra_includes,
             cfg_overrides: project_model::CfgOverrides {
-                global: CfgDiff::new(
-                    self.cargo_cfgs(source_root)
-                        .iter()
-                        // parse any cfg setting formatted as key=value or just key (without value)
-                        .filter_map(|s| {
-                            let mut sp = s.splitn(2, "=");
-                            let key = sp.next();
-                            let val = sp.next();
-                            key.map(|key| (key, val))
-                        })
-                        .map(|(key, val)| match val {
-                            Some(val) => CfgAtom::KeyValue {
-                                key: Symbol::intern(key),
-                                value: Symbol::intern(val),
-                            },
-                            None => CfgAtom::Flag(Symbol::intern(key)),
-                        })
-                        .collect(),
-                    vec![],
-                )
-                .unwrap(),
+                global: {
+                    let (enabled, disabled): (Vec<_>, Vec<_>) =
+                        self.cargo_cfgs(source_root).iter().partition_map(|s| {
+                            s.strip_prefix("!").map_or(Either::Left(s), Either::Right)
+                        });
+                    CfgDiff::new(
+                        enabled
+                            .into_iter()
+                            // parse any cfg setting formatted as key=value or just key (without value)
+                            .map(|s| match s.split_once("=") {
+                                Some((key, val)) => CfgAtom::KeyValue {
+                                    key: Symbol::intern(key),
+                                    value: Symbol::intern(val),
+                                },
+                                None => CfgAtom::Flag(Symbol::intern(s)),
+                            })
+                            .collect(),
+                        disabled
+                            .into_iter()
+                            .map(|s| match s.split_once("=") {
+                                Some((key, val)) => CfgAtom::KeyValue {
+                                    key: Symbol::intern(key),
+                                    value: Symbol::intern(val),
+                                },
+                                None => CfgAtom::Flag(Symbol::intern(s)),
+                            })
+                            .collect(),
+                    )
+                },
                 selective: Default::default(),
             },
             wrap_rustc_in_build_scripts: *self.cargo_buildScripts_useRustcWrapper(source_root),
@@ -2020,21 +2034,13 @@ impl Config {
         *self.cfg_setTest(source_root)
     }
 
-    pub(crate) fn completion_snippets_default() -> FxHashMap<String, SnippetDef> {
+    pub(crate) fn completion_snippets_default() -> FxIndexMap<String, SnippetDef> {
         serde_json::from_str(
             r#"{
-            "Arc::new": {
-                "postfix": "arc",
-                "body": "Arc::new(${receiver})",
-                "requires": "std::sync::Arc",
-                "description": "Put the expression into an `Arc`",
-                "scope": "expr"
-            },
-            "Rc::new": {
-                "postfix": "rc",
-                "body": "Rc::new(${receiver})",
-                "requires": "std::rc::Rc",
-                "description": "Put the expression into an `Rc`",
+            "Ok": {
+                "postfix": "ok",
+                "body": "Ok(${receiver})",
+                "description": "Wrap the expression in a `Result::Ok`",
                 "scope": "expr"
             },
             "Box::pin": {
@@ -2044,10 +2050,17 @@ impl Config {
                 "description": "Put the expression into a pinned `Box`",
                 "scope": "expr"
             },
-            "Ok": {
-                "postfix": "ok",
-                "body": "Ok(${receiver})",
-                "description": "Wrap the expression in a `Result::Ok`",
+            "Arc::new": {
+                "postfix": "arc",
+                "body": "Arc::new(${receiver})",
+                "requires": "std::sync::Arc",
+                "description": "Put the expression into an `Arc`",
+                "scope": "expr"
+            },
+            "Some": {
+                "postfix": "some",
+                "body": "Some(${receiver})",
+                "description": "Wrap the expression in an `Option::Some`",
                 "scope": "expr"
             },
             "Err": {
@@ -2056,10 +2069,11 @@ impl Config {
                 "description": "Wrap the expression in a `Result::Err`",
                 "scope": "expr"
             },
-            "Some": {
-                "postfix": "some",
-                "body": "Some(${receiver})",
-                "description": "Wrap the expression in an `Option::Some`",
+            "Rc::new": {
+                "postfix": "rc",
+                "body": "Rc::new(${receiver})",
+                "requires": "std::rc::Rc",
+                "description": "Put the expression into an `Rc`",
                 "scope": "expr"
             }
         }"#,
@@ -3198,7 +3212,7 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
         "FxHashMap<Box<str>, Box<[Box<str>]>>" => set! {
             "type": "object",
         },
-        "FxHashMap<String, SnippetDef>" => set! {
+        "FxIndexMap<String, SnippetDef>" => set! {
             "type": "object",
         },
         "FxHashMap<String, String>" => set! {

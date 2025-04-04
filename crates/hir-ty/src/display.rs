@@ -4,13 +4,15 @@
 
 use std::{
     fmt::{self, Debug},
-    mem::{self, size_of},
+    mem,
 };
 
-use base_db::CrateId;
+use base_db::Crate;
 use chalk_ir::{BoundVar, Safety, TyKind};
 use either::Either;
 use hir_def::{
+    GenericDefId, HasModule, ImportPathConfig, ItemContainerId, LocalFieldId, Lookup, ModuleDefId,
+    ModuleId, TraitId,
     data::adt::VariantData,
     db::DefDatabase,
     find_path::{self, PrefixKind},
@@ -23,16 +25,14 @@ use hir_def::{
         TraitBoundModifier, TypeBound, TypeRef, TypeRefId, TypesMap, TypesSourceMap, UseArgRef,
     },
     visibility::Visibility,
-    GenericDefId, HasModule, ImportPathConfig, ItemContainerId, LocalFieldId, Lookup, ModuleDefId,
-    ModuleId, TraitId,
 };
 use hir_expand::name::Name;
-use intern::{sym, Internable, Interned};
+use intern::{Internable, Interned, sym};
 use itertools::Itertools;
 use la_arena::ArenaMap;
 use rustc_apfloat::{
-    ieee::{Half as f16, Quad as f128},
     Float,
+    ieee::{Half as f16, Quad as f128},
 };
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
@@ -41,21 +41,22 @@ use stdx::never;
 use triomphe::Arc;
 
 use crate::{
-    consteval::try_const_usize,
-    db::{HirDatabase, InternedClosure},
-    from_assoc_type_id, from_foreign_def_id, from_placeholder_idx,
-    generics::generics,
-    layout::Layout,
-    lt_from_placeholder_idx,
-    mapping::from_chalk,
-    mir::pad16,
-    primitive, to_assoc_type_id,
-    utils::{self, detect_variant_from_bytes, ClosureSubst},
     AdtId, AliasEq, AliasTy, Binders, CallableDefId, CallableSig, ConcreteConst, Const,
     ConstScalar, ConstValue, DomainGoal, FnAbi, GenericArg, ImplTraitId, Interner, Lifetime,
     LifetimeData, LifetimeOutlives, MemoryMap, Mutability, OpaqueTy, ProjectionTy, ProjectionTyExt,
     QuantifiedWhereClause, Scalar, Substitution, TraitEnvironment, TraitRef, TraitRefExt, Ty,
     TyExt, WhereClause,
+    consteval::try_const_usize,
+    db::{HirDatabase, InternedClosure},
+    from_assoc_type_id, from_foreign_def_id, from_placeholder_idx,
+    generics::generics,
+    infer::normalize,
+    layout::Layout,
+    lt_from_placeholder_idx,
+    mapping::from_chalk,
+    mir::pad16,
+    primitive, to_assoc_type_id,
+    utils::{self, ClosureSubst, detect_variant_from_bytes},
 };
 
 pub trait HirWrite: fmt::Write {
@@ -87,6 +88,7 @@ pub struct HirFormatter<'a> {
     show_container_bounds: bool,
     omit_verbose_types: bool,
     closure_style: ClosureStyle,
+    display_kind: DisplayKind,
     display_target: DisplayTarget,
     bounds_formatting_ctx: BoundsFormattingCtx,
 }
@@ -164,6 +166,7 @@ pub trait HirDisplay {
         limited_size: Option<usize>,
         omit_verbose_types: bool,
         display_target: DisplayTarget,
+        display_kind: DisplayKind,
         closure_style: ClosureStyle,
         show_container_bounds: bool,
     ) -> HirDisplayWrapper<'a, Self>
@@ -171,7 +174,7 @@ pub trait HirDisplay {
         Self: Sized,
     {
         assert!(
-            !matches!(display_target, DisplayTarget::SourceCode { .. }),
+            !matches!(display_kind, DisplayKind::SourceCode { .. }),
             "HirDisplayWrapper cannot fail with DisplaySourceCodeError, use HirDisplay::hir_fmt directly instead"
         );
         HirDisplayWrapper {
@@ -181,6 +184,7 @@ pub trait HirDisplay {
             limited_size,
             omit_verbose_types,
             display_target,
+            display_kind,
             closure_style,
             show_container_bounds,
         }
@@ -191,7 +195,7 @@ pub trait HirDisplay {
     fn display<'a>(
         &'a self,
         db: &'a dyn HirDatabase,
-        edition: Edition,
+        display_target: DisplayTarget,
     ) -> HirDisplayWrapper<'a, Self>
     where
         Self: Sized,
@@ -203,7 +207,8 @@ pub trait HirDisplay {
             limited_size: None,
             omit_verbose_types: false,
             closure_style: ClosureStyle::ImplFn,
-            display_target: DisplayTarget::Diagnostics { edition },
+            display_target,
+            display_kind: DisplayKind::Diagnostics,
             show_container_bounds: false,
         }
     }
@@ -214,7 +219,7 @@ pub trait HirDisplay {
         &'a self,
         db: &'a dyn HirDatabase,
         max_size: Option<usize>,
-        edition: Edition,
+        display_target: DisplayTarget,
     ) -> HirDisplayWrapper<'a, Self>
     where
         Self: Sized,
@@ -226,7 +231,8 @@ pub trait HirDisplay {
             limited_size: None,
             omit_verbose_types: true,
             closure_style: ClosureStyle::ImplFn,
-            display_target: DisplayTarget::Diagnostics { edition },
+            display_target,
+            display_kind: DisplayKind::Diagnostics,
             show_container_bounds: false,
         }
     }
@@ -237,7 +243,7 @@ pub trait HirDisplay {
         &'a self,
         db: &'a dyn HirDatabase,
         limited_size: Option<usize>,
-        edition: Edition,
+        display_target: DisplayTarget,
     ) -> HirDisplayWrapper<'a, Self>
     where
         Self: Sized,
@@ -249,7 +255,8 @@ pub trait HirDisplay {
             limited_size,
             omit_verbose_types: true,
             closure_style: ClosureStyle::ImplFn,
-            display_target: DisplayTarget::Diagnostics { edition },
+            display_target,
+            display_kind: DisplayKind::Diagnostics,
             show_container_bounds: false,
         }
     }
@@ -272,7 +279,8 @@ pub trait HirDisplay {
             entity_limit: None,
             omit_verbose_types: false,
             closure_style: ClosureStyle::ImplFn,
-            display_target: DisplayTarget::SourceCode { module_id, allow_opaque },
+            display_target: DisplayTarget::from_crate(db, module_id.krate()),
+            display_kind: DisplayKind::SourceCode { target_module_id: module_id, allow_opaque },
             show_container_bounds: false,
             bounds_formatting_ctx: Default::default(),
         }) {
@@ -284,29 +292,10 @@ pub trait HirDisplay {
     }
 
     /// Returns a String representation of `self` for test purposes
-    fn display_test<'a>(&'a self, db: &'a dyn HirDatabase) -> HirDisplayWrapper<'a, Self>
-    where
-        Self: Sized,
-    {
-        HirDisplayWrapper {
-            db,
-            t: self,
-            max_size: None,
-            limited_size: None,
-            omit_verbose_types: false,
-            closure_style: ClosureStyle::ImplFn,
-            display_target: DisplayTarget::Test,
-            show_container_bounds: false,
-        }
-    }
-
-    /// Returns a String representation of `self` that shows the constraint from
-    /// the container for functions
-    fn display_with_container_bounds<'a>(
+    fn display_test<'a>(
         &'a self,
         db: &'a dyn HirDatabase,
-        show_container_bounds: bool,
-        edition: Edition,
+        display_target: DisplayTarget,
     ) -> HirDisplayWrapper<'a, Self>
     where
         Self: Sized,
@@ -318,21 +307,44 @@ pub trait HirDisplay {
             limited_size: None,
             omit_verbose_types: false,
             closure_style: ClosureStyle::ImplFn,
-            display_target: DisplayTarget::Diagnostics { edition },
+            display_target,
+            display_kind: DisplayKind::Test,
+            show_container_bounds: false,
+        }
+    }
+
+    /// Returns a String representation of `self` that shows the constraint from
+    /// the container for functions
+    fn display_with_container_bounds<'a>(
+        &'a self,
+        db: &'a dyn HirDatabase,
+        show_container_bounds: bool,
+        display_target: DisplayTarget,
+    ) -> HirDisplayWrapper<'a, Self>
+    where
+        Self: Sized,
+    {
+        HirDisplayWrapper {
+            db,
+            t: self,
+            max_size: None,
+            limited_size: None,
+            omit_verbose_types: false,
+            closure_style: ClosureStyle::ImplFn,
+            display_target,
+            display_kind: DisplayKind::Diagnostics,
             show_container_bounds,
         }
     }
 }
 
 impl HirFormatter<'_> {
+    pub fn krate(&self) -> Crate {
+        self.display_target.krate
+    }
+
     pub fn edition(&self) -> Edition {
-        match self.display_target {
-            DisplayTarget::Diagnostics { edition } => edition,
-            DisplayTarget::SourceCode { module_id, .. } => {
-                self.db.crate_graph()[module_id.krate()].edition
-            }
-            DisplayTarget::Test => Edition::CURRENT,
-        }
+        self.display_target.edition
     }
 
     pub fn write_joined<T: HirDisplay>(
@@ -394,20 +406,33 @@ impl HirFormatter<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DisplayTarget {
+    krate: Crate,
+    pub edition: Edition,
+}
+
+impl DisplayTarget {
+    pub fn from_crate(db: &dyn HirDatabase, krate: Crate) -> Self {
+        let edition = krate.data(db).edition;
+        Self { krate, edition }
+    }
+}
+
 #[derive(Clone, Copy)]
-pub enum DisplayTarget {
+pub enum DisplayKind {
     /// Display types for inlays, doc popups, autocompletion, etc...
     /// Showing `{unknown}` or not qualifying paths is fine here.
     /// There's no reason for this to fail.
-    Diagnostics { edition: Edition },
+    Diagnostics,
     /// Display types for inserting them in source files.
     /// The generated code should compile, so paths need to be qualified.
-    SourceCode { module_id: ModuleId, allow_opaque: bool },
+    SourceCode { target_module_id: ModuleId, allow_opaque: bool },
     /// Only for test purpose to keep real types
     Test,
 }
 
-impl DisplayTarget {
+impl DisplayKind {
     fn is_source_code(self) -> bool {
         matches!(self, Self::SourceCode { .. })
     }
@@ -450,6 +475,7 @@ pub struct HirDisplayWrapper<'a, T> {
     limited_size: Option<usize>,
     omit_verbose_types: bool,
     closure_style: ClosureStyle,
+    display_kind: DisplayKind,
     display_target: DisplayTarget,
     show_container_bounds: bool,
 }
@@ -479,6 +505,7 @@ impl<T: HirDisplay> HirDisplayWrapper<'_, T> {
             max_size: self.max_size,
             entity_limit: self.limited_size,
             omit_verbose_types: self.omit_verbose_types,
+            display_kind: self.display_kind,
             display_target: self.display_target,
             closure_style: self.closure_style,
             show_container_bounds: self.show_container_bounds,
@@ -502,7 +529,9 @@ where
             Err(HirDisplayError::FmtError) => Err(fmt::Error),
             Err(HirDisplayError::DisplaySourceCodeError(_)) => {
                 // This should never happen
-                panic!("HirDisplay::hir_fmt failed with DisplaySourceCodeError when calling Display::fmt!")
+                panic!(
+                    "HirDisplay::hir_fmt failed with DisplaySourceCodeError when calling Display::fmt!"
+                )
             }
         }
     }
@@ -533,7 +562,7 @@ impl HirDisplay for ProjectionTy {
         // if we are projection on a type parameter, check if the projection target has bounds
         // itself, if so, we render them directly as `impl Bound` instead of the less useful
         // `<Param as Trait>::Assoc`
-        if !f.display_target.is_source_code() {
+        if !f.display_kind.is_source_code() {
             if let TyKind::Placeholder(idx) = self_ty.kind(Interner) {
                 if !f.bounds_formatting_ctx.contains(self) {
                     let db = f.db;
@@ -653,10 +682,8 @@ fn render_const_scalar(
     memory_map: &MemoryMap,
     ty: &Ty,
 ) -> Result<(), HirDisplayError> {
-    // FIXME: We need to get krate from the final callers of the hir display
-    // infrastructure and have it here as a field on `f`.
-    let trait_env =
-        TraitEnvironment::empty(*f.db.crate_graph().crates_in_topological_order().last().unwrap());
+    let trait_env = TraitEnvironment::empty(f.krate());
+    let ty = normalize(f.db, trait_env.clone(), ty.clone());
     match ty.kind(Interner) {
         TyKind::Scalar(s) => match s {
             Scalar::Bool => write!(f, "{}", b[0] != 0),
@@ -821,7 +848,7 @@ fn render_const_scalar(
                     write!(f, "{}", data.name.display(f.db.upcast(), f.edition()))?;
                     let field_types = f.db.field_types(s.into());
                     render_variant_after_name(
-                        &data.variant_data,
+                        &f.db.variant_data(s.into()),
                         f,
                         &field_types,
                         f.db.trait_environment(adt.0.into()),
@@ -847,7 +874,7 @@ fn render_const_scalar(
                     write!(f, "{}", data.name.display(f.db.upcast(), f.edition()))?;
                     let field_types = f.db.field_types(var_id.into());
                     render_variant_after_name(
-                        &data.variant_data,
+                        &f.db.variant_data(var_id.into()),
                         f,
                         &field_types,
                         f.db.trait_environment(adt.0.into()),
@@ -1109,7 +1136,7 @@ impl HirDisplay for Ty {
                 let def = from_chalk(db, *def);
                 let sig = db.callable_item_signature(def).substitute(Interner, parameters);
 
-                if f.display_target.is_source_code() {
+                if f.display_kind.is_source_code() {
                     // `FnDef` is anonymous and there's no surface syntax for it. Show it as a
                     // function pointer type.
                     return sig.hir_fmt(f);
@@ -1198,8 +1225,8 @@ impl HirDisplay for Ty {
             }
             TyKind::Adt(AdtId(def_id), parameters) => {
                 f.start_location_link((*def_id).into());
-                match f.display_target {
-                    DisplayTarget::Diagnostics { .. } | DisplayTarget::Test => {
+                match f.display_kind {
+                    DisplayKind::Diagnostics | DisplayKind::Test => {
                         let name = match *def_id {
                             hir_def::AdtId::StructId(it) => db.struct_data(it).name.clone(),
                             hir_def::AdtId::UnionId(it) => db.union_data(it).name.clone(),
@@ -1207,7 +1234,7 @@ impl HirDisplay for Ty {
                         };
                         write!(f, "{}", name.display(f.db.upcast(), f.edition()))?;
                     }
-                    DisplayTarget::SourceCode { module_id, allow_opaque: _ } => {
+                    DisplayKind::SourceCode { target_module_id: module_id, allow_opaque: _ } => {
                         if let Some(path) = find_path::find_path(
                             db.upcast(),
                             ItemInNs::Types((*def_id).into()),
@@ -1246,7 +1273,7 @@ impl HirDisplay for Ty {
                 let type_alias_data = db.type_alias_data(type_alias);
 
                 // Use placeholder associated types when the target is test (https://rust-lang.github.io/chalk/book/clauses/type_equality.html#placeholder-associated-types)
-                if f.display_target.is_test() {
+                if f.display_kind.is_test() {
                     f.start_location_link(trait_.into());
                     write!(f, "{}", trait_data.name.display(f.db.upcast(), f.edition()))?;
                     f.end_location_link();
@@ -1275,7 +1302,7 @@ impl HirDisplay for Ty {
                 f.end_location_link();
             }
             TyKind::OpaqueType(opaque_ty_id, parameters) => {
-                if !f.display_target.allows_opaque() {
+                if !f.display_kind.allows_opaque() {
                     return Err(HirDisplayError::DisplaySourceCodeError(
                         DisplaySourceCodeError::OpaqueType,
                     ));
@@ -1317,7 +1344,7 @@ impl HirDisplay for Ty {
                             .lang_item(body.module(db.upcast()).krate(), LangItem::Future)
                             .and_then(LangItemTarget::as_trait);
                         let output = future_trait.and_then(|t| {
-                            db.trait_data(t).associated_type_by_name(&Name::new_symbol_root(
+                            db.trait_items(t).associated_type_by_name(&Name::new_symbol_root(
                                 sym::Output.clone(),
                             ))
                         });
@@ -1344,8 +1371,8 @@ impl HirDisplay for Ty {
                 }
             }
             TyKind::Closure(id, substs) => {
-                if f.display_target.is_source_code() {
-                    if !f.display_target.allows_opaque() {
+                if f.display_kind.is_source_code() {
+                    if !f.display_kind.allows_opaque() {
                         return Err(HirDisplayError::DisplaySourceCodeError(
                             DisplaySourceCodeError::OpaqueType,
                         ));
@@ -1356,7 +1383,7 @@ impl HirDisplay for Ty {
                 match f.closure_style {
                     ClosureStyle::Hide => return write!(f, "{TYPE_HINT_TRUNCATION}"),
                     ClosureStyle::ClosureWithId => {
-                        return write!(f, "{{closure#{:?}}}", id.0.as_u32())
+                        return write!(f, "{{closure#{:?}}}", id.0.as_u32());
                     }
                     ClosureStyle::ClosureWithSubst => {
                         write!(f, "{{closure#{:?}}}", id.0.as_u32())?;
@@ -1465,7 +1492,7 @@ impl HirDisplay for Ty {
             }
             TyKind::Alias(AliasTy::Projection(p_ty)) => p_ty.hir_fmt(f)?,
             TyKind::Alias(AliasTy::Opaque(opaque_ty)) => {
-                if !f.display_target.allows_opaque() {
+                if !f.display_kind.allows_opaque() {
                     return Err(HirDisplayError::DisplaySourceCodeError(
                         DisplaySourceCodeError::OpaqueType,
                     ));
@@ -1508,7 +1535,7 @@ impl HirDisplay for Ty {
                 };
             }
             TyKind::Error => {
-                if f.display_target.is_source_code() {
+                if f.display_kind.is_source_code() {
                     f.write_char('_')?;
                 } else {
                     write!(f, "{{unknown}}")?;
@@ -1516,7 +1543,7 @@ impl HirDisplay for Ty {
             }
             TyKind::InferenceVar(..) => write!(f, "_")?,
             TyKind::Coroutine(_, subst) => {
-                if f.display_target.is_source_code() {
+                if f.display_kind.is_source_code() {
                     return Err(HirDisplayError::DisplaySourceCodeError(
                         DisplaySourceCodeError::Coroutine,
                     ));
@@ -1573,7 +1600,7 @@ fn generic_args_sans_defaults<'ga>(
     generic_def: Option<hir_def::GenericDefId>,
     parameters: &'ga [GenericArg],
 ) -> &'ga [GenericArg] {
-    if f.display_target.is_source_code() || f.omit_verbose_types() {
+    if f.display_kind.is_source_code() || f.omit_verbose_types() {
         match generic_def
             .map(|generic_def_id| f.db.generic_defaults(generic_def_id))
             .filter(|it| !it.is_empty())
@@ -1686,7 +1713,7 @@ fn fn_traits(db: &dyn DefDatabase, trait_: TraitId) -> impl Iterator<Item = Trai
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SizedByDefault {
     NotSized,
-    Sized { anchor: CrateId },
+    Sized { anchor: Crate },
 }
 
 impl SizedByDefault {
@@ -1958,7 +1985,7 @@ impl HirDisplay for LifetimeData {
                 write!(f, "{}", param_data.name.display(f.db.upcast(), f.edition()))?;
                 Ok(())
             }
-            _ if f.display_target.is_source_code() => write!(f, "'_"),
+            _ if f.display_kind.is_source_code() => write!(f, "'_"),
             LifetimeData::BoundVar(idx) => idx.hir_fmt(f),
             LifetimeData::InferenceVar(_) => write!(f, "_"),
             LifetimeData::Static => write!(f, "'static"),
@@ -2101,16 +2128,16 @@ impl HirDisplayWithTypesMap for TypeRefId {
                 write!(f, "]")?;
             }
             TypeRef::Fn(fn_) => {
-                if fn_.is_unsafe() {
+                if fn_.is_unsafe {
                     write!(f, "unsafe ")?;
                 }
-                if let Some(abi) = fn_.abi() {
+                if let Some(abi) = &fn_.abi {
                     f.write_str("extern \"")?;
                     f.write_str(abi.as_str())?;
                     f.write_str("\" ")?;
                 }
                 write!(f, "fn(")?;
-                if let Some(((_, return_type), function_parameters)) = fn_.params().split_last() {
+                if let Some(((_, return_type), function_parameters)) = fn_.params.split_last() {
                     for index in 0..function_parameters.len() {
                         let (param_name, param_type) = &function_parameters[index];
                         if let Some(name) = param_name {
@@ -2123,8 +2150,8 @@ impl HirDisplayWithTypesMap for TypeRefId {
                             write!(f, ", ")?;
                         }
                     }
-                    if fn_.is_varargs() {
-                        write!(f, "{}...", if fn_.params().len() == 1 { "" } else { ", " })?;
+                    if fn_.is_varargs {
+                        write!(f, "{}...", if fn_.params.len() == 1 { "" } else { ", " })?;
                     }
                     write!(f, ")")?;
                     match &types_map[*return_type] {
@@ -2241,8 +2268,8 @@ impl HirDisplayWithTypesMap for Path {
                 // Resolve `$crate` to the crate's display name.
                 // FIXME: should use the dependency name instead if available, but that depends on
                 // the crate invoking `HirDisplay`
-                let crate_graph = f.db.crate_graph();
-                let name = crate_graph[*id]
+                let crate_data = id.extra_data(f.db);
+                let name = crate_data
                     .display_name
                     .as_ref()
                     .map(|name| name.canonical_name())
@@ -2278,77 +2305,82 @@ impl HirDisplayWithTypesMap for Path {
             if let Some(generic_args) = segment.args_and_bindings {
                 // We should be in type context, so format as `Foo<Bar>` instead of `Foo::<Bar>`.
                 // Do we actually format expressions?
-                if generic_args.desugared_from_fn {
-                    // First argument will be a tuple, which already includes the parentheses.
-                    // If the tuple only contains 1 item, write it manually to avoid the trailing `,`.
-                    let tuple = match generic_args.args[0] {
-                        hir_def::path::GenericArg::Type(ty) => match &types_map[ty] {
-                            TypeRef::Tuple(it) => Some(it),
+                match generic_args.parenthesized {
+                    hir_def::path::GenericArgsParentheses::ReturnTypeNotation => {
+                        write!(f, "(..)")?;
+                    }
+                    hir_def::path::GenericArgsParentheses::ParenSugar => {
+                        // First argument will be a tuple, which already includes the parentheses.
+                        // If the tuple only contains 1 item, write it manually to avoid the trailing `,`.
+                        let tuple = match generic_args.args[0] {
+                            hir_def::path::GenericArg::Type(ty) => match &types_map[ty] {
+                                TypeRef::Tuple(it) => Some(it),
+                                _ => None,
+                            },
                             _ => None,
-                        },
-                        _ => None,
-                    };
-                    if let Some(v) = tuple {
-                        if v.len() == 1 {
-                            write!(f, "(")?;
-                            v[0].hir_fmt(f, types_map)?;
-                            write!(f, ")")?;
-                        } else {
-                            generic_args.args[0].hir_fmt(f, types_map)?;
+                        };
+                        if let Some(v) = tuple {
+                            if v.len() == 1 {
+                                write!(f, "(")?;
+                                v[0].hir_fmt(f, types_map)?;
+                                write!(f, ")")?;
+                            } else {
+                                generic_args.args[0].hir_fmt(f, types_map)?;
+                            }
+                        }
+                        if let Some(ret) = generic_args.bindings[0].type_ref {
+                            if !matches!(&types_map[ret], TypeRef::Tuple(v) if v.is_empty()) {
+                                write!(f, " -> ")?;
+                                ret.hir_fmt(f, types_map)?;
+                            }
                         }
                     }
-                    if let Some(ret) = generic_args.bindings[0].type_ref {
-                        if !matches!(&types_map[ret], TypeRef::Tuple(v) if v.is_empty()) {
-                            write!(f, " -> ")?;
-                            ret.hir_fmt(f, types_map)?;
+                    hir_def::path::GenericArgsParentheses::No => {
+                        let mut first = true;
+                        // Skip the `Self` bound if exists. It's handled outside the loop.
+                        for arg in &generic_args.args[generic_args.has_self_type as usize..] {
+                            if first {
+                                first = false;
+                                write!(f, "<")?;
+                            } else {
+                                write!(f, ", ")?;
+                            }
+                            arg.hir_fmt(f, types_map)?;
                         }
-                    }
-                    return Ok(());
-                }
+                        for binding in generic_args.bindings.iter() {
+                            if first {
+                                first = false;
+                                write!(f, "<")?;
+                            } else {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{}", binding.name.display(f.db.upcast(), f.edition()))?;
+                            match &binding.type_ref {
+                                Some(ty) => {
+                                    write!(f, " = ")?;
+                                    ty.hir_fmt(f, types_map)?
+                                }
+                                None => {
+                                    write!(f, ": ")?;
+                                    f.write_joined(
+                                        binding.bounds.iter().map(TypesMapAdapter::wrap(types_map)),
+                                        " + ",
+                                    )?;
+                                }
+                            }
+                        }
 
-                let mut first = true;
-                // Skip the `Self` bound if exists. It's handled outside the loop.
-                for arg in &generic_args.args[generic_args.has_self_type as usize..] {
-                    if first {
-                        first = false;
-                        write!(f, "<")?;
-                    } else {
-                        write!(f, ", ")?;
-                    }
-                    arg.hir_fmt(f, types_map)?;
-                }
-                for binding in generic_args.bindings.iter() {
-                    if first {
-                        first = false;
-                        write!(f, "<")?;
-                    } else {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", binding.name.display(f.db.upcast(), f.edition()))?;
-                    match &binding.type_ref {
-                        Some(ty) => {
-                            write!(f, " = ")?;
-                            ty.hir_fmt(f, types_map)?
+                        // There may be no generic arguments to print, in case of a trait having only a
+                        // single `Self` bound which is converted to `<Ty as Trait>::Assoc`.
+                        if !first {
+                            write!(f, ">")?;
                         }
-                        None => {
-                            write!(f, ": ")?;
-                            f.write_joined(
-                                binding.bounds.iter().map(TypesMapAdapter::wrap(types_map)),
-                                " + ",
-                            )?;
+
+                        // Current position: `<Ty as Trait<Args>|`
+                        if generic_args.has_self_type {
+                            write!(f, ">")?;
                         }
                     }
-                }
-
-                // There may be no generic arguments to print, in case of a trait having only a
-                // single `Self` bound which is converted to `<Ty as Trait>::Assoc`.
-                if !first {
-                    write!(f, ">")?;
-                }
-
-                // Current position: `<Ty as Trait<Args>|`
-                if generic_args.has_self_type {
-                    write!(f, ">")?;
                 }
             }
         }

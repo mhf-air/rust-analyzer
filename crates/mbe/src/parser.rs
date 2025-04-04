@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use arrayvec::ArrayVec;
-use intern::{sym, Symbol};
-use span::{Edition, Span, SyntaxContextId};
+use intern::{Symbol, sym};
+use span::{Edition, Span, SyntaxContext};
 use tt::iter::{TtElement, TtIter};
 
 use crate::ParseError;
@@ -28,14 +28,14 @@ pub(crate) struct MetaTemplate(pub(crate) Box<[Op]>);
 
 impl MetaTemplate {
     pub(crate) fn parse_pattern(
-        edition: impl Copy + Fn(SyntaxContextId) -> Edition,
+        edition: impl Copy + Fn(SyntaxContext) -> Edition,
         pattern: TtIter<'_, Span>,
     ) -> Result<Self, ParseError> {
         MetaTemplate::parse(edition, pattern, Mode::Pattern)
     }
 
     pub(crate) fn parse_template(
-        edition: impl Copy + Fn(SyntaxContextId) -> Edition,
+        edition: impl Copy + Fn(SyntaxContext) -> Edition,
         template: TtIter<'_, Span>,
     ) -> Result<Self, ParseError> {
         MetaTemplate::parse(edition, template, Mode::Template)
@@ -46,7 +46,7 @@ impl MetaTemplate {
     }
 
     fn parse(
-        edition: impl Copy + Fn(SyntaxContextId) -> Edition,
+        edition: impl Copy + Fn(SyntaxContext) -> Edition,
         mut src: TtIter<'_, Span>,
         mode: Mode,
     ) -> Result<Self, ParseError> {
@@ -179,7 +179,7 @@ enum Mode {
 }
 
 fn next_op(
-    edition: impl Copy + Fn(SyntaxContextId) -> Edition,
+    edition: impl Copy + Fn(SyntaxContext) -> Edition,
     first_peeked: TtElement<'_, Span>,
     src: &mut TtIter<'_, Span>,
     mode: Mode,
@@ -194,7 +194,7 @@ fn next_op(
                         let mut res = ArrayVec::new();
                         res.push(*p);
                         Box::new(res)
-                    }))
+                    }));
                 }
                 Some(it) => it,
             };
@@ -212,13 +212,13 @@ fn next_op(
                         Mode::Pattern => {
                             return Err(ParseError::unexpected(
                                 "`${}` metavariable expressions are not allowed in matchers",
-                            ))
+                            ));
                         }
                     },
                     _ => {
                         return Err(ParseError::expected(
                             "expected `$()` repetition or `${}` expression",
-                        ))
+                        ));
                     }
                 },
                 TtElement::Leaf(leaf) => match leaf {
@@ -246,7 +246,7 @@ fn next_op(
                         Mode::Pattern => {
                             return Err(ParseError::unexpected(
                                 "`$$` is not allowed on the pattern side",
-                            ))
+                            ));
                         }
                         Mode::Template => Op::Punct({
                             let mut res = ArrayVec::new();
@@ -255,7 +255,7 @@ fn next_op(
                         }),
                     },
                     tt::Leaf::Punct(_) | tt::Leaf::Literal(_) => {
-                        return Err(ParseError::expected("expected ident"))
+                        return Err(ParseError::expected("expected ident"));
                     }
                 },
             }
@@ -287,7 +287,7 @@ fn next_op(
 }
 
 fn eat_fragment_kind(
-    edition: impl Copy + Fn(SyntaxContextId) -> Edition,
+    edition: impl Copy + Fn(SyntaxContext) -> Edition,
     src: &mut TtIter<'_, Span>,
     mode: Mode,
 ) -> Result<Option<MetaVarKind>, ParseError> {
@@ -348,7 +348,7 @@ fn parse_repeat(src: &mut TtIter<'_, Span>) -> Result<(Option<Separator>, Repeat
         };
         match tt {
             tt::Leaf::Ident(_) | tt::Leaf::Literal(_) if has_sep => {
-                return Err(ParseError::InvalidRepeat)
+                return Err(ParseError::InvalidRepeat);
             }
             tt::Leaf::Ident(ident) => separator = Separator::Ident(ident.clone()),
             tt::Leaf::Literal(lit) => separator = Separator::Literal(lit.clone()),

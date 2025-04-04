@@ -6,21 +6,21 @@ use std::fmt;
 use hir_def::{DefWithBodyId, EnumId, EnumVariantId, HasModule, LocalFieldId, ModuleId, VariantId};
 use intern::sym;
 use rustc_pattern_analysis::{
-    constructor::{Constructor, ConstructorSet, VariantVisibility},
-    usefulness::{compute_match_usefulness, PlaceValidity, UsefulnessReport},
     Captures, IndexVec, PatCx, PrivateUninhabitedField,
+    constructor::{Constructor, ConstructorSet, VariantVisibility},
+    usefulness::{PlaceValidity, UsefulnessReport, compute_match_usefulness},
 };
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use stdx::never;
 
 use crate::{
+    AdtId, Interner, Scalar, Ty, TyExt, TyKind,
     db::HirDatabase,
     infer::normalize,
     inhabitedness::{is_enum_variant_uninhabited_from, is_ty_uninhabited_from},
-    AdtId, Interner, Scalar, Ty, TyExt, TyKind,
 };
 
-use super::{is_box, FieldPat, Pat, PatKind};
+use super::{FieldPat, Pat, PatKind, is_box};
 
 use Constructor::*;
 
@@ -49,7 +49,7 @@ impl EnumVariantContiguousIndex {
     }
 
     fn to_enum_variant_id(self, db: &dyn HirDatabase, eid: EnumId) -> EnumVariantId {
-        db.enum_data(eid).variants[self.0].0
+        db.enum_variants(eid).variants[self.0].0
     }
 }
 
@@ -449,7 +449,7 @@ impl PatCx for MatchCheckCtx<'_> {
             TyKind::Scalar(Scalar::Int(..) | Scalar::Uint(..)) => unhandled(),
             TyKind::Array(..) | TyKind::Slice(..) => unhandled(),
             &TyKind::Adt(AdtId(adt @ hir_def::AdtId::EnumId(enum_id)), ref subst) => {
-                let enum_data = cx.db.enum_data(enum_id);
+                let enum_data = cx.db.enum_variants(enum_id);
                 let is_declared_nonexhaustive = cx.is_foreign_non_exhaustive(adt);
 
                 if enum_data.variants.is_empty() && !is_declared_nonexhaustive {

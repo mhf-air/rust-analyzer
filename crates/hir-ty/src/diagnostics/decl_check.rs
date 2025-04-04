@@ -16,20 +16,20 @@ mod case_conv;
 use std::fmt;
 
 use hir_def::{
-    data::adt::VariantData, db::DefDatabase, hir::Pat, src::HasSource, AdtId, ConstId, EnumId,
-    EnumVariantId, FunctionId, HasModule, ItemContainerId, Lookup, ModuleDefId, ModuleId, StaticId,
-    StructId, TraitId, TypeAliasId,
+    AdtId, ConstId, EnumId, EnumVariantId, FunctionId, HasModule, ItemContainerId, Lookup,
+    ModuleDefId, ModuleId, StaticId, StructId, TraitId, TypeAliasId, data::adt::VariantData,
+    db::DefDatabase, hir::Pat, src::HasSource,
 };
 use hir_expand::{
-    name::{AsName, Name},
     HirFileId, HirFileIdExt,
+    name::{AsName, Name},
 };
 use intern::sym;
 use stdx::{always, never};
 use syntax::{
+    AstNode, AstPtr, ToSmolStr,
     ast::{self, HasName},
     utils::is_raw_identifier,
-    AstNode, AstPtr, ToSmolStr,
 };
 
 use crate::db::HirDatabase;
@@ -251,7 +251,7 @@ impl<'a> DeclValidator<'a> {
             return;
         }
 
-        let (_, source_map) = self.db.body_with_source_map(func.into());
+        let source_map = self.db.body_with_source_map(func.into()).1;
         for (id, replacement) in pats_replacements {
             let Ok(source_ptr) = source_map.pat_syntax(id) else {
                 continue;
@@ -288,7 +288,7 @@ impl<'a> DeclValidator<'a> {
 
     fn edition(&self, id: impl HasModule) -> span::Edition {
         let krate = id.krate(self.db.upcast());
-        self.db.crate_graph()[krate].edition
+        krate.data(self.db).edition
     }
 
     fn validate_struct(&mut self, struct_id: StructId) {
@@ -307,8 +307,8 @@ impl<'a> DeclValidator<'a> {
 
     /// Check incorrect names for struct fields.
     fn validate_struct_fields(&mut self, struct_id: StructId) {
-        let data = self.db.struct_data(struct_id);
-        let VariantData::Record { fields, .. } = data.variant_data.as_ref() else {
+        let data = self.db.variant_data(struct_id.into());
+        let VariantData::Record { fields, .. } = data.as_ref() else {
             return;
         };
         let edition = self.edition(struct_id);
@@ -394,7 +394,7 @@ impl<'a> DeclValidator<'a> {
 
     /// Check incorrect names for enum variants.
     fn validate_enum_variants(&mut self, enum_id: EnumId) {
-        let data = self.db.enum_data(enum_id);
+        let data = self.db.enum_variants(enum_id);
 
         for (variant_id, _) in data.variants.iter() {
             self.validate_enum_variant_fields(*variant_id);
@@ -467,8 +467,8 @@ impl<'a> DeclValidator<'a> {
 
     /// Check incorrect names for fields of enum variant.
     fn validate_enum_variant_fields(&mut self, variant_id: EnumVariantId) {
-        let variant_data = self.db.enum_variant_data(variant_id);
-        let VariantData::Record { fields, .. } = variant_data.variant_data.as_ref() else {
+        let variant_data = self.db.variant_data(variant_id.into());
+        let VariantData::Record { fields, .. } = variant_data.as_ref() else {
             return;
         };
         let edition = self.edition(variant_id);
@@ -558,7 +558,7 @@ impl<'a> DeclValidator<'a> {
 
     fn validate_static(&mut self, static_id: StaticId) {
         let data = self.db.static_data(static_id);
-        if data.is_extern {
+        if data.is_extern() {
             cov_mark::hit!(extern_static_incorrect_case_ignored);
             return;
         }
@@ -597,7 +597,7 @@ impl<'a> DeclValidator<'a> {
     ) where
         N: AstNode + HasName + fmt::Debug,
         S: HasSource<Value = N>,
-        L: Lookup<Data = S, Database<'a> = dyn DefDatabase + 'a> + HasModule + Copy,
+        L: Lookup<Data = S, Database = dyn DefDatabase> + HasModule + Copy,
     {
         let to_expected_case_type = match expected_case {
             CaseType::LowerSnakeCase => to_lower_snake_case,

@@ -5,34 +5,34 @@
 use std::ops::ControlFlow;
 
 use arrayvec::ArrayVec;
-use base_db::CrateId;
-use chalk_ir::{cast::Cast, UniverseIndex, WithKind};
+use base_db::Crate;
+use chalk_ir::{UniverseIndex, WithKind, cast::Cast};
 use hir_def::{
-    data::{adt::StructFlags, ImplData, TraitFlags},
-    nameres::DefMap,
     AssocItemId, BlockId, ConstId, FunctionId, HasModule, ImplId, ItemContainerId, Lookup,
     ModuleId, TraitId,
+    data::{TraitFlags, adt::StructFlags},
+    nameres::{DefMap, assoc::ImplItems},
 };
 use hir_expand::name::Name;
 use intern::sym;
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use stdx::never;
 use triomphe::Arc;
 
 use crate::{
-    autoderef::{self, AutoderefKind},
-    db::HirDatabase,
-    error_lifetime, from_chalk_trait_id, from_foreign_def_id,
-    infer::{unify::InferenceTable, Adjust, Adjustment, OverloadedDeref, PointerCast},
-    lang_items::is_box,
-    primitive::{FloatTy, IntTy, UintTy},
-    to_chalk_trait_id,
-    utils::all_super_traits,
     AdtId, Canonical, CanonicalVarKinds, DebruijnIndex, DynTyExt, ForeignDefId, GenericArgData,
     Goal, Guidance, InEnvironment, Interner, Mutability, Scalar, Solution, Substitution,
     TraitEnvironment, TraitRef, TraitRefExt, Ty, TyBuilder, TyExt, TyKind, TyVariableKind,
     VariableKind, WhereClause,
+    autoderef::{self, AutoderefKind},
+    db::HirDatabase,
+    error_lifetime, from_chalk_trait_id, from_foreign_def_id,
+    infer::{Adjust, Adjustment, OverloadedDeref, PointerCast, unify::InferenceTable},
+    lang_items::is_box,
+    primitive::{FloatTy, IntTy, UintTy},
+    to_chalk_trait_id,
+    utils::all_super_traits,
 };
 
 /// This is used as a key for indexing impls.
@@ -148,7 +148,7 @@ pub struct TraitImpls {
 }
 
 impl TraitImpls {
-    pub(crate) fn trait_impls_in_crate_query(db: &dyn HirDatabase, krate: CrateId) -> Arc<Self> {
+    pub(crate) fn trait_impls_in_crate_query(db: &dyn HirDatabase, krate: Crate) -> Arc<Self> {
         let _p = tracing::info_span!("trait_impls_in_crate_query", ?krate).entered();
         let mut impls = FxHashMap::default();
 
@@ -166,22 +166,16 @@ impl TraitImpls {
 
         Self::collect_def_map(db, &mut impls, &db.block_def_map(block));
 
-        if impls.is_empty() {
-            None
-        } else {
-            Some(Arc::new(Self::finish(impls)))
-        }
+        if impls.is_empty() { None } else { Some(Arc::new(Self::finish(impls))) }
     }
 
     pub(crate) fn trait_impls_in_deps_query(
         db: &dyn HirDatabase,
-        krate: CrateId,
+        krate: Crate,
     ) -> Arc<[Arc<Self>]> {
         let _p = tracing::info_span!("trait_impls_in_deps_query", ?krate).entered();
-        let crate_graph = db.crate_graph();
-
         Arc::from_iter(
-            crate_graph.transitive_deps(krate).map(|krate| db.trait_impls_in_crate(krate)),
+            db.transitive_deps(krate).into_iter().map(|krate| db.trait_impls_in_crate(krate)),
         )
     }
 
@@ -282,7 +276,7 @@ pub struct InherentImpls {
 }
 
 impl InherentImpls {
-    pub(crate) fn inherent_impls_in_crate_query(db: &dyn HirDatabase, krate: CrateId) -> Arc<Self> {
+    pub(crate) fn inherent_impls_in_crate_query(db: &dyn HirDatabase, krate: Crate) -> Arc<Self> {
         let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
         let mut impls = Self { map: FxHashMap::default(), invalid_impls: Vec::default() };
 
@@ -327,7 +321,7 @@ impl InherentImpls {
                 let self_ty = db.impl_self_ty(impl_id);
                 let self_ty = self_ty.skip_binders();
 
-                match is_inherent_impl_coherent(db, def_map, &data, self_ty) {
+                match is_inherent_impl_coherent(db, def_map, impl_id, self_ty) {
                     true => {
                         // `fp` should only be `None` in error cases (either erroneous code or incomplete name resolution)
                         if let Some(fp) = TyFingerprint::for_inherent_impl(self_ty) {
@@ -367,16 +361,15 @@ impl InherentImpls {
 
 pub(crate) fn incoherent_inherent_impl_crates(
     db: &dyn HirDatabase,
-    krate: CrateId,
+    krate: Crate,
     fp: TyFingerprint,
-) -> SmallVec<[CrateId; 2]> {
+) -> SmallVec<[Crate; 2]> {
     let _p = tracing::info_span!("incoherent_inherent_impl_crates").entered();
     let mut res = SmallVec::new();
-    let crate_graph = db.crate_graph();
 
     // should pass crate for finger print and do reverse deps
 
-    for krate in crate_graph.transitive_deps(krate) {
+    for krate in db.transitive_deps(krate) {
         let impls = db.inherent_impls_in_crate(krate);
         if impls.map.get(&fp).is_some_and(|v| !v.is_empty()) {
             res.push(krate);
@@ -386,11 +379,7 @@ pub(crate) fn incoherent_inherent_impl_crates(
     res
 }
 
-pub fn def_crates(
-    db: &dyn HirDatabase,
-    ty: &Ty,
-    cur_crate: CrateId,
-) -> Option<SmallVec<[CrateId; 2]>> {
+pub fn def_crates(db: &dyn HirDatabase, ty: &Ty, cur_crate: Crate) -> Option<SmallVec<[Crate; 2]>> {
     match ty.kind(Interner) {
         &TyKind::Adt(AdtId(def_id), _) => {
             let rustc_has_incoherent_inherent_impls = match def_id {
@@ -412,7 +401,7 @@ pub fn def_crates(
         }
         &TyKind::Foreign(id) => {
             let alias = from_foreign_def_id(id);
-            Some(if db.type_alias_data(alias).rustc_has_incoherent_inherent_impls {
+            Some(if db.type_alias_data(alias).rustc_has_incoherent_inherent_impls() {
                 db.incoherent_inherent_impl_crates(cur_crate, TyFingerprint::ForeignType(id))
             } else {
                 smallvec![alias.module(db.upcast()).krate()]
@@ -596,7 +585,7 @@ pub(crate) fn iterate_method_candidates<T>(
     mut callback: impl FnMut(ReceiverAdjustments, AssocItemId, bool) -> Option<T>,
 ) -> Option<T> {
     let mut slot = None;
-    iterate_method_candidates_dyn(
+    _ = iterate_method_candidates_dyn(
         ty,
         db,
         env,
@@ -705,15 +694,12 @@ pub(crate) fn lookup_impl_method_query(
     let name = &db.function_data(func).name;
     let Some((impl_fn, impl_subst)) =
         lookup_impl_assoc_item_for_trait_ref(trait_ref, db, env, name).and_then(|assoc| {
-            if let (AssocItemId::FunctionId(id), subst) = assoc {
-                Some((id, subst))
-            } else {
-                None
-            }
+            if let (AssocItemId::FunctionId(id), subst) = assoc { Some((id, subst)) } else { None }
         })
     else {
         return (func, fn_subst);
     };
+
     (
         impl_fn,
         Substitution::from_iter(
@@ -771,11 +757,10 @@ fn find_matching_impl(
     mut impls: impl Iterator<Item = ImplId>,
     mut table: InferenceTable<'_>,
     actual_trait_ref: TraitRef,
-) -> Option<(Arc<ImplData>, Substitution)> {
+) -> Option<(Arc<ImplItems>, Substitution)> {
     let db = table.db;
     impls.find_map(|impl_| {
         table.run_in_snapshot(|table| {
-            let impl_data = db.impl_data(impl_);
             let impl_substs =
                 TyBuilder::subst_for_def(db, impl_, None).fill_with_inference_vars(table).build();
             let trait_ref = db
@@ -793,7 +778,7 @@ fn find_matching_impl(
             let goal = crate::Goal::all(Interner, wcs);
             table.try_obligation(goal.clone())?;
             table.register_obligation(goal);
-            Some((impl_data, table.resolve_completely(impl_substs)))
+            Some((db.impl_items(impl_), table.resolve_completely(impl_substs)))
         })
     })
 }
@@ -801,7 +786,7 @@ fn find_matching_impl(
 fn is_inherent_impl_coherent(
     db: &dyn HirDatabase,
     def_map: &DefMap,
-    impl_data: &ImplData,
+    impl_id: ImplId,
     self_ty: &Ty,
 ) -> bool {
     let self_ty = self_ty.kind(Interner);
@@ -854,12 +839,15 @@ fn is_inherent_impl_coherent(
 
             _ => false,
         };
+        let items = db.impl_items(impl_id);
         rustc_has_incoherent_inherent_impls
-            && !impl_data.items.is_empty()
-            && impl_data.items.iter().all(|&(_, assoc)| match assoc {
-                AssocItemId::FunctionId(it) => db.function_data(it).rustc_allow_incoherent_impl,
-                AssocItemId::ConstId(it) => db.const_data(it).rustc_allow_incoherent_impl,
-                AssocItemId::TypeAliasId(it) => db.type_alias_data(it).rustc_allow_incoherent_impl,
+            && !items.items.is_empty()
+            && items.items.iter().all(|&(_, assoc)| match assoc {
+                AssocItemId::FunctionId(it) => db.function_data(it).rustc_allow_incoherent_impl(),
+                AssocItemId::ConstId(it) => db.const_data(it).rustc_allow_incoherent_impl(),
+                AssocItemId::TypeAliasId(it) => {
+                    db.type_alias_data(it).rustc_allow_incoherent_impl()
+                }
             })
     }
 }
@@ -888,24 +876,32 @@ pub fn check_orphan_rules(db: &dyn HirDatabase, impl_: ImplId) -> bool {
         return true;
     }
 
-    let unwrap_fundamental = |ty: Ty| match ty.kind(Interner) {
-        TyKind::Ref(_, _, referenced) => referenced.clone(),
-        &TyKind::Adt(AdtId(hir_def::AdtId::StructId(s)), ref subs) => {
-            let struct_data = db.struct_data(s);
-            if struct_data.flags.contains(StructFlags::IS_FUNDAMENTAL) {
-                let next = subs.type_parameters(Interner).next();
-                match next {
-                    Some(ty) => ty,
-                    None => ty,
+    let unwrap_fundamental = |mut ty: Ty| {
+        // Unwrap all layers of fundamental types with a loop.
+        loop {
+            match ty.kind(Interner) {
+                TyKind::Ref(_, _, referenced) => ty = referenced.clone(),
+                &TyKind::Adt(AdtId(hir_def::AdtId::StructId(s)), ref subs) => {
+                    let struct_data = db.struct_data(s);
+                    if struct_data.flags.contains(StructFlags::IS_FUNDAMENTAL) {
+                        let next = subs.type_parameters(Interner).next();
+                        match next {
+                            Some(it) => ty = it,
+                            None => break ty,
+                        }
+                    } else {
+                        break ty;
+                    }
                 }
-            } else {
-                ty
+                _ => break ty,
             }
         }
-        _ => ty,
     };
     //   - At least one of the types `T0..=Tn`` must be a local type. Let `Ti`` be the first such type.
-    let is_not_orphan = trait_ref.substitution.type_parameters(Interner).any(|ty| {
+
+    // FIXME: param coverage
+    //   - No uncovered type parameters `P1..=Pn` may appear in `T0..Ti`` (excluding `Ti`)
+    trait_ref.substitution.type_parameters(Interner).any(|ty| {
         match unwrap_fundamental(ty).kind(Interner) {
             &TyKind::Adt(AdtId(id), _) => is_local(id.module(db.upcast()).krate()),
             TyKind::Error => true,
@@ -914,10 +910,7 @@ pub fn check_orphan_rules(db: &dyn HirDatabase, impl_: ImplId) -> bool {
             }),
             _ => false,
         }
-    });
-    // FIXME: param coverage
-    //   - No uncovered type parameters `P1..=Pn` may appear in `T0..Ti`` (excluding `Ti`)
-    is_not_orphan
+    })
 }
 
 pub fn iterate_path_candidates(
@@ -1225,7 +1218,7 @@ fn iterate_trait_method_candidates(
         {
             // FIXME: this should really be using the edition of the method name's span, in case it
             // comes from a macro
-            if !db.crate_graph()[krate].edition.at_least_2021() {
+            if !krate.data(db).edition.at_least_2021() {
                 continue;
             }
         }
@@ -1238,7 +1231,7 @@ fn iterate_trait_method_candidates(
         {
             // FIXME: this should really be using the edition of the method name's span, in case it
             // comes from a macro
-            if !db.crate_graph()[krate].edition.at_least_2024() {
+            if !krate.data(db).edition.at_least_2024() {
                 continue;
             }
         }
@@ -1247,7 +1240,7 @@ fn iterate_trait_method_candidates(
         // trait, but if we find out it doesn't, we'll skip the rest of the
         // iteration
         let mut known_implemented = false;
-        for &(_, item) in data.items.iter() {
+        for &(_, item) in db.trait_items(t).items.iter() {
             // Don't pass a `visible_from_module` down to `is_valid_candidate`,
             // since only inherent methods should be included into visibility checking.
             let visible =
@@ -1374,7 +1367,7 @@ fn iterate_inherent_methods(
     ) -> ControlFlow<()> {
         let db = table.db;
         for t in traits {
-            let data = db.trait_data(t);
+            let data = db.trait_items(t);
             for &(_, item) in data.items.iter() {
                 // We don't pass `visible_from_module` as all trait items should be visible.
                 let visible = match is_valid_trait_method_candidate(
@@ -1407,7 +1400,7 @@ fn iterate_inherent_methods(
         callback: &mut dyn FnMut(ReceiverAdjustments, AssocItemId, bool) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
         for &impl_id in impls.for_self_ty(self_ty) {
-            for &(ref item_name, item) in table.db.impl_data(impl_id).items.iter() {
+            for &(ref item_name, item) in table.db.impl_items(impl_id).items.iter() {
                 let visible = match is_valid_impl_method_candidate(
                     table,
                     self_ty,

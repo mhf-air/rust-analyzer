@@ -2,9 +2,9 @@
 
 use either::Either;
 use hir_def::{
+    CallableDefId, Lookup, MacroId, VariantId,
     nameres::{ModuleOrigin, ModuleSource},
     src::{HasChildSource, HasSource as _},
-    CallableDefId, Lookup, MacroId, VariantId,
 };
 use hir_expand::{HirFileId, InFile};
 use hir_ty::db::InternedClosure;
@@ -13,9 +13,10 @@ use syntax::ast;
 use tt::TextRange;
 
 use crate::{
-    db::HirDatabase, Adt, Callee, Const, Enum, ExternCrateDecl, Field, FieldSource, Function, Impl,
+    Adt, Callee, Const, Enum, ExternCrateDecl, Field, FieldSource, Function, Impl,
     InlineAsmOperand, Label, LifetimeParam, LocalSource, Macro, Module, Param, SelfParam, Static,
-    Struct, Trait, TraitAlias, TypeAlias, TypeOrConstParam, Union, Variant,
+    Struct, Trait, TraitAlias, TypeAlias, TypeOrConstParam, Union, Variant, VariantDef,
+    db::HirDatabase,
 };
 
 pub trait HasSource {
@@ -107,6 +108,16 @@ impl HasSource for Adt {
             Adt::Struct(s) => Some(s.source(db)?.map(ast::Adt::Struct)),
             Adt::Union(u) => Some(u.source(db)?.map(ast::Adt::Union)),
             Adt::Enum(e) => Some(e.source(db)?.map(ast::Adt::Enum)),
+        }
+    }
+}
+impl HasSource for VariantDef {
+    type Ast = ast::VariantDef;
+    fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
+        match self {
+            VariantDef::Struct(s) => Some(s.source(db)?.map(ast::VariantDef::Struct)),
+            VariantDef::Union(u) => Some(u.source(db)?.map(ast::VariantDef::Union)),
+            VariantDef::Variant(v) => Some(v.source(db)?.map(ast::VariantDef::Variant)),
         }
     }
 }
@@ -296,7 +307,7 @@ impl HasSource for ExternCrateDecl {
 impl HasSource for InlineAsmOperand {
     type Ast = ast::AsmOperandNamed;
     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
-        let (_body, source_map) = db.body_with_source_map(self.owner);
+        let source_map = db.body_with_source_map(self.owner).1;
         if let Ok(src) = source_map.expr_syntax(self.expr) {
             let root = src.file_syntax(db.upcast());
             return src

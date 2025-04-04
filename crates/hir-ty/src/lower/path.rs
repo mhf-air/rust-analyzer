@@ -2,32 +2,32 @@
 
 use std::iter;
 
-use chalk_ir::{cast::Cast, fold::Shift, BoundVar};
+use chalk_ir::{BoundVar, cast::Cast, fold::Shift};
 use either::Either;
 use hir_def::{
+    GenericDefId, GenericParamId, ItemContainerId, Lookup, TraitId,
     data::TraitFlags,
     expr_store::HygieneId,
     generics::{TypeParamProvenance, WherePredicate, WherePredicateTypeTarget},
-    path::{GenericArg, GenericArgs, Path, PathSegment, PathSegments},
+    path::{GenericArg, GenericArgs, GenericArgsParentheses, Path, PathSegment, PathSegments},
     resolver::{ResolveValueResult, TypeNs, ValueNs},
     type_ref::{TypeBound, TypeRef, TypesMap},
-    GenericDefId, GenericParamId, ItemContainerId, Lookup, TraitId,
 };
 use smallvec::SmallVec;
 use stdx::never;
 
 use crate::{
+    AliasEq, AliasTy, GenericArgsProhibitedReason, ImplTraitLoweringMode, Interner,
+    ParamLoweringMode, PathLoweringDiagnostic, ProjectionTy, QuantifiedWhereClause, Substitution,
+    TraitRef, Ty, TyBuilder, TyDefId, TyKind, TyLoweringContext, ValueTyDefId, WhereClause,
     consteval::unknown_const_as_generic,
     error_lifetime,
     generics::generics,
     lower::{
-        generic_arg_to_chalk, named_associated_type_shorthand_candidates, ImplTraitLoweringState,
+        ImplTraitLoweringState, generic_arg_to_chalk, named_associated_type_shorthand_candidates,
     },
     to_assoc_type_id, to_chalk_trait_id, to_placeholder_idx,
     utils::associated_type_by_name_including_super_traits,
-    AliasEq, AliasTy, GenericArgsProhibitedReason, ImplTraitLoweringMode, Interner,
-    ParamLoweringMode, PathLoweringDiagnostic, ProjectionTy, QuantifiedWhereClause, Substitution,
-    TraitRef, Ty, TyBuilder, TyDefId, TyKind, TyLoweringContext, ValueTyDefId, WhereClause,
 };
 
 type CallbackData<'a> = Either<
@@ -138,12 +138,15 @@ impl<'a, 'b> PathLoweringContext<'a, 'b> {
 
     fn prohibit_parenthesized_generic_args(&mut self) -> bool {
         if let Some(generic_args) = self.current_or_prev_segment.args_and_bindings {
-            if generic_args.desugared_from_fn {
-                let segment = self.current_segment_u32();
-                self.on_diagnostic(
-                    PathLoweringDiagnostic::ParenthesizedGenericArgsWithoutFnTrait { segment },
-                );
-                return true;
+            match generic_args.parenthesized {
+                GenericArgsParentheses::No => {}
+                GenericArgsParentheses::ReturnTypeNotation | GenericArgsParentheses::ParenSugar => {
+                    let segment = self.current_segment_u32();
+                    self.on_diagnostic(
+                        PathLoweringDiagnostic::ParenthesizedGenericArgsWithoutFnTrait { segment },
+                    );
+                    return true;
+                }
             }
         }
         false
@@ -169,7 +172,7 @@ impl<'a, 'b> PathLoweringContext<'a, 'b> {
                         self.skip_resolved_segment();
                         let segment = self.current_or_prev_segment;
                         let found =
-                            self.ctx.db.trait_data(trait_).associated_type_by_name(segment.name);
+                            self.ctx.db.trait_items(trait_).associated_type_by_name(segment.name);
 
                         match found {
                             Some(associated_ty) => {
@@ -604,8 +607,14 @@ impl<'a, 'b> PathLoweringContext<'a, 'b> {
     ) -> Substitution {
         let prohibit_parens = match def {
             GenericDefId::TraitId(trait_) => {
-                let trait_data = self.ctx.db.trait_data(trait_);
-                !trait_data.flags.contains(TraitFlags::RUSTC_PAREN_SUGAR)
+                // RTN is prohibited anyways if we got here.
+                let is_rtn =
+                    self.current_or_prev_segment.args_and_bindings.is_some_and(|generics| {
+                        generics.parenthesized == GenericArgsParentheses::ReturnTypeNotation
+                    });
+                let is_fn_trait =
+                    !self.ctx.db.trait_data(trait_).flags.contains(TraitFlags::RUSTC_PAREN_SUGAR);
+                is_rtn || is_fn_trait
             }
             _ => true,
         };

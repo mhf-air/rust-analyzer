@@ -1,26 +1,33 @@
 //! Constant evaluation details
 
-use base_db::{ra_salsa::Cycle, CrateId};
-use chalk_ir::{cast::Cast, BoundVar, DebruijnIndex};
+use base_db::Crate;
+use chalk_ir::{BoundVar, DebruijnIndex, cast::Cast};
 use hir_def::{
+    ConstBlockLoc, EnumVariantId, GeneralConstId, HasModule as _, StaticId,
     expr_store::{Body, HygieneId},
     hir::{Expr, ExprId},
     path::Path,
     resolver::{Resolver, ValueNs},
     type_ref::LiteralConstRef,
-    ConstBlockLoc, EnumVariantId, GeneralConstId, HasModule as _, StaticId,
 };
 use hir_expand::Lookup;
+use salsa::Cycle;
 use stdx::never;
 use triomphe::Arc;
 
 use crate::{
-    db::HirDatabase, generics::Generics, infer::InferenceContext, lower::ParamLoweringMode,
-    mir::monomorphize_mir_body_bad, to_placeholder_idx, Const, ConstData, ConstScalar, ConstValue,
-    GenericArg, Interner, MemoryMap, Substitution, TraitEnvironment, Ty, TyBuilder,
+    Const, ConstData, ConstScalar, ConstValue, GenericArg, Interner, MemoryMap, Substitution,
+    TraitEnvironment, Ty, TyBuilder,
+    db::{HirDatabase, HirDatabaseData},
+    display::DisplayTarget,
+    generics::Generics,
+    infer::InferenceContext,
+    lower::ParamLoweringMode,
+    mir::monomorphize_mir_body_bad,
+    to_placeholder_idx,
 };
 
-use super::mir::{interpret_mir, lower_to_mir, pad16, MirEvalError, MirLowerError};
+use super::mir::{MirEvalError, MirLowerError, interpret_mir, lower_to_mir, pad16};
 
 /// Extension trait for [`Const`]
 pub trait ConstExt {
@@ -62,11 +69,15 @@ impl ConstEvalError {
         f: &mut String,
         db: &dyn HirDatabase,
         span_formatter: impl Fn(span::FileId, span::TextRange) -> String,
-        edition: span::Edition,
+        display_target: DisplayTarget,
     ) -> std::result::Result<(), std::fmt::Error> {
         match self {
-            ConstEvalError::MirLowerError(e) => e.pretty_print(f, db, span_formatter, edition),
-            ConstEvalError::MirEvalError(e) => e.pretty_print(f, db, span_formatter, edition),
+            ConstEvalError::MirLowerError(e) => {
+                e.pretty_print(f, db, span_formatter, display_target)
+            }
+            ConstEvalError::MirEvalError(e) => {
+                e.pretty_print(f, db, span_formatter, display_target)
+            }
         }
     }
 }
@@ -152,7 +163,7 @@ pub fn intern_const_ref(
     db: &dyn HirDatabase,
     value: &LiteralConstRef,
     ty: Ty,
-    krate: CrateId,
+    krate: Crate,
 ) -> Const {
     let layout = db.layout_of_ty(ty.clone(), TraitEnvironment::empty(krate));
     let bytes = match value {
@@ -175,7 +186,7 @@ pub fn intern_const_ref(
 }
 
 /// Interns a possibly-unknown target usize
-pub fn usize_const(db: &dyn HirDatabase, value: Option<u128>, krate: CrateId) -> Const {
+pub fn usize_const(db: &dyn HirDatabase, value: Option<u128>, krate: Crate) -> Const {
     intern_const_ref(
         db,
         &value.map_or(LiteralConstRef::Unknown, LiteralConstRef::UInt),
@@ -219,9 +230,10 @@ pub fn try_const_isize(db: &dyn HirDatabase, c: &Const) -> Option<i128> {
 pub(crate) fn const_eval_recover(
     _: &dyn HirDatabase,
     _: &Cycle,
-    _: &GeneralConstId,
-    _: &Substitution,
-    _: &Option<Arc<TraitEnvironment>>,
+    _: HirDatabaseData,
+    _: GeneralConstId,
+    _: Substitution,
+    _: Option<Arc<TraitEnvironment>>,
 ) -> Result<Const, ConstEvalError> {
     Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
 }
@@ -229,7 +241,7 @@ pub(crate) fn const_eval_recover(
 pub(crate) fn const_eval_static_recover(
     _: &dyn HirDatabase,
     _: &Cycle,
-    _: &StaticId,
+    _: StaticId,
 ) -> Result<Const, ConstEvalError> {
     Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
 }
@@ -237,7 +249,7 @@ pub(crate) fn const_eval_static_recover(
 pub(crate) fn const_eval_discriminant_recover(
     _: &dyn HirDatabase,
     _: &Cycle,
-    _: &EnumVariantId,
+    _: EnumVariantId,
 ) -> Result<i128, ConstEvalError> {
     Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
 }
@@ -298,7 +310,7 @@ pub(crate) fn const_eval_discriminant_variant(
         let value = match prev_idx {
             Some(prev_idx) => {
                 1 + db.const_eval_discriminant(
-                    db.enum_data(loc.parent).variants[prev_idx as usize].0,
+                    db.enum_variants(loc.parent).variants[prev_idx as usize].0,
                 )?
             }
             _ => 0,

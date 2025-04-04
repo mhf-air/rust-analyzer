@@ -44,26 +44,26 @@ use std::{
 };
 
 use ast::{AstNode, StructKind};
-use base_db::CrateId;
+use base_db::Crate;
 use either::Either;
-use hir_expand::{attrs::RawAttrs, name::Name, ExpandTo, HirFileId, InFile};
+use hir_expand::{ExpandTo, HirFileId, InFile, attrs::RawAttrs, name::Name};
 use intern::{Interned, Symbol};
 use la_arena::{Arena, Idx, RawIdx};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use span::{AstIdNode, Edition, FileAstId, SyntaxContextId};
+use span::{AstIdNode, Edition, FileAstId, SyntaxContext};
 use stdx::never;
-use syntax::{ast, match_ast, SyntaxKind};
+use syntax::{SyntaxKind, ast, match_ast};
 use triomphe::Arc;
 
 use crate::{
+    BlockId, LocalLifetimeParamId, LocalTypeOrConstParamId, Lookup,
     attr::Attrs,
     db::DefDatabase,
     generics::GenericParams,
     path::{GenericArgs, ImportAlias, ModPath, Path, PathKind},
     type_ref::{Mutability, TraitRef, TypeBound, TypeRefId, TypesMap, TypesSourceMap},
     visibility::{RawVisibility, VisibilityExplicitness},
-    BlockId, LocalLifetimeParamId, LocalTypeOrConstParamId, Lookup,
 };
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -202,7 +202,7 @@ impl ItemTree {
     }
 
     /// Returns the inner attributes of the source file.
-    pub fn top_level_attrs(&self, db: &dyn DefDatabase, krate: CrateId) -> Attrs {
+    pub fn top_level_attrs(&self, db: &dyn DefDatabase, krate: Crate) -> Attrs {
         Attrs::filter(
             db,
             krate,
@@ -214,8 +214,24 @@ impl ItemTree {
         self.attrs.get(&of).unwrap_or(&RawAttrs::EMPTY)
     }
 
-    pub(crate) fn attrs(&self, db: &dyn DefDatabase, krate: CrateId, of: AttrOwner) -> Attrs {
+    pub(crate) fn attrs(&self, db: &dyn DefDatabase, krate: Crate, of: AttrOwner) -> Attrs {
         Attrs::filter(db, krate, self.raw_attrs(of).clone())
+    }
+
+    /// Returns a count of a few, expensive items.
+    ///
+    /// For more detail, see [`ItemTreeDataStats`].
+    pub fn item_tree_stats(&self) -> ItemTreeDataStats {
+        match self.data {
+            Some(ref data) => ItemTreeDataStats {
+                traits: data.traits.len(),
+                impls: data.impls.len(),
+                mods: data.mods.len(),
+                macro_calls: data.macro_calls.len(),
+                macro_rules: data.macro_rules.len(),
+            },
+            None => ItemTreeDataStats::default(),
+        }
     }
 
     pub fn pretty_print(&self, db: &dyn DefDatabase, edition: Edition) -> String {
@@ -326,6 +342,15 @@ struct ItemTreeData {
     macro_defs: Arena<Macro2>,
 
     vis: ItemVisibilities,
+}
+
+#[derive(Default, Debug, Eq, PartialEq)]
+pub struct ItemTreeDataStats {
+    pub traits: usize,
+    pub impls: usize,
+    pub mods: usize,
+    pub macro_calls: usize,
+    pub macro_rules: usize,
 }
 
 #[derive(Default, Debug, Eq, PartialEq)]
@@ -506,7 +531,7 @@ impl AttrOwner {
 pub enum FieldParent {
     Struct(FileItemTreeId<Struct>),
     Union(FileItemTreeId<Union>),
-    Variant(FileItemTreeId<Variant>),
+    EnumVariant(FileItemTreeId<Variant>),
 }
 
 pub type ItemTreeParamId = Idx<Param>;
@@ -937,7 +962,7 @@ pub struct Param {
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-    pub(crate) struct FnFlags: u16 {
+    pub struct FnFlags: u16 {
         const HAS_SELF_PARAM = 1 << 0;
         const HAS_BODY = 1 << 1;
         const HAS_DEFAULT_KW = 1 << 2;
@@ -952,6 +977,7 @@ bitflags::bitflags! {
         /// it if needed.
         const HAS_TARGET_FEATURE = 1 << 8;
         const DEPRECATED_SAFE_2024 = 1 << 9;
+        const RUSTC_ALLOW_INCOHERENT_IMPL = 1 << 10;
     }
 }
 
@@ -1007,6 +1033,7 @@ pub struct Field {
     pub name: Name,
     pub type_ref: TypeRefId,
     pub visibility: RawVisibilityId,
+    pub is_unsafe: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1024,13 +1051,20 @@ pub struct Const {
 pub struct Static {
     pub name: Name,
     pub visibility: RawVisibilityId,
-    // TODO: use bitflags when we have more flags
-    pub mutable: bool,
-    pub has_safe_kw: bool,
-    pub has_unsafe_kw: bool,
+    pub flags: StaticFlags,
     pub type_ref: TypeRefId,
     pub ast_id: FileAstId<ast::Static>,
     pub types_map: Arc<TypesMap>,
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct StaticFlags: u8 {
+        const MUTABLE = 1 << 0;
+        const IS_EXTERN = 1 << 1;
+        const HAS_SAFE_KW = 1 << 2;
+        const HAS_UNSAFE_KW = 1 << 3;
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1098,7 +1132,7 @@ pub struct MacroCall {
     pub path: Interned<ModPath>,
     pub ast_id: FileAstId<ast::MacroCall>,
     pub expand_to: ExpandTo,
-    pub ctxt: SyntaxContextId,
+    pub ctxt: SyntaxContext,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

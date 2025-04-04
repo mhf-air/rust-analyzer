@@ -12,16 +12,17 @@ use std::ops::{Deref, Index};
 
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
-use hir_expand::{name::Name, ExpandError, InFile};
+use hir_expand::{ExpandError, InFile, name::Name};
 use la_arena::{Arena, ArenaMap};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use span::{Edition, MacroFileId, SyntaxContextData};
-use syntax::{ast, AstPtr, SyntaxNodePtr};
+use span::{Edition, MacroFileId, SyntaxContext};
+use syntax::{AstPtr, SyntaxNodePtr, ast};
 use triomphe::Arc;
 use tt::TextRange;
 
 use crate::{
+    BlockId, DefWithBodyId, Lookup, SyntheticSyntax,
     db::DefDatabase,
     hir::{
         Array, AsmOperand, Binding, BindingId, Expr, ExprId, ExprOrPatId, Label, LabelId, Pat,
@@ -30,27 +31,27 @@ use crate::{
     nameres::DefMap,
     path::{ModPath, Path},
     type_ref::{TypeRef, TypeRefId, TypesMap, TypesSourceMap},
-    BlockId, DefWithBodyId, Lookup, SyntheticSyntax,
 };
 
 pub use self::body::{Body, BodySourceMap};
 
 /// A wrapper around [`span::SyntaxContextId`] that is intended only for comparisons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct HygieneId(span::SyntaxContextId);
+pub struct HygieneId(span::SyntaxContext);
 
 impl HygieneId {
     // The edition doesn't matter here, we only use this for comparisons and to lookup the macro.
-    pub const ROOT: Self = Self(span::SyntaxContextId::root(Edition::Edition2015));
+    pub const ROOT: Self = Self(span::SyntaxContext::root(Edition::Edition2015));
 
-    pub fn new(mut ctx: span::SyntaxContextId) -> Self {
+    pub fn new(mut ctx: span::SyntaxContext) -> Self {
         // See `Name` for why we're doing that.
         ctx.remove_root_edition();
         Self(ctx)
     }
 
-    pub(crate) fn lookup(self, db: &dyn DefDatabase) -> SyntaxContextData {
-        db.lookup_intern_syntax_context(self.0)
+    // FIXME: Inline this
+    pub(crate) fn lookup(self) -> SyntaxContext {
+        self.0
     }
 
     pub(crate) fn is_root(self) -> bool {

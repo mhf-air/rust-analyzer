@@ -1,28 +1,29 @@
 use std::{iter, mem::discriminant};
 
 use crate::{
+    FilePosition, NavigationTarget, RangeInfo, TryToNav, UpmappingResult,
     doc_links::token_as_doc_comment,
     navigation_target::{self, ToNav},
-    FilePosition, NavigationTarget, RangeInfo, TryToNav, UpmappingResult,
 };
 use hir::{
-    sym, AsAssocItem, AssocItem, CallableKind, FileRange, HasCrate, InFile, MacroFileIdExt,
-    ModuleDef, Semantics,
+    AsAssocItem, AssocItem, CallableKind, FileRange, HasCrate, InFile, MacroFileIdExt, ModuleDef,
+    Semantics, sym,
 };
 use ide_db::{
-    base_db::{AnchoredPath, FileLoader, SourceDatabase},
+    RootDatabase, SymbolKind,
+    base_db::{AnchoredPath, RootQueryDb, SourceDatabase, Upcast},
     defs::{Definition, IdentClass},
     famous_defs::FamousDefs,
     helpers::pick_best_token,
-    RootDatabase, SymbolKind,
 };
 use itertools::Itertools;
 use span::{Edition, FileId};
 use syntax::{
-    ast::{self, HasLoopBody},
-    match_ast, AstNode, AstToken,
+    AstNode, AstToken,
     SyntaxKind::*,
-    SyntaxNode, SyntaxToken, TextRange, T,
+    SyntaxNode, SyntaxToken, T, TextRange,
+    ast::{self, HasLoopBody},
+    match_ast,
 };
 
 // Feature: Go to Definition
@@ -216,8 +217,9 @@ fn try_lookup_include_path(
     }
     let path = token.value().ok()?;
 
-    let file_id = sema.db.resolve_path(AnchoredPath { anchor: file_id, path: &path })?;
-    let size = sema.db.file_text(file_id).len().try_into().ok()?;
+    let file_id = Upcast::<dyn RootQueryDb>::upcast(sema.db)
+        .resolve_path(AnchoredPath { anchor: file_id, path: &path })?;
+    let size = sema.db.file_text(file_id).text(sema.db).len().try_into().ok()?;
     Some(NavigationTarget {
         file_id,
         full_range: TextRange::new(0.into(), size),
@@ -2190,8 +2192,8 @@ where T : Bound
 struct A;
 impl Bound for A{}
 fn f() {
-    let gen = Gen::<A>(A);
-    gen.g$0();
+    let g = Gen::<A>(A);
+    g.g$0();
 }
                 "#,
             );
@@ -2216,8 +2218,8 @@ where T : Bound
 struct A;
 impl Bound for A{}
 fn f() {
-    let gen = Gen::<A>(A);
-    gen.g$0();
+    let g = Gen::<A>(A);
+    g.g$0();
 }
 "#,
             );

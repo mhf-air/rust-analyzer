@@ -9,21 +9,20 @@
 
 use std::mem;
 
-use base_db::ra_salsa::Cycle;
 use chalk_ir::{
-    fold::{FallibleTypeFolder, TypeFoldable, TypeSuperFoldable},
     ConstData, DebruijnIndex,
+    fold::{FallibleTypeFolder, TypeFoldable, TypeSuperFoldable},
 };
 use hir_def::DefWithBodyId;
 use triomphe::Arc;
 
 use crate::{
+    Const, Interner, ProjectionTy, Substitution, TraitEnvironment, Ty, TyKind,
     consteval::{intern_const_scalar, unknown_const},
-    db::{HirDatabase, InternedClosure},
+    db::{HirDatabase, HirDatabaseData, InternedClosure, InternedClosureId},
     from_placeholder_idx,
-    generics::{generics, Generics},
+    generics::{Generics, generics},
     infer::normalize,
-    ClosureId, Const, Interner, ProjectionTy, Substitution, TraitEnvironment, Ty, TyKind,
 };
 
 use super::{MirBody, MirLowerError, Operand, Rvalue, StatementKind, TerminatorKind};
@@ -314,23 +313,24 @@ pub fn monomorphized_mir_body_query(
     Ok(Arc::new(body))
 }
 
-pub fn monomorphized_mir_body_recover(
+pub(crate) fn monomorphized_mir_body_recover(
     _: &dyn HirDatabase,
-    _: &Cycle,
-    _: &DefWithBodyId,
-    _: &Substitution,
-    _: &Arc<crate::TraitEnvironment>,
+    _: &salsa::Cycle,
+    _: HirDatabaseData,
+    _: DefWithBodyId,
+    _: Substitution,
+    _: Arc<crate::TraitEnvironment>,
 ) -> Result<Arc<MirBody>, MirLowerError> {
     Err(MirLowerError::Loop)
 }
 
 pub fn monomorphized_mir_body_for_closure_query(
     db: &dyn HirDatabase,
-    closure: ClosureId,
+    closure: InternedClosureId,
     subst: Substitution,
     trait_env: Arc<crate::TraitEnvironment>,
 ) -> Result<Arc<MirBody>, MirLowerError> {
-    let InternedClosure(owner, _) = db.lookup_intern_closure(closure.into());
+    let InternedClosure(owner, _) = db.lookup_intern_closure(closure);
     let generics = owner.as_generic_def_id(db.upcast()).map(|g_def| generics(db.upcast(), g_def));
     let filler = &mut Filler { db, subst: &subst, trait_env, generics, owner };
     let body = db.mir_body_for_closure(closure)?;

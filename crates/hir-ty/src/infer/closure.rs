@@ -3,12 +3,13 @@
 use std::{cmp, convert::Infallible, mem};
 
 use chalk_ir::{
+    BoundVar, DebruijnIndex, FnSubst, Mutability, TyKind,
     cast::Cast,
     fold::{FallibleTypeFolder, TypeFoldable},
-    BoundVar, DebruijnIndex, FnSubst, Mutability, TyKind,
 };
 use either::Either;
 use hir_def::{
+    DefWithBodyId, FieldId, HasModule, TupleFieldId, TupleId, VariantId,
     data::adt::VariantData,
     hir::{
         Array, AsmOperand, BinaryOp, BindingId, CaptureBy, Expr, ExprId, ExprOrPatId, Pat, PatId,
@@ -17,18 +18,20 @@ use hir_def::{
     lang_item::LangItem,
     path::Path,
     resolver::ValueNs,
-    DefWithBodyId, FieldId, HasModule, TupleFieldId, TupleId, VariantId,
 };
 use hir_expand::name::Name;
 use intern::sym;
 use rustc_hash::FxHashMap;
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use stdx::{format_to, never};
 use syntax::utils::is_raw_identifier;
 
 use crate::{
+    Adjust, Adjustment, AliasEq, AliasTy, Binders, BindingMode, ChalkTraitId, ClosureId, DynTy,
+    DynTyExt, FnAbi, FnPointer, FnSig, Interner, OpaqueTy, ProjectionTyExt, Substitution, Ty,
+    TyExt, WhereClause,
     db::{HirDatabase, InternedClosure},
-    error_lifetime, from_chalk_trait_id, from_placeholder_idx,
+    error_lifetime, from_assoc_type_id, from_chalk_trait_id, from_placeholder_idx,
     generics::Generics,
     infer::coerce::CoerceNever,
     make_binders,
@@ -36,9 +39,6 @@ use crate::{
     to_chalk_trait_id,
     traits::FnTrait,
     utils::{self, elaborate_clause_supertraits},
-    Adjust, Adjustment, AliasEq, AliasTy, Binders, BindingMode, ChalkTraitId, ClosureId, DynTy,
-    DynTyExt, FnAbi, FnPointer, FnSig, Interner, OpaqueTy, ProjectionTyExt, Substitution, Ty,
-    TyExt, WhereClause,
 };
 
 use super::{Expectation, InferenceContext};
@@ -153,7 +153,8 @@ impl InferenceContext<'_> {
             if let WhereClause::AliasEq(AliasEq { alias: AliasTy::Projection(projection), ty }) =
                 bound.skip_binders()
             {
-                let assoc_data = self.db.associated_ty_data(projection.associated_ty_id);
+                let assoc_data =
+                    self.db.associated_ty_data(from_assoc_type_id(projection.associated_ty_id));
                 if !fn_traits.contains(&assoc_data.trait_id) {
                     return None;
                 }
@@ -223,7 +224,7 @@ impl HirPlace {
             kind: MutBorrowKind::Default | MutBorrowKind::TwoPhasedBorrow,
         }) = current_capture
         {
-            if self.projections[len..].iter().any(|it| *it == ProjectionElem::Deref) {
+            if self.projections[len..].contains(&ProjectionElem::Deref) {
                 current_capture =
                     CaptureKind::ByRef(BorrowKind::Mut { kind: MutBorrowKind::ClosureCapture });
             }
@@ -307,7 +308,7 @@ impl CapturedItem {
                 }
             }
         }
-        if is_raw_identifier(&result, db.crate_graph()[owner.module(db.upcast()).krate()].edition) {
+        if is_raw_identifier(&result, owner.module(db.upcast()).krate().data(db).edition) {
             result.insert_str(0, "r#");
         }
         result
@@ -316,7 +317,7 @@ impl CapturedItem {
     pub fn display_place_source_code(&self, owner: DefWithBodyId, db: &dyn HirDatabase) -> String {
         let body = db.body(owner);
         let krate = owner.krate(db.upcast());
-        let edition = db.crate_graph()[krate].edition;
+        let edition = krate.data(db).edition;
         let mut result = body[self.place.local].name.display(db.upcast(), edition).to_string();
         for proj in &self.place.projections {
             match proj {
@@ -368,7 +369,7 @@ impl CapturedItem {
     pub fn display_place(&self, owner: DefWithBodyId, db: &dyn HirDatabase) -> String {
         let body = db.body(owner);
         let krate = owner.krate(db.upcast());
-        let edition = db.crate_graph()[krate].edition;
+        let edition = krate.data(db).edition;
         let mut result = body[self.place.local].name.display(db.upcast(), edition).to_string();
         let mut field_need_paren = false;
         for proj in &self.place.projections {
@@ -517,10 +518,9 @@ impl InferenceContext<'_> {
             return None;
         }
         let hygiene = self.body.expr_or_pat_path_hygiene(id);
-        let result = self
-            .resolver
-            .resolve_path_in_value_ns_fully(self.db.upcast(), path, hygiene)
-            .and_then(|result| match result {
+
+        self.resolver.resolve_path_in_value_ns_fully(self.db.upcast(), path, hygiene).and_then(
+            |result| match result {
                 ValueNs::LocalBinding(binding) => {
                     let mir_span = match id {
                         ExprOrPatId::ExprId(id) => MirSpan::ExprId(id),
@@ -530,8 +530,8 @@ impl InferenceContext<'_> {
                     Some(HirPlace { local: binding, projections: Vec::new() })
                 }
                 _ => None,
-            });
-        result
+            },
+        )
     }
 
     /// Changes `current_capture_span_stack` to contain the stack of spans for this expr.
@@ -815,7 +815,7 @@ impl InferenceContext<'_> {
                         {
                             if let Some(deref_fn) = self
                                 .db
-                                .trait_data(deref_trait)
+                                .trait_items(deref_trait)
                                 .method_by_name(&Name::new_symbol_root(sym::deref_mut.clone()))
                             {
                                 break 'b deref_fn == f;
@@ -963,7 +963,7 @@ impl InferenceContext<'_> {
                 if let Some(variant) = self.result.variant_resolution_for_pat(p) {
                     let adt = variant.adt_id(self.db.upcast());
                     let is_multivariant = match adt {
-                        hir_def::AdtId::EnumId(e) => self.db.enum_data(e).variants.len() != 1,
+                        hir_def::AdtId::EnumId(e) => self.db.enum_variants(e).variants.len() != 1,
                         _ => false,
                     };
                     if is_multivariant {
@@ -1159,7 +1159,7 @@ impl InferenceContext<'_> {
                             self.consume_place(place)
                         }
                         VariantId::StructId(s) => {
-                            let vd = &*self.db.struct_data(s).variant_data;
+                            let vd = &*self.db.variant_data(s.into());
                             for field_pat in args.iter() {
                                 let arg = field_pat.pat;
                                 let Some(local_id) = vd.field(&field_pat.name) else {
@@ -1211,7 +1211,7 @@ impl InferenceContext<'_> {
                             self.consume_place(place)
                         }
                         VariantId::StructId(s) => {
-                            let vd = &*self.db.struct_data(s).variant_data;
+                            let vd = &*self.db.variant_data(s.into());
                             let (al, ar) =
                                 args.split_at(ellipsis.map_or(args.len(), |it| it as usize));
                             let fields = vd.fields().iter();
