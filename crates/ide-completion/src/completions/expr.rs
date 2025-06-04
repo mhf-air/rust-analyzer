@@ -260,7 +260,7 @@ pub(crate) fn complete_expr_path(
                                 path_ctx,
                                 strukt,
                                 None,
-                                Some(Name::new_symbol_root(sym::Self_.clone())),
+                                Some(Name::new_symbol_root(sym::Self_)),
                             );
                         }
                     }
@@ -280,7 +280,7 @@ pub(crate) fn complete_expr_path(
                                 ctx,
                                 un,
                                 None,
-                                Some(Name::new_symbol_root(sym::Self_.clone())),
+                                Some(Name::new_symbol_root(sym::Self_)),
                             );
                         }
                     }
@@ -363,9 +363,14 @@ pub(crate) fn complete_expr_path(
                     add_keyword("true", "true");
                     add_keyword("false", "false");
 
-                    if in_condition || in_block_expr {
-                        add_keyword("letm", "let mut $0");
-                        add_keyword("let", "let $0");
+                    if in_condition {
+                        add_keyword("letm", "let mut $1 = $0");
+                        add_keyword("let", "let $1 = $0");
+                    }
+
+                    if in_block_expr {
+                        add_keyword("letm", "let mut $1 = $0;");
+                        add_keyword("let", "let $1 = $0;");
                     }
 
                     if after_if_expr {

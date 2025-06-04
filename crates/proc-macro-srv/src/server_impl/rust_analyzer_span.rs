@@ -11,7 +11,7 @@ use std::{
 
 use intern::Symbol;
 use proc_macro::bridge::{self, server};
-use span::{FIXUP_ERASED_FILE_AST_ID_MARKER, FileId, Span};
+use span::{FIXUP_ERASED_FILE_AST_ID_MARKER, Span};
 use tt::{TextRange, TextSize};
 
 use crate::server_impl::{TopSubtree, literal_kind_to_internal, token_stream::TokenStreamBuilder};
@@ -27,10 +27,6 @@ mod tt {
 
 type TokenStream = crate::server_impl::TokenStream<Span>;
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct SourceFile {
-    file_id: FileId,
-}
 pub struct FreeFunctions;
 
 pub struct RaSpanServer {
@@ -46,7 +42,6 @@ pub struct RaSpanServer {
 impl server::Types for RaSpanServer {
     type FreeFunctions = FreeFunctions;
     type TokenStream = TokenStream;
-    type SourceFile = SourceFile;
     type Span = Span;
     type Symbol = Symbol;
 }
@@ -173,16 +168,38 @@ impl server::TokenStream for RaSpanServer {
             }
 
             bridge::TokenTree::Literal(literal) => {
-                let literal = tt::Literal {
-                    symbol: literal.symbol,
-                    suffix: literal.suffix,
-                    span: literal.span,
-                    kind: literal_kind_to_internal(literal.kind),
-                };
+                let token_trees =
+                    if let Some((_minus, symbol)) = literal.symbol.as_str().split_once('-') {
+                        let punct = tt::Punct {
+                            spacing: tt::Spacing::Alone,
+                            span: literal.span,
+                            char: '-' as char,
+                        };
+                        let leaf: tt::Leaf = tt::Leaf::from(punct);
+                        let minus_tree = tt::TokenTree::from(leaf);
 
-                let leaf: tt::Leaf = tt::Leaf::from(literal);
-                let tree = tt::TokenTree::from(leaf);
-                TokenStream { token_trees: vec![tree] }
+                        let literal = tt::Literal {
+                            symbol: Symbol::intern(symbol),
+                            suffix: literal.suffix,
+                            span: literal.span,
+                            kind: literal_kind_to_internal(literal.kind),
+                        };
+                        let leaf: tt::Leaf = tt::Leaf::from(literal);
+                        let tree = tt::TokenTree::from(leaf);
+                        vec![minus_tree, tree]
+                    } else {
+                        let literal = tt::Literal {
+                            symbol: literal.symbol,
+                            suffix: literal.suffix,
+                            span: literal.span,
+                            kind: literal_kind_to_internal(literal.kind),
+                        };
+
+                        let leaf: tt::Leaf = tt::Leaf::from(literal);
+                        let tree = tt::TokenTree::from(leaf);
+                        vec![tree]
+                    };
+                TokenStream { token_trees }
             }
 
             bridge::TokenTree::Punct(p) => {
@@ -212,7 +229,7 @@ impl server::TokenStream for RaSpanServer {
         base: Option<Self::TokenStream>,
         trees: Vec<bridge::TokenTree<Self::TokenStream, Self::Span, Self::Symbol>>,
     ) -> Self::TokenStream {
-        let mut builder = TokenStreamBuilder::new();
+        let mut builder = TokenStreamBuilder::default();
         if let Some(base) = base {
             builder.push(base);
         }
@@ -227,7 +244,7 @@ impl server::TokenStream for RaSpanServer {
         base: Option<Self::TokenStream>,
         streams: Vec<Self::TokenStream>,
     ) -> Self::TokenStream {
-        let mut builder = TokenStreamBuilder::new();
+        let mut builder = TokenStreamBuilder::default();
         if let Some(base) = base {
             builder.push(base);
         }
@@ -241,20 +258,9 @@ impl server::TokenStream for RaSpanServer {
         &mut self,
         stream: Self::TokenStream,
     ) -> Vec<bridge::TokenTree<Self::TokenStream, Self::Span, Self::Symbol>> {
-        stream.into_bridge()
-    }
-}
-
-impl server::SourceFile for RaSpanServer {
-    fn eq(&mut self, file1: &Self::SourceFile, file2: &Self::SourceFile) -> bool {
-        file1 == file2
-    }
-    fn path(&mut self, _file: &Self::SourceFile) -> String {
-        // FIXME
-        String::new()
-    }
-    fn is_real(&mut self, _file: &Self::SourceFile) -> bool {
-        true
+        stream.into_bridge(&mut |first, second| {
+            server::Span::join(self, first, second).unwrap_or(first)
+        })
     }
 }
 
@@ -262,8 +268,13 @@ impl server::Span for RaSpanServer {
     fn debug(&mut self, span: Self::Span) -> String {
         format!("{:?}", span)
     }
-    fn source_file(&mut self, span: Self::Span) -> Self::SourceFile {
-        SourceFile { file_id: span.anchor.file_id.file_id() }
+    fn file(&mut self, _: Self::Span) -> String {
+        // FIXME
+        String::new()
+    }
+    fn local_file(&mut self, _: Self::Span) -> Option<String> {
+        // FIXME
+        None
     }
     fn save_span(&mut self, _span: Self::Span) -> usize {
         // FIXME, quote is incompatible with third-party tools

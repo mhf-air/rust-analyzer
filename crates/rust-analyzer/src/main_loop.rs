@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam_channel::{Receiver, select};
+use crossbeam_channel::{Receiver, never, select};
 use ide_db::base_db::{SourceDatabase, VfsPath, salsa::Database as _};
 use lsp_server::{Connection, Notification, Request};
 use lsp_types::{TextDocumentIdentifier, notification::Notification as _};
@@ -71,6 +71,7 @@ enum Event {
     Flycheck(FlycheckMessage),
     TestResult(CargoTestMessage),
     DiscoverProject(DiscoverProjectMessage),
+    FetchWorkspaces(FetchWorkspaceRequest),
 }
 
 impl fmt::Display for Event {
@@ -83,6 +84,7 @@ impl fmt::Display for Event {
             Event::QueuedTask(_) => write!(f, "Event::QueuedTask"),
             Event::TestResult(_) => write!(f, "Event::TestResult"),
             Event::DiscoverProject(_) => write!(f, "Event::DiscoverProject"),
+            Event::FetchWorkspaces(_) => write!(f, "Event::SwitchWorkspaces"),
         }
     }
 }
@@ -150,6 +152,7 @@ impl fmt::Debug for Event {
             }
             _ => (),
         }
+
         match self {
             Event::Lsp(it) => fmt::Debug::fmt(it, f),
             Event::Task(it) => fmt::Debug::fmt(it, f),
@@ -158,6 +161,7 @@ impl fmt::Debug for Event {
             Event::Flycheck(it) => fmt::Debug::fmt(it, f),
             Event::TestResult(it) => fmt::Debug::fmt(it, f),
             Event::DiscoverProject(it) => fmt::Debug::fmt(it, f),
+            Event::FetchWorkspaces(it) => fmt::Debug::fmt(it, f),
         }
     }
 }
@@ -251,7 +255,7 @@ impl GlobalState {
     }
 
     fn next_event(
-        &self,
+        &mut self,
         inbox: &Receiver<lsp_server::Message>,
     ) -> Result<Option<Event>, crossbeam_channel::RecvError> {
         // Make sure we reply to formatting requests ASAP so the editor doesn't block
@@ -283,6 +287,10 @@ impl GlobalState {
 
             recv(self.discover_receiver) -> task =>
                 task.map(Event::DiscoverProject),
+
+            recv(self.fetch_ws_receiver.as_ref().map_or(&never(), |(chan, _)| chan)) -> _instant => {
+                Ok(Event::FetchWorkspaces(self.fetch_ws_receiver.take().unwrap().1))
+            },
         }
         .map(Some)
     }
@@ -411,6 +419,9 @@ impl GlobalState {
                 while let Ok(message) = self.discover_receiver.try_recv() {
                     self.handle_discover_msg(message);
                 }
+            }
+            Event::FetchWorkspaces(req) => {
+                self.fetch_workspaces_queue.request_op("project structure change".to_owned(), req)
             }
         }
         let event_handling_duration = loop_start.elapsed();
@@ -830,6 +841,7 @@ impl GlobalState {
         match message {
             vfs::loader::Message::Changed { files } | vfs::loader::Message::Loaded { files } => {
                 let _p = tracing::info_span!("GlobalState::handle_vfs_msg{changed/load}").entered();
+                self.debounce_workspace_fetch();
                 let vfs = &mut self.vfs.write().0;
                 for (path, contents) in files {
                     let path = VfsPath::from(path);
@@ -969,7 +981,9 @@ impl GlobalState {
                     TestState::Ok => lsp_ext::TestState::Passed,
                     TestState::Failed { stdout } => lsp_ext::TestState::Failed { message: stdout },
                 };
-                let test_id = format!("{}::{name}", message.target.target);
+
+                // The notification requires the namespace form (with underscores) of the target
+                let test_id = format!("{}::{name}", message.target.target.replace('-', "_"));
 
                 self.send_notification::<lsp_ext::ChangeTestState>(
                     lsp_ext::ChangeTestStateParams { test_id, state },
@@ -1172,6 +1186,7 @@ impl GlobalState {
             .on::<NO_RETRY, lsp_ext::InterpretFunction>(handlers::handle_interpret_function)
             .on::<NO_RETRY, lsp_ext::ExpandMacro>(handlers::handle_expand_macro)
             .on::<NO_RETRY, lsp_ext::ParentModule>(handlers::handle_parent_module)
+            .on::<NO_RETRY, lsp_ext::ChildModules>(handlers::handle_child_modules)
             .on::<NO_RETRY, lsp_ext::Runnables>(handlers::handle_runnables)
             .on::<NO_RETRY, lsp_ext::RelatedTests>(handlers::handle_related_tests)
             .on::<NO_RETRY, lsp_ext::CodeActionRequest>(handlers::handle_code_action)

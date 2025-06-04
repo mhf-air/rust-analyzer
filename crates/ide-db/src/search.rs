@@ -10,15 +10,14 @@ use std::{cell::LazyCell, cmp::Reverse};
 use base_db::{RootQueryDb, SourceDatabase};
 use either::Either;
 use hir::{
-    Adt, AsAssocItem, DefWithBody, FileRange, FileRangeWrapper, HasAttrs, HasContainer, HasSource,
-    HirFileIdExt, InFile, InFileWrapper, InRealFile, InlineAsmOperand, ItemContainer, ModuleSource,
-    PathResolution, Semantics, Visibility, sym,
+    Adt, AsAssocItem, DefWithBody, EditionedFileId, FileRange, FileRangeWrapper, HasAttrs,
+    HasContainer, HasSource, InFile, InFileWrapper, InRealFile, InlineAsmOperand, ItemContainer,
+    ModuleSource, PathResolution, Semantics, Visibility, sym,
 };
 use memchr::memmem::Finder;
 use parser::SyntaxKind;
 use rustc_hash::{FxHashMap, FxHashSet};
 use salsa::Database;
-use span::EditionedFileId;
 use syntax::{
     AstNode, AstToken, SmolStr, SyntaxElement, SyntaxNode, TextRange, TextSize, ToSmolStr,
     ast::{self, HasName, Rename},
@@ -168,7 +167,9 @@ impl SearchScope {
             let source_root = db.file_source_root(crate_data.root_file_id).source_root_id(db);
             let source_root = db.source_root(source_root).source_root(db);
             entries.extend(
-                source_root.iter().map(|id| (EditionedFileId::new(id, crate_data.edition), None)),
+                source_root
+                    .iter()
+                    .map(|id| (EditionedFileId::new(db, id, crate_data.edition), None)),
             );
         }
         SearchScope { entries }
@@ -183,7 +184,9 @@ impl SearchScope {
             let source_root = db.file_source_root(root_file).source_root_id(db);
             let source_root = db.source_root(source_root).source_root(db);
             entries.extend(
-                source_root.iter().map(|id| (EditionedFileId::new(id, rev_dep.edition(db)), None)),
+                source_root
+                    .iter()
+                    .map(|id| (EditionedFileId::new(db, id, rev_dep.edition(db)), None)),
             );
         }
         SearchScope { entries }
@@ -198,7 +201,7 @@ impl SearchScope {
         SearchScope {
             entries: source_root
                 .iter()
-                .map(|id| (EditionedFileId::new(id, of.edition(db)), None))
+                .map(|id| (EditionedFileId::new(db, id, of.edition(db)), None))
                 .collect(),
         }
     }
@@ -311,8 +314,6 @@ impl Definition {
                 DefWithBody::Const(c) => c.source(db).map(|src| src.syntax().cloned()),
                 DefWithBody::Static(s) => s.source(db).map(|src| src.syntax().cloned()),
                 DefWithBody::Variant(v) => v.source(db).map(|src| src.syntax().cloned()),
-                // FIXME: implement
-                DefWithBody::InTypeConst(_) => return SearchScope::empty(),
             };
             return match def {
                 Some(def) => SearchScope::file_range(
@@ -328,8 +329,6 @@ impl Definition {
                 DefWithBody::Const(c) => c.source(db).map(|src| src.syntax().cloned()),
                 DefWithBody::Static(s) => s.source(db).map(|src| src.syntax().cloned()),
                 DefWithBody::Variant(v) => v.source(db).map(|src| src.syntax().cloned()),
-                // FIXME: implement
-                DefWithBody::InTypeConst(_) => return SearchScope::empty(),
             };
             return match def {
                 Some(def) => SearchScope::file_range(
@@ -370,7 +369,7 @@ impl Definition {
         if let Definition::Macro(macro_def) = self {
             return match macro_def.kind(db) {
                 hir::MacroKind::Declarative => {
-                    if macro_def.attrs(db).by_key(&sym::macro_export).exists() {
+                    if macro_def.attrs(db).by_key(sym::macro_export).exists() {
                         SearchScope::reverse_dependencies(db, module.krate())
                     } else {
                         SearchScope::krate(db, module.krate())
@@ -486,7 +485,7 @@ impl<'a> FindUsages<'a> {
         scope: &'b SearchScope,
     ) -> impl Iterator<Item = (Arc<str>, EditionedFileId, TextRange)> + 'b {
         scope.entries.iter().map(|(&file_id, &search_range)| {
-            let text = db.file_text(file_id.file_id()).text(db);
+            let text = db.file_text(file_id.file_id(db)).text(db);
             let search_range =
                 search_range.unwrap_or_else(|| TextRange::up_to(TextSize::of(&*text)));
 
@@ -525,6 +524,7 @@ impl<'a> FindUsages<'a> {
     fn find_nodes<'b>(
         sema: &'b Semantics<'_, RootDatabase>,
         name: &str,
+        file_id: EditionedFileId,
         node: &syntax::SyntaxNode,
         offset: TextSize,
     ) -> impl Iterator<Item = SyntaxNode> + 'b {
@@ -535,7 +535,7 @@ impl<'a> FindUsages<'a> {
             })
             .into_iter()
             .flat_map(move |token| {
-                if sema.might_be_inside_macro_call(&token) {
+                if sema.is_inside_macro_call(InFile::new(file_id.into(), &token)) {
                     sema.descend_into_macros_exact(token)
                 } else {
                     <_>::from([token])
@@ -652,16 +652,17 @@ impl<'a> FindUsages<'a> {
                 for (file_text, file_id, search_range) in
                     FindUsages::scope_files(db, &current_to_process_search_scope)
                 {
-                    let file_id = crate::base_db::EditionedFileId::new(db, file_id);
-
                     let tree = LazyCell::new(move || sema.parse(file_id).syntax().clone());
 
                     for offset in FindUsages::match_indices(&file_text, &finder, search_range) {
-                        let usages =
-                            FindUsages::find_nodes(sema, &current_to_process, &tree, offset)
-                                .filter(|it| {
-                                    matches!(it.kind(), SyntaxKind::NAME | SyntaxKind::NAME_REF)
-                                });
+                        let usages = FindUsages::find_nodes(
+                            sema,
+                            &current_to_process,
+                            file_id,
+                            &tree,
+                            offset,
+                        )
+                        .filter(|it| matches!(it.kind(), SyntaxKind::NAME | SyntaxKind::NAME_REF));
                         for usage in usages {
                             if let Some(alias) = usage.parent().and_then(|it| {
                                 let path = ast::PathSegment::cast(it)?.parent_path();
@@ -813,12 +814,10 @@ impl<'a> FindUsages<'a> {
             sink: &mut dyn FnMut(EditionedFileId, FileReference) -> bool,
         ) {
             for (file_text, file_id, search_range) in files {
-                let file_id_wrapper = crate::base_db::EditionedFileId::new(this.sema.db, file_id);
-
-                let tree = LazyCell::new(move || this.sema.parse(file_id_wrapper).syntax().clone());
+                let tree = LazyCell::new(move || this.sema.parse(file_id).syntax().clone());
 
                 for offset in FindUsages::match_indices(&file_text, finder, search_range) {
-                    let usages = FindUsages::find_nodes(this.sema, name, &tree, offset)
+                    let usages = FindUsages::find_nodes(this.sema, name, file_id, &tree, offset)
                         .filter_map(ast::NameRef::cast);
                     for usage in usages {
                         let found_usage = usage
@@ -860,7 +859,10 @@ impl<'a> FindUsages<'a> {
                 name,
                 is_possibly_self.into_iter().map(|position| {
                     (
-                        self.sema.db.file_text(position.file_id.file_id()).text(self.sema.db),
+                        self.sema
+                            .db
+                            .file_text(position.file_id.file_id(self.sema.db))
+                            .text(self.sema.db),
                         position.file_id,
                         position.range,
                     )
@@ -954,19 +956,21 @@ impl<'a> FindUsages<'a> {
         let include_self_kw_refs =
             self.include_self_kw_refs.as_ref().map(|ty| (ty, Finder::new("Self")));
         for (text, file_id, search_range) in Self::scope_files(sema.db, &search_scope) {
-            let file_id_wrapper = crate::base_db::EditionedFileId::new(sema.db, file_id);
-
-            let tree = LazyCell::new(move || sema.parse(file_id_wrapper).syntax().clone());
+            let tree = LazyCell::new(move || sema.parse(file_id).syntax().clone());
 
             // Search for occurrences of the items name
             for offset in Self::match_indices(&text, finder, search_range) {
                 let ret = tree.token_at_offset(offset).any(|token| {
-                    let Some(str_token) = ast::String::cast(token.clone()) else { return false };
-                    if let Some((range, Some(nameres))) =
-                        sema.check_for_format_args_template(token, offset)
+                    if let Some((range, _frange, string_token, Some(nameres))) =
+                        sema.check_for_format_args_template(token.clone(), offset)
                     {
-                        return self
-                            .found_format_args_ref(file_id, range, str_token, nameres, sink);
+                        return self.found_format_args_ref(
+                            file_id,
+                            range,
+                            string_token,
+                            nameres,
+                            sink,
+                        );
                     }
                     false
                 });
@@ -974,8 +978,8 @@ impl<'a> FindUsages<'a> {
                     return;
                 }
 
-                for name in
-                    Self::find_nodes(sema, name, &tree, offset).filter_map(ast::NameLike::cast)
+                for name in Self::find_nodes(sema, name, file_id, &tree, offset)
+                    .filter_map(ast::NameLike::cast)
                 {
                     if match name {
                         ast::NameLike::NameRef(name_ref) => self.found_name_ref(&name_ref, sink),
@@ -989,8 +993,8 @@ impl<'a> FindUsages<'a> {
             // Search for occurrences of the `Self` referring to our type
             if let Some((self_ty, finder)) = &include_self_kw_refs {
                 for offset in Self::match_indices(&text, finder, search_range) {
-                    for name_ref in
-                        Self::find_nodes(sema, "Self", &tree, offset).filter_map(ast::NameRef::cast)
+                    for name_ref in Self::find_nodes(sema, "Self", file_id, &tree, offset)
+                        .filter_map(ast::NameRef::cast)
                     {
                         if self.found_self_ty_name_ref(self_ty, &name_ref, sink) {
                             return;
@@ -1011,11 +1015,10 @@ impl<'a> FindUsages<'a> {
             for (text, file_id, search_range) in Self::scope_files(sema.db, &scope) {
                 self.sema.db.unwind_if_revision_cancelled();
 
-                let file_id_wrapper = crate::base_db::EditionedFileId::new(sema.db, file_id);
-                let tree = LazyCell::new(move || sema.parse(file_id_wrapper).syntax().clone());
+                let tree = LazyCell::new(move || sema.parse(file_id).syntax().clone());
 
                 for offset in Self::match_indices(&text, finder, search_range) {
-                    for name_ref in Self::find_nodes(sema, "super", &tree, offset)
+                    for name_ref in Self::find_nodes(sema, "super", file_id, &tree, offset)
                         .filter_map(ast::NameRef::cast)
                     {
                         if self.found_name_ref(&name_ref, sink) {
@@ -1025,7 +1028,7 @@ impl<'a> FindUsages<'a> {
                 }
                 if let Some(finder) = &is_crate_root {
                     for offset in Self::match_indices(&text, finder, search_range) {
-                        for name_ref in Self::find_nodes(sema, "crate", &tree, offset)
+                        for name_ref in Self::find_nodes(sema, "crate", file_id, &tree, offset)
                             .filter_map(ast::NameRef::cast)
                         {
                             if self.found_name_ref(&name_ref, sink) {
@@ -1060,19 +1063,17 @@ impl<'a> FindUsages<'a> {
                     return;
                 };
 
-                let file_text = sema.db.file_text(file_id.file_id());
+                let file_text = sema.db.file_text(file_id.file_id(self.sema.db));
                 let text = file_text.text(sema.db);
                 let search_range =
                     search_range.unwrap_or_else(|| TextRange::up_to(TextSize::of(&*text)));
-
-                let file_id = crate::base_db::EditionedFileId::new(sema.db, file_id);
 
                 let tree = LazyCell::new(|| sema.parse(file_id).syntax().clone());
                 let finder = &Finder::new("self");
 
                 for offset in Self::match_indices(&text, finder, search_range) {
-                    for name_ref in
-                        Self::find_nodes(sema, "self", &tree, offset).filter_map(ast::NameRef::cast)
+                    for name_ref in Self::find_nodes(sema, "self", file_id, &tree, offset)
+                        .filter_map(ast::NameRef::cast)
                     {
                         if self.found_self_module_name_ref(&name_ref, sink) {
                             return;

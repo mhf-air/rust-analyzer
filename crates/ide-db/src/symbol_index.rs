@@ -27,7 +27,7 @@ use std::{
     ops::ControlFlow,
 };
 
-use base_db::{RootQueryDb, SourceDatabase, SourceRootId, Upcast};
+use base_db::{RootQueryDb, SourceDatabase, SourceRootId};
 use fst::{Automaton, Streamer, raw::IndexedValue};
 use hir::{
     Crate, Module,
@@ -97,12 +97,16 @@ impl Query {
 }
 
 #[query_group::query_group]
-pub trait SymbolsDatabase: HirDatabase + SourceDatabase + Upcast<dyn HirDatabase> {
+pub trait SymbolsDatabase: HirDatabase + SourceDatabase {
     /// The symbol index for a given module. These modules should only be in source roots that
     /// are inside local_roots.
+    // FIXME: Is it worth breaking the encapsulation boundary of `hir`, and make this take a `ModuleId`,
+    // in order for it to be a non-interned query?
+    #[salsa::invoke_interned(module_symbols)]
     fn module_symbols(&self, module: Module) -> Arc<SymbolIndex>;
 
     /// The symbol index for a given source root within library_roots.
+    #[salsa::invoke_interned(library_symbols)]
     fn library_symbols(&self, source_root_id: SourceRootId) -> Arc<SymbolIndex>;
 
     #[salsa::transparent]
@@ -123,11 +127,11 @@ pub trait SymbolsDatabase: HirDatabase + SourceDatabase + Upcast<dyn HirDatabase
 fn library_symbols(db: &dyn SymbolsDatabase, source_root_id: SourceRootId) -> Arc<SymbolIndex> {
     let _p = tracing::info_span!("library_symbols").entered();
 
-    let mut symbol_collector = SymbolCollector::new(db.upcast());
+    let mut symbol_collector = SymbolCollector::new(db);
 
     db.source_root_crates(source_root_id)
         .iter()
-        .flat_map(|&krate| Crate::from(krate).modules(db.upcast()))
+        .flat_map(|&krate| Crate::from(krate).modules(db))
         // we specifically avoid calling other SymbolsDatabase queries here, even though they do the same thing,
         // as the index for a library is not going to really ever change, and we do not want to store each
         // the module or crate indices for those in salsa unless we need to.
@@ -139,12 +143,12 @@ fn library_symbols(db: &dyn SymbolsDatabase, source_root_id: SourceRootId) -> Ar
 fn module_symbols(db: &dyn SymbolsDatabase, module: Module) -> Arc<SymbolIndex> {
     let _p = tracing::info_span!("module_symbols").entered();
 
-    Arc::new(SymbolIndex::new(SymbolCollector::new_module(db.upcast(), module)))
+    Arc::new(SymbolIndex::new(SymbolCollector::new_module(db, module)))
 }
 
 pub fn crate_symbols(db: &dyn SymbolsDatabase, krate: Crate) -> Box<[Arc<SymbolIndex>]> {
     let _p = tracing::info_span!("crate_symbols").entered();
-    krate.modules(db.upcast()).into_iter().map(|module| db.module_symbols(module)).collect()
+    krate.modules(db).into_iter().map(|module| db.module_symbols(module)).collect()
 }
 
 // Feature: Workspace Symbol

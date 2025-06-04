@@ -126,13 +126,13 @@ fn check_impl(
 
     let mut defs: Vec<(DefWithBodyId, Crate)> = Vec::new();
     for file_id in files {
-        let module = db.module_for_file_opt(file_id);
+        let module = db.module_for_file_opt(file_id.file_id(&db));
         let module = match module {
             Some(m) => m,
             None => continue,
         };
         let def_map = module.def_map(&db);
-        visit_module(&db, &def_map, module.local_id, &mut |it| {
+        visit_module(&db, def_map, module.local_id, &mut |it| {
             let def = match it {
                 ModuleDefId::FunctionId(it) => it.into(),
                 ModuleDefId::EnumVariantId(it) => it.into(),
@@ -160,7 +160,6 @@ fn check_impl(
             let loc = it.lookup(&db);
             loc.source(&db).value.syntax().text_range().start()
         }
-        DefWithBodyId::InTypeConstId(it) => it.source(&db).syntax().text_range().start(),
     });
     let mut unexpected_type_mismatches = String::new();
     for (def, krate) in defs {
@@ -388,11 +387,11 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
         }
     };
 
-    let module = db.module_for_file(file_id);
+    let module = db.module_for_file(file_id.file_id(&db));
     let def_map = module.def_map(&db);
 
     let mut defs: Vec<(DefWithBodyId, Crate)> = Vec::new();
-    visit_module(&db, &def_map, module.local_id, &mut |it| {
+    visit_module(&db, def_map, module.local_id, &mut |it| {
         let def = match it {
             ModuleDefId::FunctionId(it) => it.into(),
             ModuleDefId::EnumVariantId(it) => it.into(),
@@ -419,7 +418,6 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
             let loc = it.lookup(&db);
             loc.source(&db).value.syntax().text_range().start()
         }
-        DefWithBodyId::InTypeConstId(it) => it.source(&db).syntax().text_range().start(),
     });
     for (def, krate) in defs {
         let (body, source_map) = db.body_with_source_map(def);
@@ -506,7 +504,7 @@ pub(crate) fn visit_module(
     fn visit_body(db: &TestDB, body: &Body, cb: &mut dyn FnMut(ModuleDefId)) {
         for (_, def_map) in body.blocks(db) {
             for (mod_id, _) in def_map.modules() {
-                visit_module(db, &def_map, mod_id, cb);
+                visit_module(db, def_map, mod_id, cb);
             }
         }
     }
@@ -570,9 +568,9 @@ fn salsa_bug() {
     ",
     );
 
-    let module = db.module_for_file(pos.file_id);
+    let module = db.module_for_file(pos.file_id.file_id(&db));
     let crate_def_map = module.def_map(&db);
-    visit_module(&db, &crate_def_map, module.local_id, &mut |def| {
+    visit_module(&db, crate_def_map, module.local_id, &mut |def| {
         db.infer(match def {
             ModuleDefId::FunctionId(it) => it.into(),
             ModuleDefId::EnumVariantId(it) => it.into(),
@@ -607,11 +605,11 @@ fn salsa_bug() {
         }
     ";
 
-    db.set_file_text(pos.file_id.file_id(), new_text);
+    db.set_file_text(pos.file_id.file_id(&db), new_text);
 
-    let module = db.module_for_file(pos.file_id);
+    let module = db.module_for_file(pos.file_id.file_id(&db));
     let crate_def_map = module.def_map(&db);
-    visit_module(&db, &crate_def_map, module.local_id, &mut |def| {
+    visit_module(&db, crate_def_map, module.local_id, &mut |def| {
         db.infer(match def {
             ModuleDefId::FunctionId(it) => it.into(),
             ModuleDefId::EnumVariantId(it) => it.into(),

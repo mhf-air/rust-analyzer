@@ -1,14 +1,17 @@
 //! The IR of the `#[query_group]` macro.
 
-use quote::{ToTokens, format_ident, quote};
-use syn::{FnArg, Ident, PatType, Path, Receiver, ReturnType, Type, parse_quote};
+use quote::{ToTokens, format_ident, quote, quote_spanned};
+use syn::{FnArg, Ident, PatType, Path, Receiver, ReturnType, Type, parse_quote, spanned::Spanned};
+
+use crate::Cycle;
 
 pub(crate) struct TrackedQuery {
     pub(crate) trait_name: Ident,
     pub(crate) signature: syn::Signature,
     pub(crate) pat_and_tys: Vec<PatType>,
     pub(crate) invoke: Option<Path>,
-    pub(crate) cycle: Option<Path>,
+    pub(crate) default: Option<syn::Block>,
+    pub(crate) cycle: Option<Cycle>,
     pub(crate) lru: Option<u32>,
     pub(crate) generated_struct: Option<GeneratedInputStruct>,
 }
@@ -33,12 +36,20 @@ impl ToTokens for TrackedQuery {
         let fn_ident = &sig.ident;
         let shim: Ident = format_ident!("{}_shim", fn_ident);
 
-        let annotation = match (self.cycle.clone(), self.lru) {
-            (Some(cycle), Some(lru)) => quote!(#[salsa::tracked(lru = #lru, recovery_fn = #cycle)]),
-            (Some(cycle), None) => quote!(#[salsa::tracked(recovery_fn = #cycle)]),
-            (None, Some(lru)) => quote!(#[salsa::tracked(lru = #lru)]),
-            (None, None) => quote!(#[salsa::tracked]),
-        };
+        let options = self
+            .cycle
+            .as_ref()
+            .map(|Cycle { cycle_fn, cycle_initial, cycle_result }| {
+                let cycle_fn = cycle_fn.as_ref().map(|(ident, path)| quote!(#ident=#path));
+                let cycle_initial =
+                    cycle_initial.as_ref().map(|(ident, path)| quote!(#ident=#path));
+                let cycle_result = cycle_result.as_ref().map(|(ident, path)| quote!(#ident=#path));
+                let options = cycle_fn.into_iter().chain(cycle_initial).chain(cycle_result);
+                quote!(#(#options),*)
+            })
+            .into_iter()
+            .chain(self.lru.map(|lru| quote!(lru = #lru)));
+        let annotation = quote!(#[salsa_macros::tracked( #(#options),* )]);
 
         let pat_and_tys = &self.pat_and_tys;
         let params = self
@@ -46,6 +57,14 @@ impl ToTokens for TrackedQuery {
             .iter()
             .map(|pat_type| pat_type.pat.clone())
             .collect::<Vec<Box<syn::Pat>>>();
+
+        let invoke_block = match &self.default {
+            Some(default) => quote! { #default },
+            None => {
+                let invoke_params: proc_macro2::TokenStream = quote! {db, #(#params),*};
+                quote_spanned! { invoke.span() =>  {#invoke(#invoke_params)}}
+            }
+        };
 
         let method = match &self.generated_struct {
             Some(generated_struct) => {
@@ -59,9 +78,8 @@ impl ToTokens for TrackedQuery {
                             db: &dyn #trait_name,
                             _input: #input_struct_name,
                             #(#pat_and_tys),*
-                        ) #ret {
-                            #invoke(db, #(#params),*)
-                        }
+                        ) #ret
+                            #invoke_block
                         #shim(self, #create_data_ident(self), #(#params),*)
                     }
                 }
@@ -73,9 +91,9 @@ impl ToTokens for TrackedQuery {
                         fn #shim(
                             db: &dyn #trait_name,
                             #(#pat_and_tys),*
-                        ) #ret {
-                            #invoke(db, #(#params),*)
-                        }
+                        ) #ret
+                            #invoke_block
+
                         #shim(self, #(#params),*)
                     }
                 }
@@ -216,6 +234,7 @@ pub(crate) struct Transparent {
     pub(crate) signature: syn::Signature,
     pub(crate) pat_and_tys: Vec<PatType>,
     pub(crate) invoke: Option<Path>,
+    pub(crate) default: Option<syn::Block>,
 }
 
 impl ToTokens for Transparent {
@@ -233,10 +252,15 @@ impl ToTokens for Transparent {
             None => sig.ident.to_token_stream(),
         };
 
-        let method = quote! {
-            #sig {
-                #invoke(self, #(#ty),*)
-            }
+        let method = match &self.default {
+            Some(default) => quote! {
+                #sig { let db = self; #default }
+            },
+            None => quote! {
+                #sig {
+                    #invoke(self, #(#ty),*)
+                }
+            },
         };
 
         method.to_tokens(tokens);
@@ -310,6 +334,7 @@ impl ToTokens for Lookup {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Queries {
     TrackedQuery(TrackedQuery),
     InputQuery(InputQuery),

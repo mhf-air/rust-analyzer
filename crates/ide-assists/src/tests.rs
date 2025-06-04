@@ -1,9 +1,10 @@
 mod generated;
 
 use expect_test::expect;
-use hir::{FileRange, Semantics};
+use hir::Semantics;
 use ide_db::{
-    EditionedFileId, RootDatabase, SnippetCap,
+    EditionedFileId, FileRange, RootDatabase, SnippetCap,
+    assists::ExprFillDefaultMode,
     base_db::SourceDatabase,
     imports::insert_use::{ImportGranularity, InsertUseConfig},
     source_change::FileSystemEdit,
@@ -35,6 +36,7 @@ pub(crate) const TEST_CONFIG: AssistConfig = AssistConfig {
     term_search_fuel: 400,
     term_search_borrowck: true,
     code_action_grouping: true,
+    expr_fill_default: ExprFillDefaultMode::Todo,
 };
 
 pub(crate) const TEST_CONFIG_NO_GROUPING: AssistConfig = AssistConfig {
@@ -54,6 +56,7 @@ pub(crate) const TEST_CONFIG_NO_GROUPING: AssistConfig = AssistConfig {
     term_search_fuel: 400,
     term_search_borrowck: true,
     code_action_grouping: false,
+    expr_fill_default: ExprFillDefaultMode::Todo,
 };
 
 pub(crate) const TEST_CONFIG_NO_SNIPPET_CAP: AssistConfig = AssistConfig {
@@ -73,6 +76,7 @@ pub(crate) const TEST_CONFIG_NO_SNIPPET_CAP: AssistConfig = AssistConfig {
     term_search_fuel: 400,
     term_search_borrowck: true,
     code_action_grouping: true,
+    expr_fill_default: ExprFillDefaultMode::Todo,
 };
 
 pub(crate) const TEST_CONFIG_IMPORT_ONE: AssistConfig = AssistConfig {
@@ -92,6 +96,7 @@ pub(crate) const TEST_CONFIG_IMPORT_ONE: AssistConfig = AssistConfig {
     term_search_fuel: 400,
     term_search_borrowck: true,
     code_action_grouping: true,
+    expr_fill_default: ExprFillDefaultMode::Todo,
 };
 
 pub(crate) fn with_single_file(text: &str) -> (RootDatabase, EditionedFileId) {
@@ -222,17 +227,17 @@ pub(crate) fn check_assist_unresolved(
 fn check_doc_test(assist_id: &str, before: &str, after: &str) {
     let after = trim_indent(after);
     let (db, file_id, selection) = RootDatabase::with_range_or_offset(before);
-    let before = db.file_text(file_id.file_id()).text(&db).to_string();
-    let frange = FileRange { file_id, range: selection.into() };
+    let before = db.file_text(file_id.file_id(&db)).text(&db).to_string();
+    let frange = ide_db::FileRange { file_id: file_id.file_id(&db), range: selection.into() };
 
-    let assist = assists(&db, &TEST_CONFIG, AssistResolveStrategy::All, frange.into())
+    let assist = assists(&db, &TEST_CONFIG, AssistResolveStrategy::All, frange)
         .into_iter()
         .find(|assist| assist.id.0 == assist_id)
         .unwrap_or_else(|| {
             panic!(
                 "\n\nAssist is not applicable: {}\nAvailable assists: {}",
                 assist_id,
-                assists(&db, &TEST_CONFIG, AssistResolveStrategy::None, frange.into())
+                assists(&db, &TEST_CONFIG, AssistResolveStrategy::None, frange)
                     .into_iter()
                     .map(|assist| assist.id.0)
                     .collect::<Vec<_>>()
@@ -247,7 +252,7 @@ fn check_doc_test(assist_id: &str, before: &str, after: &str) {
             .expect("Assist did not contain any source changes");
         let mut actual = before;
         if let Some((source_file_edit, snippet_edit)) =
-            source_change.get_source_and_snippet_edit(file_id.file_id())
+            source_change.get_source_and_snippet_edit(file_id.file_id(&db))
         {
             source_file_edit.apply(&mut actual);
             if let Some(snippet_edit) = snippet_edit {
@@ -281,9 +286,9 @@ fn check_with_config(
 ) {
     let (mut db, file_with_caret_id, range_or_offset) = RootDatabase::with_range_or_offset(before);
     db.enable_proc_attr_macros();
-    let text_without_caret = db.file_text(file_with_caret_id.into()).text(&db).to_string();
+    let text_without_caret = db.file_text(file_with_caret_id.file_id(&db)).text(&db).to_string();
 
-    let frange = FileRange { file_id: file_with_caret_id, range: range_or_offset.into() };
+    let frange = hir::FileRange { file_id: file_with_caret_id, range: range_or_offset.into() };
 
     let sema = Semantics::new(&db);
     let ctx = AssistContext::new(sema, &config, frange);
@@ -297,7 +302,9 @@ fn check_with_config(
 
     let assist = match assist_label {
         Some(label) => res.into_iter().find(|resolved| resolved.label == label),
-        None => res.pop(),
+        None if res.is_empty() => None,
+        // Pick the first as that is the one with the highest priority
+        None => Some(res.swap_remove(0)),
     };
 
     match (assist, expected) {
@@ -388,8 +395,9 @@ fn assist_order_field_struct() {
     let before = "struct Foo { $0bar: u32 }";
     let (before_cursor_pos, before) = extract_offset(before);
     let (db, file_id) = with_single_file(&before);
-    let frange = FileRange { file_id, range: TextRange::empty(before_cursor_pos) };
-    let assists = assists(&db, &TEST_CONFIG, AssistResolveStrategy::None, frange.into());
+    let frange =
+        FileRange { file_id: file_id.file_id(&db), range: TextRange::empty(before_cursor_pos) };
+    let assists = assists(&db, &TEST_CONFIG, AssistResolveStrategy::None, frange);
     let mut assists = assists.iter();
 
     assert_eq!(assists.next().expect("expected assist").label, "Change visibility to pub(crate)");
@@ -415,7 +423,12 @@ pub fn test_some_range(a: int) -> bool {
 "#,
     );
 
-    let assists = assists(&db, &TEST_CONFIG, AssistResolveStrategy::None, frange.into());
+    let assists = assists(
+        &db,
+        &TEST_CONFIG,
+        AssistResolveStrategy::None,
+        FileRange { file_id: frange.file_id.file_id(&db), range: frange.range },
+    );
     let expected = labels(&assists);
 
     expect![[r#"
@@ -443,7 +456,12 @@ pub fn test_some_range(a: int) -> bool {
         let mut cfg = TEST_CONFIG;
         cfg.allowed = Some(vec![AssistKind::Refactor]);
 
-        let assists = assists(&db, &cfg, AssistResolveStrategy::None, frange.into());
+        let assists = assists(
+            &db,
+            &cfg,
+            AssistResolveStrategy::None,
+            FileRange { file_id: frange.file_id.file_id(&db), range: frange.range },
+        );
         let expected = labels(&assists);
 
         expect![[r#"
@@ -457,7 +475,12 @@ pub fn test_some_range(a: int) -> bool {
     {
         let mut cfg = TEST_CONFIG;
         cfg.allowed = Some(vec![AssistKind::RefactorExtract]);
-        let assists = assists(&db, &cfg, AssistResolveStrategy::None, frange.into());
+        let assists = assists(
+            &db,
+            &cfg,
+            AssistResolveStrategy::None,
+            FileRange { file_id: frange.file_id.file_id(&db), range: frange.range },
+        );
         let expected = labels(&assists);
 
         expect![[r#"
@@ -469,7 +492,12 @@ pub fn test_some_range(a: int) -> bool {
     {
         let mut cfg = TEST_CONFIG;
         cfg.allowed = Some(vec![AssistKind::QuickFix]);
-        let assists = assists(&db, &cfg, AssistResolveStrategy::None, frange.into());
+        let assists = assists(
+            &db,
+            &cfg,
+            AssistResolveStrategy::None,
+            FileRange { file_id: frange.file_id.file_id(&db), range: frange.range },
+        );
         let expected = labels(&assists);
 
         expect![[r#""#]].assert_eq(&expected);
@@ -494,7 +522,12 @@ pub fn test_some_range(a: int) -> bool {
     cfg.allowed = Some(vec![AssistKind::RefactorExtract]);
 
     {
-        let assists = assists(&db, &cfg, AssistResolveStrategy::None, frange.into());
+        let assists = assists(
+            &db,
+            &cfg,
+            AssistResolveStrategy::None,
+            FileRange { file_id: frange.file_id.file_id(&db), range: frange.range },
+        );
         assert_eq!(4, assists.len());
         let mut assists = assists.into_iter();
 
@@ -592,7 +625,7 @@ pub fn test_some_range(a: int) -> bool {
                 assist_kind: AssistKind::RefactorExtract,
                 assist_subtype: None,
             }),
-            frange.into(),
+            FileRange { file_id: frange.file_id.file_id(&db), range: frange.range },
         );
         assert_eq!(4, assists.len());
         let mut assists = assists.into_iter();
@@ -691,7 +724,7 @@ pub fn test_some_range(a: int) -> bool {
                 assist_kind: AssistKind::RefactorExtract,
                 assist_subtype: None,
             }),
-            frange.into(),
+            FileRange { file_id: frange.file_id.file_id(&db), range: frange.range },
         );
         assert_eq!(4, assists.len());
         let mut assists = assists.into_iter();
@@ -828,7 +861,12 @@ pub fn test_some_range(a: int) -> bool {
     }
 
     {
-        let assists = assists(&db, &cfg, AssistResolveStrategy::All, frange.into());
+        let assists = assists(
+            &db,
+            &cfg,
+            AssistResolveStrategy::All,
+            FileRange { file_id: frange.file_id.file_id(&db), range: frange.range },
+        );
         assert_eq!(4, assists.len());
         let mut assists = assists.into_iter();
 

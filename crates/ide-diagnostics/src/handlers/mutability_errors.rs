@@ -39,7 +39,7 @@ pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Option
         Some(vec![fix(
             "add_mut",
             "Change it to be mutable",
-            SourceChange::from_text_edit(file_id, edit),
+            SourceChange::from_text_edit(file_id.file_id(ctx.sema.db), edit),
             use_range,
         )])
     })();
@@ -55,6 +55,7 @@ pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Option
             ),
             span,
         )
+        .stable()
         .with_fixes(fixes),
     )
 }
@@ -82,7 +83,7 @@ pub(crate) fn unused_mut(ctx: &DiagnosticsContext<'_>, d: &hir::UnusedMut) -> Op
         Some(vec![fix(
             "remove_mut",
             "Remove unnecessary `mut`",
-            SourceChange::from_text_edit(file_id, edit),
+            SourceChange::from_text_edit(file_id.file_id(ctx.sema.db), edit),
             use_range,
         )])
     })();
@@ -94,7 +95,7 @@ pub(crate) fn unused_mut(ctx: &DiagnosticsContext<'_>, d: &hir::UnusedMut) -> Op
             "variable does not need to be mutable",
             ast,
         )
-        .experimental() // Not supporting `#[allow(unused_mut)]` in proc macros leads to false positive.
+        // Not supporting `#[allow(unused_mut)]` in proc macros leads to false positive, hence not stable.
         .with_fixes(fixes),
     )
 }

@@ -5,6 +5,7 @@ use hir_expand::{
     MacroCallId, MacroCallKind, MacroDefId,
     attrs::{Attr, AttrId, AttrInput},
     inert_attr_macro::find_builtin_attr_idx,
+    mod_path::{ModPath, PathKind},
 };
 use span::SyntaxContext;
 use syntax::ast;
@@ -15,7 +16,6 @@ use crate::{
     db::DefDatabase,
     item_scope::BuiltinShadowMode,
     nameres::{LocalDefMap, path_resolution::ResolveMode},
-    path::{self, ModPath, PathKind},
 };
 
 use super::{DefMap, MacroSubNs};
@@ -121,7 +121,7 @@ pub(super) fn attr_macro_as_call_id(
     };
 
     def.make_call(
-        db.upcast(),
+        db,
         krate,
         MacroCallKind::Attr {
             ast_id: item_attr.ast_id,
@@ -139,14 +139,14 @@ pub(super) fn derive_macro_as_call_id(
     derive_pos: u32,
     call_site: SyntaxContext,
     krate: Crate,
-    resolver: impl Fn(&path::ModPath) -> Option<(MacroId, MacroDefId)>,
+    resolver: impl Fn(&ModPath) -> Option<(MacroId, MacroDefId)>,
     derive_macro_id: MacroCallId,
 ) -> Result<(MacroId, MacroDefId, MacroCallId), UnresolvedMacro> {
     let (macro_id, def_id) = resolver(&item_attr.path)
         .filter(|(_, def_id)| def_id.is_derive())
         .ok_or_else(|| UnresolvedMacro { path: item_attr.path.as_ref().clone() })?;
     let call_id = def_id.make_call(
-        db.upcast(),
+        db,
         krate,
         MacroCallKind::Derive {
             ast_id: item_attr.ast_id,

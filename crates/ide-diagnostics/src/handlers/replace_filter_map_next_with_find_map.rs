@@ -1,4 +1,4 @@
-use hir::{HirFileIdExt, InFile, db::ExpandDatabase};
+use hir::{InFile, db::ExpandDatabase};
 use ide_db::source_change::SourceChange;
 use ide_db::text_edit::TextEdit;
 use syntax::{
@@ -21,6 +21,7 @@ pub(crate) fn replace_filter_map_next_with_find_map(
         "replace filter_map(..).next() with find_map(..)",
         InFile::new(d.file, d.next_expr.into()),
     )
+    .stable()
     .with_fixes(fixes(ctx, d))
 }
 
@@ -43,7 +44,8 @@ fn fixes(
 
     let edit = TextEdit::replace(range_to_replace, replacement);
 
-    let source_change = SourceChange::from_text_edit(d.file.original_file(ctx.sema.db), edit);
+    let source_change =
+        SourceChange::from_text_edit(d.file.original_file(ctx.sema.db).file_id(ctx.sema.db), edit);
 
     Some(vec![fix(
         "replace_with_find_map",

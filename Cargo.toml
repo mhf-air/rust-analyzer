@@ -4,7 +4,7 @@ exclude = ["crates/proc-macro-srv/proc-macro-test/imp"]
 resolver = "2"
 
 [workspace.package]
-rust-version = "1.85"
+rust-version = "1.86"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["rust-analyzer team"]
@@ -21,6 +21,8 @@ smol_str.opt-level = 3
 text-size.opt-level = 3
 serde.opt-level = 3
 salsa.opt-level = 3
+dissimilar.opt-level = 3
+
 # This speeds up `cargo xtask dist`.
 miniz_oxide.opt-level = 3
 
@@ -46,7 +48,7 @@ debug = 2
 
 # ungrammar = { path = "../ungrammar" }
 
-# rust-analyzer-salsa = { path = "../salsa" }
+# salsa = { path = "../salsa" }
 
 [workspace.dependencies]
 # local crates
@@ -85,11 +87,11 @@ vfs-notify = { path = "./crates/vfs-notify", version = "0.0.0" }
 vfs = { path = "./crates/vfs", version = "0.0.0" }
 edition = { path = "./crates/edition", version = "0.0.0" }
 
-ra-ap-rustc_lexer = { version = "0.100", default-features = false }
-ra-ap-rustc_parse_format = { version = "0.100", default-features = false }
-ra-ap-rustc_index = { version = "0.100", default-features = false }
-ra-ap-rustc_abi = { version = "0.100", default-features = false }
-ra-ap-rustc_pattern_analysis = { version = "0.100", default-features = false }
+ra-ap-rustc_lexer = { version = "0.113", default-features = false }
+ra-ap-rustc_parse_format = { version = "0.113", default-features = false }
+ra-ap-rustc_index = { version = "0.113", default-features = false }
+ra-ap-rustc_abi = { version = "0.113", default-features = false }
+ra-ap-rustc_pattern_analysis = { version = "0.113", default-features = false }
 
 # local crates that aren't published to crates.io. These should not have versions.
 
@@ -104,11 +106,11 @@ arrayvec = "0.7.6"
 bitflags = "2.9.0"
 cargo_metadata = "0.19.2"
 camino = "1.1.9"
-chalk-solve = { version = "0.100.0", default-features = false }
-chalk-ir = "0.100.0"
-chalk-recursive = { version = "0.100.0", default-features = false }
-chalk-derive = "0.100.0"
-crossbeam-channel = "0.5.14"
+chalk-solve = { version = "0.102.0", default-features = false }
+chalk-ir = "0.102.0"
+chalk-recursive = { version = "0.102.0", default-features = false }
+chalk-derive = "0.102.0"
+crossbeam-channel = "0.5.15"
 dissimilar = "1.0.10"
 dot = "0.1.4"
 either = "1.15.0"
@@ -131,12 +133,15 @@ process-wrap = { version = "8.2.0", features = ["std"] }
 pulldown-cmark-to-cmark = "10.0.4"
 pulldown-cmark = { version = "0.9.6", default-features = false }
 rayon = "1.10.0"
-salsa = "0.19"
-rustc-hash = "2.1.1"
+rowan = "=0.15.15"
+salsa = { version = "0.22.0", default-features = false, features = ["rayon","salsa_unstable"] }
+salsa-macros = "0.22.0"
 semver = "1.0.26"
 serde = { version = "1.0.219" }
 serde_derive = { version = "1.0.219" }
 serde_json = "1.0.140"
+rustc-hash = "2.1.1"
+rustc-literal-escaper = "0.0.2"
 smallvec = { version = "1.14.0", features = [
   "const_new",
   "union",
@@ -158,11 +163,10 @@ triomphe = { version = "0.1.14", default-features = false, features = ["std"] }
 url = "2.5.4"
 xshell = "0.2.7"
 
-
 # We need to freeze the version of the crate, as the raw-api feature is considered unstable
-dashmap = { version = "=5.5.3", features = ["raw-api"] }
+dashmap = { version = "=6.1.0", features = ["raw-api", "inline"] }
 # We need to freeze the version of the crate, as it needs to match with dashmap
-hashbrown = { version = "=0.14.5", features = [
+hashbrown = { version = "0.14.0", features = [
   "inline-more",
 ], default-features = false }
 
@@ -172,6 +176,7 @@ hashbrown = { version = "=0.14.5", features = [
 elided_lifetimes_in_paths = "warn"
 explicit_outlives_requirements = "warn"
 unsafe_op_in_unsafe_fn = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bootstrap)'] }
 unused_extern_crates = "warn"
 unused_lifetimes = "warn"
 unreachable_pub = "warn"

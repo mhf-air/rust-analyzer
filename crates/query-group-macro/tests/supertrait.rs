@@ -1,6 +1,6 @@
 use query_group_macro::query_group;
 
-#[salsa::db]
+#[salsa_macros::db]
 pub trait SourceDb: salsa::Database {
     /// Text of the file.
     fn file_text(&self, id: usize) -> String;
@@ -8,6 +8,7 @@ pub trait SourceDb: salsa::Database {
 
 #[query_group]
 pub trait RootDb: SourceDb {
+    #[salsa::invoke_interned(parse)]
     fn parse(&self, id: usize) -> String;
 }
 

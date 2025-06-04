@@ -4,22 +4,22 @@ use std::{fmt, panic, sync::Mutex};
 
 use base_db::{
     Crate, CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, RootQueryDb,
-    SourceDatabase, SourceRoot, SourceRootId, SourceRootInput, Upcast,
+    SourceDatabase, SourceRoot, SourceRootId, SourceRootInput,
 };
-use hir_expand::{InFile, db::ExpandDatabase, files::FilePosition};
+use hir_expand::{InFile, files::FilePosition};
 use salsa::{AsDynDatabase, Durability};
-use span::{EditionedFileId, FileId};
+use span::FileId;
 use syntax::{AstNode, algo, ast};
 use triomphe::Arc;
 
 use crate::{
     LocalModuleId, Lookup, ModuleDefId, ModuleId,
     db::DefDatabase,
-    nameres::{DefMap, ModuleSource},
+    nameres::{DefMap, ModuleSource, block_def_map, crate_def_map},
     src::HasSource,
 };
 
-#[salsa::db]
+#[salsa_macros::db]
 #[derive(Clone)]
 pub(crate) struct TestDB {
     storage: salsa::Storage<Self>,
@@ -30,9 +30,18 @@ pub(crate) struct TestDB {
 
 impl Default for TestDB {
     fn default() -> Self {
+        let events = <Arc<Mutex<Option<Vec<salsa::Event>>>>>::default();
         let mut this = Self {
-            storage: Default::default(),
-            events: Default::default(),
+            storage: salsa::Storage::new(Some(Box::new({
+                let events = events.clone();
+                move |event| {
+                    let mut events = events.lock().unwrap();
+                    if let Some(events) = &mut *events {
+                        events.push(event);
+                    }
+                }
+            }))),
+            events,
             files: Default::default(),
             crates_map: Default::default(),
         };
@@ -44,42 +53,8 @@ impl Default for TestDB {
     }
 }
 
-impl Upcast<dyn ExpandDatabase> for TestDB {
-    #[inline]
-    fn upcast(&self) -> &(dyn ExpandDatabase + 'static) {
-        self
-    }
-}
-
-impl Upcast<dyn DefDatabase> for TestDB {
-    #[inline]
-    fn upcast(&self) -> &(dyn DefDatabase + 'static) {
-        self
-    }
-}
-
-impl Upcast<dyn RootQueryDb> for TestDB {
-    fn upcast(&self) -> &(dyn RootQueryDb + 'static) {
-        self
-    }
-}
-
-impl Upcast<dyn SourceDatabase> for TestDB {
-    fn upcast(&self) -> &(dyn SourceDatabase + 'static) {
-        self
-    }
-}
-
-#[salsa::db]
-impl salsa::Database for TestDB {
-    fn salsa_event(&self, event: &dyn std::ops::Fn() -> salsa::Event) {
-        let mut events = self.events.lock().unwrap();
-        if let Some(events) = &mut *events {
-            let event = event();
-            events.push(event);
-        }
-    }
-}
+#[salsa_macros::db]
+impl salsa::Database for TestDB {}
 
 impl fmt::Debug for TestDB {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -89,7 +64,7 @@ impl fmt::Debug for TestDB {
 
 impl panic::RefUnwindSafe for TestDB {}
 
-#[salsa::db]
+#[salsa_macros::db]
 impl SourceDatabase for TestDB {
     fn file_text(&self, file_id: base_db::FileId) -> FileText {
         self.files.file_text(file_id)
@@ -158,12 +133,10 @@ impl TestDB {
     }
 
     pub(crate) fn module_for_file(&self, file_id: FileId) -> ModuleId {
-        let db = <TestDB as Upcast<dyn DefDatabase>>::upcast(self);
-
         for &krate in self.relevant_crates(file_id).iter() {
-            let crate_def_map = db.crate_def_map(krate);
+            let crate_def_map = crate_def_map(self, krate);
             for (local_id, data) in crate_def_map.modules() {
-                if data.origin.file_id().map(EditionedFileId::file_id) == Some(file_id) {
+                if data.origin.file_id().map(|file_id| file_id.file_id(self)) == Some(file_id) {
                     return crate_def_map.module_id(local_id);
                 }
             }
@@ -172,20 +145,18 @@ impl TestDB {
     }
 
     pub(crate) fn module_at_position(&self, position: FilePosition) -> ModuleId {
-        let db = <TestDB as Upcast<dyn DefDatabase>>::upcast(self);
+        let file_module = self.module_for_file(position.file_id.file_id(self));
+        let mut def_map = file_module.def_map(self);
+        let module = self.mod_at_position(def_map, position);
 
-        let file_module = self.module_for_file(position.file_id.file_id());
-        let mut def_map = file_module.def_map(db);
-        let module = self.mod_at_position(&def_map, position);
-
-        def_map = match self.block_at_position(&def_map, position) {
+        def_map = match self.block_at_position(def_map, position) {
             Some(it) => it,
             None => return def_map.module_id(module),
         };
         loop {
-            let new_map = self.block_at_position(&def_map, position);
+            let new_map = self.block_at_position(def_map, position);
             match new_map {
-                Some(new_block) if !Arc::ptr_eq(&new_block, &def_map) => {
+                Some(new_block) if !std::ptr::eq(&new_block, &def_map) => {
                     def_map = new_block;
                 }
                 _ => {
@@ -198,11 +169,10 @@ impl TestDB {
 
     /// Finds the smallest/innermost module in `def_map` containing `position`.
     fn mod_at_position(&self, def_map: &DefMap, position: FilePosition) -> LocalModuleId {
-        let db = <TestDB as Upcast<dyn DefDatabase>>::upcast(self);
         let mut size = None;
         let mut res = DefMap::ROOT;
         for (module, data) in def_map.modules() {
-            let src = data.definition_source(db);
+            let src = data.definition_source(self);
             if src.file_id != position.file_id {
                 continue;
             }
@@ -237,19 +207,18 @@ impl TestDB {
         res
     }
 
-    fn block_at_position(&self, def_map: &DefMap, position: FilePosition) -> Option<Arc<DefMap>> {
-        let db = <TestDB as Upcast<dyn DefDatabase>>::upcast(self);
+    fn block_at_position(&self, def_map: &DefMap, position: FilePosition) -> Option<&DefMap> {
         // Find the smallest (innermost) function in `def_map` containing the cursor.
         let mut size = None;
         let mut fn_def = None;
         for (_, module) in def_map.modules() {
-            let file_id = module.definition_source(db).file_id;
+            let file_id = module.definition_source(self).file_id;
             if file_id != position.file_id {
                 continue;
             }
             for decl in module.scope.declarations() {
                 if let ModuleDefId::FunctionId(it) = decl {
-                    let range = it.lookup(db).source(db).value.syntax().text_range();
+                    let range = it.lookup(self).source(self).value.syntax().text_range();
 
                     if !range.contains(position.offset) {
                         continue;
@@ -275,13 +244,10 @@ impl TestDB {
 
         // Find the innermost block expression that has a `DefMap`.
         let def_with_body = fn_def?.into();
-        let source_map = db.body_with_source_map(def_with_body).1;
-        let scopes = db.expr_scopes(def_with_body);
+        let source_map = self.body_with_source_map(def_with_body).1;
+        let scopes = self.expr_scopes(def_with_body);
 
-        let editioned_file_id_wrapper =
-            base_db::EditionedFileId::new(db.as_dyn_database(), position.file_id);
-
-        let root_syntax_node = db.parse(editioned_file_id_wrapper).syntax_node();
+        let root_syntax_node = self.parse(position.file_id).syntax_node();
         let scope_iter =
             algo::ancestors_at_offset(&root_syntax_node, position.offset).filter_map(|node| {
                 let block = ast::BlockExpr::cast(node)?;
@@ -298,7 +264,7 @@ impl TestDB {
             let mut containing_blocks =
                 scopes.scope_chain(Some(scope)).filter_map(|scope| scopes.block(scope));
 
-            if let Some(block) = containing_blocks.next().map(|block| db.block_def_map(block)) {
+            if let Some(block) = containing_blocks.next().map(|block| block_def_map(self, block)) {
                 return Some(block);
             }
         }

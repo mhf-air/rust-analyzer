@@ -51,18 +51,26 @@ pub(crate) fn convert_tuple_struct_to_named_struct(
     acc: &mut Assists,
     ctx: &AssistContext<'_>,
 ) -> Option<()> {
-    let name = ctx.find_node_at_offset::<ast::Name>()?;
-    let strukt = name.syntax().parent().and_then(<Either<ast::Struct, ast::Variant>>::cast)?;
-    let field_list = strukt.as_ref().either(|s| s.field_list(), |v| v.field_list())?;
+    let strukt_or_variant = ctx
+        .find_node_at_offset::<ast::Struct>()
+        .map(Either::Left)
+        .or_else(|| ctx.find_node_at_offset::<ast::Variant>().map(Either::Right))?;
+    let field_list = strukt_or_variant.as_ref().either(|s| s.field_list(), |v| v.field_list())?;
+
+    if ctx.offset() > field_list.syntax().text_range().start() {
+        // Assist could be distracting after the braces
+        return None;
+    }
+
     let tuple_fields = match field_list {
         ast::FieldList::TupleFieldList(it) => it,
         ast::FieldList::RecordFieldList(_) => return None,
     };
-    let strukt_def = match &strukt {
+    let strukt_def = match &strukt_or_variant {
         Either::Left(s) => Either::Left(ctx.sema.to_def(s)?),
         Either::Right(v) => Either::Right(ctx.sema.to_def(v)?),
     };
-    let target = strukt.as_ref().either(|s| s.syntax(), |v| v.syntax()).text_range();
+    let target = strukt_or_variant.as_ref().either(|s| s.syntax(), |v| v.syntax()).text_range();
 
     acc.add(
         AssistId::refactor_rewrite("convert_tuple_struct_to_named_struct"),
@@ -72,7 +80,7 @@ pub(crate) fn convert_tuple_struct_to_named_struct(
             let names = generate_names(tuple_fields.fields());
             edit_field_references(ctx, edit, tuple_fields.fields(), &names);
             edit_struct_references(ctx, edit, strukt_def, &names);
-            edit_struct_def(ctx, edit, &strukt, tuple_fields, names);
+            edit_struct_def(ctx, edit, &strukt_or_variant, tuple_fields, names);
         },
     )
 }
@@ -95,7 +103,7 @@ fn edit_struct_def(
     let record_fields = ast::make::record_field_list(record_fields);
     let tuple_fields_text_range = tuple_fields.syntax().text_range();
 
-    edit.edit_file(ctx.file_id());
+    edit.edit_file(ctx.vfs_file_id());
 
     if let Either::Left(strukt) = strukt {
         if let Some(w) = strukt.where_clause() {
@@ -142,7 +150,7 @@ fn edit_struct_references(
             match node {
                 ast::TupleStructPat(tuple_struct_pat) => {
                     let file_range = ctx.sema.original_range_opt(&node)?;
-                    edit.edit_file(file_range.file_id);
+                    edit.edit_file(file_range.file_id.file_id(ctx.db()));
                     edit.replace(
                         file_range.range,
                         ast::make::record_pat_with_fields(
@@ -197,7 +205,7 @@ fn edit_struct_references(
     };
 
     for (file_id, refs) in usages {
-        edit.edit_file(file_id.file_id());
+        edit.edit_file(file_id.file_id(ctx.db()));
         for r in refs {
             for node in r.name.syntax().ancestors() {
                 if edit_node(edit, node).is_some() {
@@ -222,7 +230,7 @@ fn edit_field_references(
         let def = Definition::Field(field);
         let usages = def.usages(&ctx.sema).all();
         for (file_id, refs) in usages {
-            edit.edit_file(file_id.file_id());
+            edit.edit_file(file_id.file_id(ctx.db()));
             for r in refs {
                 if let Some(name_ref) = r.name.as_name_ref() {
                     edit.replace(ctx.sema.original_range(name_ref.syntax()).range, name.text());
@@ -299,6 +307,88 @@ impl A {
             r#"
 struct Inner;
 struct A { field1: Inner }
+
+impl A {
+    fn new(inner: Inner) -> A {
+        A { field1: inner }
+    }
+
+    fn new_with_default() -> A {
+        A::new(Inner)
+    }
+
+    fn into_inner(self) -> Inner {
+        self.field1
+    }
+}"#,
+        );
+    }
+
+    #[test]
+    fn convert_simple_struct_cursor_on_struct_keyword() {
+        check_assist(
+            convert_tuple_struct_to_named_struct,
+            r#"
+struct Inner;
+struct$0 A(Inner);
+
+impl A {
+    fn new(inner: Inner) -> A {
+        A(inner)
+    }
+
+    fn new_with_default() -> A {
+        A::new(Inner)
+    }
+
+    fn into_inner(self) -> Inner {
+        self.0
+    }
+}"#,
+            r#"
+struct Inner;
+struct A { field1: Inner }
+
+impl A {
+    fn new(inner: Inner) -> A {
+        A { field1: inner }
+    }
+
+    fn new_with_default() -> A {
+        A::new(Inner)
+    }
+
+    fn into_inner(self) -> Inner {
+        self.field1
+    }
+}"#,
+        );
+    }
+
+    #[test]
+    fn convert_simple_struct_cursor_on_visibility_keyword() {
+        check_assist(
+            convert_tuple_struct_to_named_struct,
+            r#"
+struct Inner;
+pub$0 struct A(Inner);
+
+impl A {
+    fn new(inner: Inner) -> A {
+        A(inner)
+    }
+
+    fn new_with_default() -> A {
+        A::new(Inner)
+    }
+
+    fn into_inner(self) -> Inner {
+        self.0
+    }
+}"#,
+            r#"
+struct Inner;
+pub struct A { field1: Inner }
 
 impl A {
     fn new(inner: Inner) -> A {
@@ -923,7 +1013,8 @@ where
 pub struct $0Foo(#[my_custom_attr] u32);
 "#,
             r#"
-pub struct Foo { #[my_custom_attr] field1: u32 }
+pub struct Foo { #[my_custom_attr]
+field1: u32 }
 "#,
         );
     }

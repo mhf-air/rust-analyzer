@@ -43,7 +43,7 @@ pub(crate) fn replace_let_with_if_let(acc: &mut Assists, ctx: &AssistContext<'_>
         target,
         |builder| {
             let mut editor = builder.make_editor(let_stmt.syntax());
-            let make = SyntaxFactory::new();
+            let make = SyntaxFactory::with_mappings();
             let ty = ctx.sema.type_of_expr(&init);
             let pat = if let_stmt.let_else().is_some() {
                 // Do not add the wrapper type that implements `Try`,
@@ -74,7 +74,7 @@ pub(crate) fn replace_let_with_if_let(acc: &mut Assists, ctx: &AssistContext<'_>
 
             editor.replace(let_stmt.syntax(), if_stmt.syntax());
             editor.add_mappings(make.finish_with_mappings());
-            builder.add_file_edits(ctx.file_id(), editor);
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }

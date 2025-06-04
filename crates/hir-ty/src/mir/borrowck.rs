@@ -15,13 +15,13 @@ use crate::{
     ClosureId, Interner, Substitution, Ty, TyExt, TypeFlags,
     db::{HirDatabase, InternedClosure},
     display::DisplayTarget,
-    mir::Operand,
+    mir::OperandKind,
     utils::ClosureSubst,
 };
 
 use super::{
-    BasicBlockId, BorrowKind, LocalId, MirBody, MirLowerError, MirSpan, MutBorrowKind, Place,
-    ProjectionElem, Rvalue, StatementKind, TerminatorKind,
+    BasicBlockId, BorrowKind, LocalId, MirBody, MirLowerError, MirSpan, MutBorrowKind, Operand,
+    Place, ProjectionElem, Rvalue, StatementKind, TerminatorKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,8 +120,8 @@ fn make_fetch_closure_field(
 
 fn moved_out_of_ref(db: &dyn HirDatabase, body: &MirBody) -> Vec<MovedOutOfRef> {
     let mut result = vec![];
-    let mut for_operand = |op: &Operand, span: MirSpan| match op {
-        Operand::Copy(p) | Operand::Move(p) => {
+    let mut for_operand = |op: &Operand, span: MirSpan| match op.kind {
+        OperandKind::Copy(p) | OperandKind::Move(p) => {
             let mut ty: Ty = body.locals[p.local].ty.clone();
             let mut is_dereference_of_ref = false;
             for proj in p.projection.lookup(&body.projection_store) {
@@ -132,17 +132,17 @@ fn moved_out_of_ref(db: &dyn HirDatabase, body: &MirBody) -> Vec<MovedOutOfRef> 
                     ty,
                     db,
                     make_fetch_closure_field(db),
-                    body.owner.module(db.upcast()).krate(),
+                    body.owner.module(db).krate(),
                 );
             }
             if is_dereference_of_ref
                 && !ty.clone().is_copy(db, body.owner)
                 && !ty.data(Interner).flags.intersects(TypeFlags::HAS_ERROR)
             {
-                result.push(MovedOutOfRef { span, ty });
+                result.push(MovedOutOfRef { span: op.span.unwrap_or(span), ty });
             }
         }
-        Operand::Constant(_) | Operand::Static(_) => (),
+        OperandKind::Constant(_) | OperandKind::Static(_) => (),
     };
     for (_, block) in body.basic_blocks.iter() {
         db.unwind_if_revision_cancelled();
@@ -215,15 +215,15 @@ fn moved_out_of_ref(db: &dyn HirDatabase, body: &MirBody) -> Vec<MovedOutOfRef> 
 
 fn partially_moved(db: &dyn HirDatabase, body: &MirBody) -> Vec<PartiallyMoved> {
     let mut result = vec![];
-    let mut for_operand = |op: &Operand, span: MirSpan| match op {
-        Operand::Copy(p) | Operand::Move(p) => {
+    let mut for_operand = |op: &Operand, span: MirSpan| match op.kind {
+        OperandKind::Copy(p) | OperandKind::Move(p) => {
             let mut ty: Ty = body.locals[p.local].ty.clone();
             for proj in p.projection.lookup(&body.projection_store) {
                 ty = proj.projected_ty(
                     ty,
                     db,
                     make_fetch_closure_field(db),
-                    body.owner.module(db.upcast()).krate(),
+                    body.owner.module(db).krate(),
                 );
             }
             if !ty.clone().is_copy(db, body.owner)
@@ -232,7 +232,7 @@ fn partially_moved(db: &dyn HirDatabase, body: &MirBody) -> Vec<PartiallyMoved> 
                 result.push(PartiallyMoved { span, ty, local: p.local });
             }
         }
-        Operand::Constant(_) | Operand::Static(_) => (),
+        OperandKind::Constant(_) | OperandKind::Static(_) => (),
     };
     for (_, block) in body.basic_blocks.iter() {
         db.unwind_if_revision_cancelled();
@@ -369,12 +369,7 @@ fn place_case(db: &dyn HirDatabase, body: &MirBody, lvalue: &Place) -> Projectio
             }
             ProjectionElem::OpaqueCast(_) => (),
         }
-        ty = proj.projected_ty(
-            ty,
-            db,
-            make_fetch_closure_field(db),
-            body.owner.module(db.upcast()).krate(),
-        );
+        ty = proj.projected_ty(ty, db, make_fetch_closure_field(db), body.owner.module(db).krate());
     }
     if is_part_of { ProjectionCase::DirectPart } else { ProjectionCase::Direct }
 }
@@ -419,10 +414,7 @@ fn ever_initialized_map(
             let Some(terminator) = &block.terminator else {
                 never!(
                     "Terminator should be none only in construction.\nThe body:\n{}",
-                    body.pretty_print(
-                        db,
-                        DisplayTarget::from_crate(db, body.owner.krate(db.upcast()))
-                    )
+                    body.pretty_print(db, DisplayTarget::from_crate(db, body.owner.krate(db)))
                 );
                 return;
             };
@@ -500,7 +492,7 @@ fn record_usage(local: LocalId, result: &mut ArenaMap<LocalId, MutabilityReason>
 }
 
 fn record_usage_for_operand(arg: &Operand, result: &mut ArenaMap<LocalId, MutabilityReason>) {
-    if let Operand::Copy(p) | Operand::Move(p) = arg {
+    if let OperandKind::Copy(p) | OperandKind::Move(p) = arg.kind {
         record_usage(p.local, result);
     }
 }

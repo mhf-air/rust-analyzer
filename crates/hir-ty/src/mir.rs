@@ -41,8 +41,8 @@ use rustc_hash::FxHashMap;
 use smallvec::{SmallVec, smallvec};
 use stdx::{impl_from, never};
 
-pub(crate) use lower::mir_body_recover;
-pub(crate) use monomorphization::monomorphized_mir_body_recover;
+pub(crate) use lower::mir_body_cycle_result;
+pub(crate) use monomorphization::monomorphized_mir_body_cycle_result;
 
 use super::consteval::{intern_const_scalar, try_const_usize};
 
@@ -77,7 +77,14 @@ pub struct Local {
 /// currently implements it, but it seems like this may be something to check against in the
 /// validator.
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub enum Operand {
+pub struct Operand {
+    kind: OperandKind,
+    // FIXME : This should actually just be of type `MirSpan`.
+    span: Option<MirSpan>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum OperandKind {
     /// Creates a value by loading the given place.
     ///
     /// Before drop elaboration, the type of the place must be `Copy`. After drop elaboration there
@@ -101,7 +108,13 @@ pub enum Operand {
 
 impl Operand {
     fn from_concrete_const(data: Box<[u8]>, memory_map: MemoryMap, ty: Ty) -> Self {
-        Operand::Constant(intern_const_scalar(ConstScalar::Bytes(data, memory_map), ty))
+        Operand {
+            kind: OperandKind::Constant(intern_const_scalar(
+                ConstScalar::Bytes(data, memory_map),
+                ty,
+            )),
+            span: None,
+        }
     }
 
     fn from_bytes(data: Box<[u8]>, ty: Ty) -> Self {
@@ -1076,11 +1089,11 @@ impl MirBody {
             f: &mut impl FnMut(&mut Place, &mut ProjectionStore),
             store: &mut ProjectionStore,
         ) {
-            match op {
-                Operand::Copy(p) | Operand::Move(p) => {
+            match &mut op.kind {
+                OperandKind::Copy(p) | OperandKind::Move(p) => {
                     f(p, store);
                 }
-                Operand::Constant(_) | Operand::Static(_) => (),
+                OperandKind::Constant(_) | OperandKind::Static(_) => (),
             }
         }
         for (_, block) in self.basic_blocks.iter_mut() {

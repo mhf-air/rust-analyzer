@@ -104,11 +104,14 @@ pub struct CargoConfig {
     /// Extra args to pass to the cargo command.
     pub extra_args: Vec<String>,
     /// Extra env vars to set when invoking the cargo command
-    pub extra_env: FxHashMap<String, String>,
+    pub extra_env: FxHashMap<String, Option<String>>,
     pub invocation_strategy: InvocationStrategy,
     /// Optional path to use instead of `target` when building
     pub target_dir: Option<Utf8PathBuf>,
+    /// Gate `#[test]` behind `#[cfg(test)]`
     pub set_test: bool,
+    /// Load the project without any dependencies
+    pub no_deps: bool,
 }
 
 pub type Package = Idx<PackageData>;
@@ -286,7 +289,7 @@ pub struct CargoMetadataConfig {
     /// Extra args to pass to the cargo command.
     pub extra_args: Vec<String>,
     /// Extra env vars to set when invoking the cargo command
-    pub extra_env: FxHashMap<String, String>,
+    pub extra_env: FxHashMap<String, Option<String>>,
 }
 
 // Deserialize helper for the cargo metadata
@@ -308,6 +311,7 @@ impl CargoWorkspace {
         current_dir: &AbsPath,
         config: &CargoMetadataConfig,
         sysroot: &Sysroot,
+        no_deps: bool,
         locked: bool,
         progress: &dyn Fn(String),
     ) -> anyhow::Result<(cargo_metadata::Metadata, Option<anyhow::Error>)> {
@@ -316,8 +320,8 @@ impl CargoWorkspace {
             current_dir,
             config,
             sysroot,
+            no_deps,
             locked,
-            false,
             progress,
         );
         if let Ok((_, Some(ref e))) = res {
@@ -335,15 +339,14 @@ impl CargoWorkspace {
         current_dir: &AbsPath,
         config: &CargoMetadataConfig,
         sysroot: &Sysroot,
-        locked: bool,
         no_deps: bool,
+        locked: bool,
         progress: &dyn Fn(String),
     ) -> anyhow::Result<(cargo_metadata::Metadata, Option<anyhow::Error>)> {
-        let cargo = sysroot.tool(Tool::Cargo, current_dir);
+        let cargo = sysroot.tool(Tool::Cargo, current_dir, &config.extra_env);
         let mut meta = MetadataCommand::new();
         meta.cargo_path(cargo.get_program());
         cargo.get_envs().for_each(|(var, val)| _ = meta.env(var, val.unwrap_or_default()));
-        config.extra_env.iter().for_each(|(var, val)| _ = meta.env(var, val));
         meta.manifest_path(cargo_toml.to_path_buf());
         match &config.features {
             CargoFeatures::All => {

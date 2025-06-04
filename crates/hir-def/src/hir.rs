@@ -13,6 +13,7 @@
 //! See also a neighboring `body` module.
 
 pub mod format_args;
+pub mod generics;
 pub mod type_ref;
 
 use std::fmt;
@@ -25,9 +26,12 @@ use syntax::ast;
 use type_ref::TypeRefId;
 
 use crate::{
-    BlockId, ConstBlockId,
+    BlockId,
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
-    path::{GenericArgs, Path},
+    expr_store::{
+        HygieneId,
+        path::{GenericArgs, Path},
+    },
     type_ref::{Mutability, Rawness},
 };
 
@@ -208,7 +212,7 @@ pub enum Expr {
         statements: Box<[Statement]>,
         tail: Option<ExprId>,
     },
-    Const(ConstBlockId),
+    Const(ExprId),
     // FIXME: Fold this into Block with an unsafe flag?
     Unsafe {
         id: Option<BlockId>,
@@ -551,6 +555,9 @@ pub struct Binding {
     pub name: Name,
     pub mode: BindingAnnotation,
     pub problems: Option<BindingProblems>,
+    /// Note that this may not be the direct `SyntaxContextId` of the binding's expansion, because transparent
+    /// expansions are attributed to their parent expansion (recursively).
+    pub hygiene: HygieneId,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

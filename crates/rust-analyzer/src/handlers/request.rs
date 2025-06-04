@@ -198,6 +198,8 @@ pub(crate) fn handle_view_item_tree(
 }
 
 // cargo test requires:
+// - the package is a member of the workspace
+// - the target in the package is not a build script (custom-build)
 // - the package name - the root of the test identifier supplied to this handler can be
 //   a package or a target inside a package.
 // - the target name - if the test identifier is a target, it's needed in addition to the
@@ -205,38 +207,26 @@ pub(crate) fn handle_view_item_tree(
 // - real names - the test identifier uses the namespace form where hyphens are replaced with
 //   underscores. cargo test requires the real name.
 // - the target kind e.g. bin or lib
-fn find_test_target(namespace_root: &str, cargo: &CargoWorkspace) -> Option<TestTarget> {
-    cargo.packages().find_map(|p| {
-        let package_name = &cargo[p].name;
-        for target in cargo[p].targets.iter() {
-            let target_name = &cargo[*target].name;
-            if target_name.replace('-', "_") == namespace_root {
-                return Some(TestTarget {
-                    package: package_name.clone(),
-                    target: target_name.clone(),
-                    kind: cargo[*target].kind,
-                });
+fn all_test_targets(cargo: &CargoWorkspace) -> impl Iterator<Item = TestTarget> {
+    cargo.packages().filter(|p| cargo[*p].is_member).flat_map(|p| {
+        let package = &cargo[p];
+        package.targets.iter().filter_map(|t| {
+            let target = &cargo[*t];
+            if target.kind == TargetKind::BuildScript {
+                None
+            } else {
+                Some(TestTarget {
+                    package: package.name.clone(),
+                    target: target.name.clone(),
+                    kind: target.kind,
+                })
             }
-        }
-        None
+        })
     })
 }
 
-fn get_all_targets(cargo: &CargoWorkspace) -> Vec<TestTarget> {
-    cargo
-        .packages()
-        .flat_map(|p| {
-            let package_name = &cargo[p].name;
-            cargo[p].targets.iter().map(|target| {
-                let target_name = &cargo[*target].name;
-                TestTarget {
-                    package: package_name.clone(),
-                    target: target_name.clone(),
-                    kind: cargo[*target].kind,
-                }
-            })
-        })
-        .collect()
+fn find_test_target(namespace_root: &str, cargo: &CargoWorkspace) -> Option<TestTarget> {
+    all_test_targets(cargo).find(|t| namespace_root == t.target.replace('-', "_"))
 }
 
 pub(crate) fn handle_run_test(
@@ -268,7 +258,7 @@ pub(crate) fn handle_run_test(
                         }
                     })
                     .collect_vec(),
-                None => get_all_targets(cargo).into_iter().map(|target| (target, None)).collect(),
+                None => all_test_targets(cargo).map(|target| (target, None)).collect(),
             };
 
             for (target, path) in tests {
@@ -949,6 +939,18 @@ pub(crate) fn handle_parent_module(
     // locate parent module by semantics
     let position = try_default!(from_proto::file_position(&snap, params)?);
     let navs = snap.analysis.parent_module(position)?;
+    let res = to_proto::goto_definition_response(&snap, None, navs)?;
+    Ok(Some(res))
+}
+
+pub(crate) fn handle_child_modules(
+    snap: GlobalStateSnapshot,
+    params: lsp_types::TextDocumentPositionParams,
+) -> anyhow::Result<Option<lsp_types::GotoDefinitionResponse>> {
+    let _p = tracing::info_span!("handle_child_modules").entered();
+    // locate child module by semantics
+    let position = try_default!(from_proto::file_position(&snap, params)?);
+    let navs = snap.analysis.child_modules(position)?;
     let res = to_proto::goto_definition_response(&snap, None, navs)?;
     Ok(Some(res))
 }
@@ -2245,7 +2247,7 @@ fn runnable_action_links(
         let label = update_test.label();
         if let Some(r) = to_proto::make_update_runnable(&r, update_test) {
             let update_command = to_proto::command::run_single(&r, label.unwrap().as_str());
-            group.commands.push(to_command_link(update_command, r.label.clone()));
+            group.commands.push(to_command_link(update_command, r.label));
         }
     }
 
@@ -2350,8 +2352,11 @@ fn run_rustfmt(
     let mut command = match snap.config.rustfmt(source_root_id) {
         RustfmtConfig::Rustfmt { extra_args, enable_range_formatting } => {
             // FIXME: Set RUSTUP_TOOLCHAIN
-            let mut cmd = toolchain::command(toolchain::Tool::Rustfmt.path(), current_dir);
-            cmd.envs(snap.config.extra_env(source_root_id));
+            let mut cmd = toolchain::command(
+                toolchain::Tool::Rustfmt.path(),
+                current_dir,
+                snap.config.extra_env(source_root_id),
+            );
             cmd.args(extra_args);
 
             if let Some(edition) = edition {
@@ -2393,6 +2398,7 @@ fn run_rustfmt(
         RustfmtConfig::CustomCommand { command, args } => {
             let cmd = Utf8PathBuf::from(&command);
             let target_spec = TargetSpec::for_file(snap, file_id)?;
+            let extra_env = snap.config.extra_env(source_root_id);
             let mut cmd = match target_spec {
                 Some(TargetSpec::Cargo(_)) => {
                     // approach: if the command name contains a path separator, join it with the project root.
@@ -2405,12 +2411,11 @@ fn run_rustfmt(
                     } else {
                         cmd
                     };
-                    toolchain::command(cmd_path, current_dir)
+                    toolchain::command(cmd_path, current_dir, extra_env)
                 }
-                _ => toolchain::command(cmd, current_dir),
+                _ => toolchain::command(cmd, current_dir, extra_env),
             };
 
-            cmd.envs(snap.config.extra_env(source_root_id));
             cmd.args(args);
             cmd
         }
@@ -2453,7 +2458,11 @@ fn run_rustfmt(
                 Ok(None)
             }
             // rustfmt panicked at lexing/parsing the file
-            Some(101) if !rustfmt_not_installed && captured_stderr.starts_with("error[") => {
+            Some(101)
+                if !rustfmt_not_installed
+                    && (captured_stderr.starts_with("error[")
+                        || captured_stderr.starts_with("error:")) =>
+            {
                 Ok(None)
             }
             _ => {

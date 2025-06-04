@@ -69,6 +69,7 @@ impl GlobalState {
     /// are ready to do semantic work.
     pub(crate) fn is_quiescent(&self) -> bool {
         self.vfs_done
+            && self.fetch_ws_receiver.is_none()
             && !self.fetch_workspaces_queue.op_in_progress()
             && !self.fetch_build_data_queue.op_in_progress()
             && !self.fetch_proc_macros_queue.op_in_progress()
@@ -158,7 +159,7 @@ impl GlobalState {
         {
             status.health |= lsp_ext::Health::Warning;
             message.push_str("Failed to discover workspace.\n");
-            message.push_str("Consider adding the `Cargo.toml` of the workspace to the [`linkedProjects`](https://rust-analyzer.github.io/manual.html#rust-analyzer.linkedProjects) setting.\n\n");
+            message.push_str("Consider adding the `Cargo.toml` of the workspace to the [`linkedProjects`](https://rust-analyzer.github.io/book/configuration.html#linkedProjects) setting.\n\n");
         }
         if self.fetch_workspace_error().is_err() {
             status.health |= lsp_ext::Health::Error;
@@ -291,7 +292,7 @@ impl GlobalState {
 
                 if let (Some(_command), Some(path)) = (&discover_command, &path) {
                     let build = linked_projects.iter().find_map(|project| match project {
-                        LinkedProject::InlineJsonProject(it) => it.crate_by_buildfile(path),
+                        LinkedProject::InlineProjectJson(it) => it.crate_by_buildfile(path),
                         _ => None,
                     });
 
@@ -317,7 +318,7 @@ impl GlobalState {
                                 &progress,
                             )
                         }
-                        LinkedProject::InlineJsonProject(it) => {
+                        LinkedProject::InlineProjectJson(it) => {
                             let workspace = project_model::ProjectWorkspace::load_inline(
                                 it.clone(),
                                 &cargo_config,
@@ -413,35 +414,26 @@ impl GlobalState {
                 .map(|res| res.as_ref().map_err(|e| e.to_string()))
                 .chain(iter::repeat_with(|| Err("proc-macro-srv is not running".into())));
             for (client, paths) in proc_macro_clients.zip(paths) {
-                paths
-                    .into_iter()
-                    .map(move |(crate_id, res)| {
-                        (
-                            crate_id,
-                            res.map_or_else(
-                                |e| Err((e, true)),
-                                |(crate_name, path)| {
-                                    progress(path.to_string());
-                                    client.as_ref().map_err(|it| (it.clone(), true)).and_then(
-                                        |client| {
-                                            load_proc_macro(
-                                                client,
-                                                &path,
-                                                ignored_proc_macros
-                                                    .iter()
-                                                    .find_map(|(name, macros)| {
-                                                        eq_ignore_underscore(name, &crate_name)
-                                                            .then_some(&**macros)
-                                                    })
-                                                    .unwrap_or_default(),
-                                            )
-                                        },
-                                    )
-                                },
-                            ),
-                        )
-                    })
-                    .for_each(|(krate, res)| builder.insert(krate, res));
+                for (crate_id, res) in paths.iter() {
+                    let expansion_res = match client {
+                        Ok(client) => match res {
+                            Ok((crate_name, path)) => {
+                                progress(path.to_string());
+                                let ignored_proc_macros = ignored_proc_macros
+                                    .iter()
+                                    .find_map(|(name, macros)| {
+                                        eq_ignore_underscore(name, crate_name).then_some(&**macros)
+                                    })
+                                    .unwrap_or_default();
+
+                                load_proc_macro(client, path, ignored_proc_macros)
+                            }
+                            Err(e) => Err((e.clone(), true)),
+                        },
+                        Err(ref e) => Err((e.clone(), true)),
+                    };
+                    builder.insert(*crate_id, expansion_res)
+                }
             }
 
             change.set_proc_macros(builder);
@@ -645,7 +637,7 @@ impl GlobalState {
             Config::user_config_dir_path().as_deref(),
         );
 
-        if (self.proc_macro_clients.is_empty() || !same_workspaces)
+        if (self.proc_macro_clients.len() < self.workspaces.len() || !same_workspaces)
             && self.config.expand_proc_macros()
         {
             info!("Spawning proc-macro servers");
@@ -661,12 +653,18 @@ impl GlobalState {
                     | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, ..)), .. } => cargo
                         .env()
                         .into_iter()
-                        .chain(self.config.extra_env(None))
-                        .map(|(a, b)| (a.clone(), b.clone()))
+                        .map(|(k, v)| (k.clone(), Some(v.clone())))
+                        .chain(
+                            self.config.extra_env(None).iter().map(|(k, v)| (k.clone(), v.clone())),
+                        )
                         .chain(
                             ws.sysroot
                                 .root()
-                                .map(|it| ("RUSTUP_TOOLCHAIN".to_owned(), it.to_string())),
+                                .filter(|_| {
+                                    !self.config.extra_env(None).contains_key("RUSTUP_TOOLCHAIN")
+                                        && std::env::var_os("RUSTUP_TOOLCHAIN").is_none()
+                                })
+                                .map(|it| ("RUSTUP_TOOLCHAIN".to_owned(), Some(it.to_string()))),
                         )
                         .collect(),
 
@@ -739,7 +737,7 @@ impl GlobalState {
 
             ws_to_crate_graph(&self.workspaces, self.config.extra_env(None), load)
         };
-        let mut change = ChangeWithProcMacros::new();
+        let mut change = ChangeWithProcMacros::default();
         if initial_build || !self.config.expand_proc_macros() {
             if self.config.expand_proc_macros() {
                 change.set_proc_macros(
@@ -902,7 +900,7 @@ impl GlobalState {
 // FIXME: Move this into load-cargo?
 pub fn ws_to_crate_graph(
     workspaces: &[ProjectWorkspace],
-    extra_env: &FxHashMap<String, String>,
+    extra_env: &FxHashMap<String, Option<String>>,
     mut load: impl FnMut(&AbsPath) -> Option<vfs::FileId>,
 ) -> (CrateGraphBuilder, Vec<ProcMacroPaths>) {
     let mut crate_graph = CrateGraphBuilder::default();

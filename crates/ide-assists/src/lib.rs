@@ -68,7 +68,7 @@ pub mod utils;
 
 use hir::Semantics;
 use ide_db::{EditionedFileId, RootDatabase};
-use syntax::TextRange;
+use syntax::{Edition, TextRange};
 
 pub(crate) use crate::assist_context::{AssistContext, Assists};
 
@@ -90,7 +90,7 @@ pub fn assists(
     let sema = Semantics::new(db);
     let file_id = sema
         .attach_first_edition(range.file_id)
-        .unwrap_or_else(|| EditionedFileId::current_edition(range.file_id));
+        .unwrap_or_else(|| EditionedFileId::new(db, range.file_id, Edition::CURRENT));
     let ctx = AssistContext::new(sema, config, hir::FileRange { file_id, range: range.range });
     let mut acc = Assists::new(&ctx, resolve);
     handlers::all().iter().for_each(|handler| {
@@ -139,6 +139,7 @@ mod handlers {
     mod destructure_struct_binding;
     mod destructure_tuple_binding;
     mod desugar_doc_comment;
+    mod desugar_try_expr;
     mod expand_glob_import;
     mod expand_rest_pattern;
     mod extract_expressions_from_format_string;
@@ -200,6 +201,7 @@ mod handlers {
     mod remove_dbg;
     mod remove_mut;
     mod remove_parentheses;
+    mod remove_underscore;
     mod remove_unused_imports;
     mod remove_unused_param;
     mod reorder_fields;
@@ -213,7 +215,6 @@ mod handlers {
     mod replace_named_generic_with_impl;
     mod replace_qualified_name_with_use;
     mod replace_string_with_char;
-    mod replace_try_expr_with_match;
     mod replace_turbofish_with_explicit_type;
     mod sort_items;
     mod split_import;
@@ -221,13 +222,14 @@ mod handlers {
     mod toggle_async_sugar;
     mod toggle_ignore;
     mod toggle_macro_delimiter;
+    mod unmerge_imports;
     mod unmerge_match_arm;
-    mod unmerge_use;
     mod unnecessary_async;
     mod unqualify_method_call;
     mod unwrap_block;
     mod unwrap_return_type;
     mod unwrap_tuple;
+    mod unwrap_type_to_generic_arg;
     mod wrap_return_type;
     mod wrap_unwrap_cfg_attr;
 
@@ -271,6 +273,7 @@ mod handlers {
             destructure_struct_binding::destructure_struct_binding,
             destructure_tuple_binding::destructure_tuple_binding,
             desugar_doc_comment::desugar_doc_comment,
+            desugar_try_expr::desugar_try_expr,
             expand_glob_import::expand_glob_import,
             expand_glob_import::expand_glob_reexport,
             expand_rest_pattern::expand_rest_pattern,
@@ -335,6 +338,7 @@ mod handlers {
             remove_dbg::remove_dbg,
             remove_mut::remove_mut,
             remove_parentheses::remove_parentheses,
+            remove_underscore::remove_underscore,
             remove_unused_imports::remove_unused_imports,
             remove_unused_param::remove_unused_param,
             reorder_fields::reorder_fields,
@@ -351,7 +355,6 @@ mod handlers {
             replace_method_eager_lazy::replace_with_lazy_method,
             replace_named_generic_with_impl::replace_named_generic_with_impl,
             replace_qualified_name_with_use::replace_qualified_name_with_use,
-            replace_try_expr_with_match::replace_try_expr_with_match,
             replace_turbofish_with_explicit_type::replace_turbofish_with_explicit_type,
             sort_items::sort_items,
             split_import::split_import,
@@ -361,12 +364,13 @@ mod handlers {
             toggle_ignore::toggle_ignore,
             toggle_macro_delimiter::toggle_macro_delimiter,
             unmerge_match_arm::unmerge_match_arm,
-            unmerge_use::unmerge_use,
+            unmerge_imports::unmerge_imports,
             unnecessary_async::unnecessary_async,
             unqualify_method_call::unqualify_method_call,
             unwrap_block::unwrap_block,
             unwrap_return_type::unwrap_return_type,
             unwrap_tuple::unwrap_tuple,
+            unwrap_type_to_generic_arg::unwrap_type_to_generic_arg,
             wrap_return_type::wrap_return_type,
             wrap_unwrap_cfg_attr::wrap_unwrap_cfg_attr,
 

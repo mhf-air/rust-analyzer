@@ -21,6 +21,8 @@ mod ok {
     #[test]
     fn asm_expr() { run_and_expect_no_errors("test_data/parser/inline/ok/asm_expr.rs"); }
     #[test]
+    fn asm_label() { run_and_expect_no_errors("test_data/parser/inline/ok/asm_label.rs"); }
+    #[test]
     fn assoc_const_eq() {
         run_and_expect_no_errors("test_data/parser/inline/ok/assoc_const_eq.rs");
     }
@@ -81,6 +83,10 @@ mod ok {
     #[test]
     fn cast_expr() { run_and_expect_no_errors("test_data/parser/inline/ok/cast_expr.rs"); }
     #[test]
+    fn closure_binder() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/closure_binder.rs");
+    }
+    #[test]
     fn closure_body_underscore_assignment() {
         run_and_expect_no_errors(
             "test_data/parser/inline/ok/closure_body_underscore_assignment.rs",
@@ -137,6 +143,10 @@ mod ok {
     #[test]
     fn const_trait_bound() {
         run_and_expect_no_errors("test_data/parser/inline/ok/const_trait_bound.rs");
+    }
+    #[test]
+    fn const_where_clause() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/const_where_clause.rs");
     }
     #[test]
     fn continue_expr() { run_and_expect_no_errors("test_data/parser/inline/ok/continue_expr.rs"); }
@@ -278,6 +288,8 @@ mod ok {
         run_and_expect_no_errors("test_data/parser/inline/ok/generic_arg_bounds.rs");
     }
     #[test]
+    fn generic_const() { run_and_expect_no_errors("test_data/parser/inline/ok/generic_const.rs"); }
+    #[test]
     fn generic_param_attribute() {
         run_and_expect_no_errors("test_data/parser/inline/ok/generic_param_attribute.rs");
     }
@@ -414,6 +426,10 @@ mod ok {
     #[test]
     fn nocontentexpr_after_item() {
         run_and_expect_no_errors("test_data/parser/inline/ok/nocontentexpr_after_item.rs");
+    }
+    #[test]
+    fn offset_of_parens() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/offset_of_parens.rs");
     }
     #[test]
     fn or_pattern() { run_and_expect_no_errors("test_data/parser/inline/ok/or_pattern.rs"); }
@@ -764,6 +780,8 @@ mod err {
         run_and_expect_errors("test_data/parser/inline/err/generic_param_list_recover.rs");
     }
     #[test]
+    fn generic_static() { run_and_expect_errors("test_data/parser/inline/err/generic_static.rs"); }
+    #[test]
     fn impl_type() { run_and_expect_errors("test_data/parser/inline/err/impl_type.rs"); }
     #[test]
     fn let_else_right_curly_brace() {
@@ -836,6 +854,10 @@ mod err {
         run_and_expect_errors("test_data/parser/inline/err/recover_from_missing_const_default.rs");
     }
     #[test]
+    fn static_where_clause() {
+        run_and_expect_errors("test_data/parser/inline/err/static_where_clause.rs");
+    }
+    #[test]
     fn struct_field_recover() {
         run_and_expect_errors("test_data/parser/inline/err/struct_field_recover.rs");
     }
@@ -852,6 +874,10 @@ mod err {
     #[test]
     fn tuple_pat_leading_comma() {
         run_and_expect_errors("test_data/parser/inline/err/tuple_pat_leading_comma.rs");
+    }
+    #[test]
+    fn type_in_array_recover() {
+        run_and_expect_errors("test_data/parser/inline/err/type_in_array_recover.rs");
     }
     #[test]
     fn unsafe_block_in_mod() {

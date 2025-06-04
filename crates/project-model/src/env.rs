@@ -18,6 +18,7 @@ pub(crate) fn inject_cargo_package_env(env: &mut Env, package: &PackageData) {
 
     let manifest_dir = package.manifest.parent();
     env.set("CARGO_MANIFEST_DIR", manifest_dir.as_str());
+    env.set("CARGO_MANIFEST_PATH", package.manifest.as_str());
 
     env.set("CARGO_PKG_VERSION", package.version.to_string());
     env.set("CARGO_PKG_VERSION_MAJOR", package.version.major.to_string());
@@ -25,7 +26,7 @@ pub(crate) fn inject_cargo_package_env(env: &mut Env, package: &PackageData) {
     env.set("CARGO_PKG_VERSION_PATCH", package.version.patch.to_string());
     env.set("CARGO_PKG_VERSION_PRE", package.version.pre.to_string());
 
-    env.set("CARGO_PKG_AUTHORS", package.authors.join(":").clone());
+    env.set("CARGO_PKG_AUTHORS", package.authors.join(":"));
 
     env.set("CARGO_PKG_NAME", package.name.clone());
     env.set("CARGO_PKG_DESCRIPTION", package.description.as_deref().unwrap_or_default());
@@ -62,11 +63,10 @@ pub(crate) fn inject_rustc_tool_env(env: &mut Env, cargo_name: &str, kind: Targe
 
 pub(crate) fn cargo_config_env(
     manifest: &ManifestPath,
-    extra_env: &FxHashMap<String, String>,
+    extra_env: &FxHashMap<String, Option<String>>,
     sysroot: &Sysroot,
 ) -> Env {
-    let mut cargo_config = sysroot.tool(Tool::Cargo, manifest.parent());
-    cargo_config.envs(extra_env);
+    let mut cargo_config = sysroot.tool(Tool::Cargo, manifest.parent(), extra_env);
     cargo_config
         .args(["-Z", "unstable-options", "config", "get", "env"])
         .env("RUSTC_BOOTSTRAP", "1");

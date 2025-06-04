@@ -13,19 +13,18 @@ use hir_def::{
 use la_arena::{Idx, RawIdx};
 use rustc_abi::AddressSpace;
 use rustc_index::IndexVec;
-use salsa::Cycle;
 
 use triomphe::Arc;
 
 use crate::{
     Interner, ProjectionTy, Substitution, TraitEnvironment, Ty,
     consteval::try_const_usize,
-    db::{HirDatabase, HirDatabaseData, InternedClosure},
+    db::{HirDatabase, InternedClosure},
     infer::normalize,
     utils::ClosureSubst,
 };
 
-pub(crate) use self::adt::layout_of_adt_recover;
+pub(crate) use self::adt::layout_of_adt_cycle_result;
 pub use self::{adt::layout_of_adt_query, target::target_data_layout_query};
 
 mod adt;
@@ -166,7 +165,7 @@ pub fn layout_of_ty_query(
     let result = match kind {
         TyKind::Adt(AdtId(def), subst) => {
             if let hir_def::AdtId::StructId(s) = def {
-                let data = db.struct_data(*s);
+                let data = db.struct_signature(*s);
                 let repr = data.repr.unwrap_or_default();
                 if repr.simd() {
                     return layout_of_simd_ty(db, *s, repr.packed(), subst, trait_env, &target);
@@ -365,10 +364,8 @@ pub fn layout_of_ty_query(
     Ok(Arc::new(result))
 }
 
-pub(crate) fn layout_of_ty_recover(
+pub(crate) fn layout_of_ty_cycle_result(
     _: &dyn HirDatabase,
-    _: &Cycle,
-    _: HirDatabaseData,
     _: Ty,
     _: Arc<TraitEnvironment>,
 ) -> Result<Arc<Layout>, LayoutError> {
@@ -378,7 +375,7 @@ pub(crate) fn layout_of_ty_recover(
 fn struct_tail_erasing_lifetimes(db: &dyn HirDatabase, pointee: Ty) -> Ty {
     match pointee.kind(Interner) {
         &TyKind::Adt(AdtId(hir_def::AdtId::StructId(i)), ref subst) => {
-            let data = db.variant_data(i.into());
+            let data = db.variant_fields(i.into());
             let mut it = data.fields().iter().rev();
             match it.next() {
                 Some((f, _)) => {

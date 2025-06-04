@@ -62,26 +62,26 @@ use std::ops::Deref;
 
 use base_db::Crate;
 use hir_expand::{
-    ErasedAstId, HirFileId, InFile, MacroCallId, MacroDefId, name::Name, proc_macro::ProcMacroKind,
+    EditionedFileId, ErasedAstId, HirFileId, InFile, MacroCallId, MacroDefId, mod_path::ModPath,
+    name::Name, proc_macro::ProcMacroKind,
 };
 use intern::Symbol;
 use itertools::Itertools;
 use la_arena::Arena;
 use rustc_hash::{FxHashMap, FxHashSet};
-use span::{Edition, EditionedFileId, FileAstId, FileId, ROOT_ERASED_FILE_AST_ID};
+use span::{Edition, FileAstId, FileId, ROOT_ERASED_FILE_AST_ID};
 use stdx::format_to;
 use syntax::{AstNode, SmolStr, SyntaxNode, ToSmolStr, ast};
 use triomphe::Arc;
 use tt::TextRange;
 
 use crate::{
-    AstId, BlockId, BlockLoc, CrateRootModuleId, EnumId, EnumVariantId, ExternCrateId, FunctionId,
-    FxIndexMap, LocalModuleId, Lookup, MacroExpander, MacroId, ModuleId, ProcMacroId, UseId,
+    AstId, BlockId, BlockLoc, CrateRootModuleId, ExternCrateId, FunctionId, FxIndexMap,
+    LocalModuleId, Lookup, MacroExpander, MacroId, ModuleId, ProcMacroId, UseId,
     db::DefDatabase,
     item_scope::{BuiltinShadowMode, ItemScope},
     item_tree::{ItemTreeId, Mod, TreeId},
     nameres::{diagnostics::DefDiagnostic, path_resolution::ResolveMode},
-    path::ModPath,
     per_ns::PerNs,
     visibility::{Visibility, VisibilityExplicitness},
 };
@@ -110,6 +110,18 @@ pub struct LocalDefMap {
     // need to be careful with things that block def maps also have.
     /// The extern prelude which contains all root modules of external crates that are in scope.
     extern_prelude: FxIndexMap<Name, (CrateRootModuleId, Option<ExternCrateId>)>,
+}
+
+impl std::hash::Hash for LocalDefMap {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let LocalDefMap { extern_prelude } = self;
+        extern_prelude.len().hash(state);
+        for (name, (crate_root, extern_crate)) in extern_prelude {
+            name.hash(state);
+            crate_root.hash(state);
+            extern_crate.hash(state);
+        }
+    }
 }
 
 impl LocalDefMap {
@@ -158,12 +170,15 @@ pub struct DefMap {
     /// this contains all kinds of macro, not just `macro_rules!` macro.
     /// ExternCrateId being None implies it being imported from the general prelude import.
     macro_use_prelude: FxHashMap<Name, (MacroId, Option<ExternCrateId>)>,
-    pub(crate) enum_definitions: FxHashMap<EnumId, Box<[EnumVariantId]>>,
 
+    // FIXME: AstId's are fairly unstable
     /// Tracks which custom derives are in scope for an item, to allow resolution of derive helper
     /// attributes.
     // FIXME: Figure out a better way for the IDE layer to resolve these?
     derive_helpers_in_scope: FxHashMap<AstId<ast::Item>, Vec<(Name, MacroId, MacroCallId)>>,
+    // FIXME: AstId's are fairly unstable
+    /// A mapping from [`hir_expand::MacroDefId`] to [`crate::MacroId`].
+    pub macro_def_to_macro_id: FxHashMap<ErasedAstId, MacroId>,
 
     /// The diagnostics that need to be emitted for this crate.
     diagnostics: Vec<DefDiagnostic>,
@@ -247,7 +262,7 @@ struct BlockRelativeModuleId {
 }
 
 impl BlockRelativeModuleId {
-    fn def_map(self, db: &dyn DefDatabase, krate: Crate) -> Arc<DefMap> {
+    fn def_map(self, db: &dyn DefDatabase, krate: Crate) -> &DefMap {
         self.into_module(krate).def_map(db)
     }
 
@@ -325,19 +340,17 @@ impl ModuleOrigin {
         match self {
             &ModuleOrigin::File { definition: editioned_file_id, .. }
             | &ModuleOrigin::CrateRoot { definition: editioned_file_id } => {
-                let definition = base_db::EditionedFileId::new(db, editioned_file_id);
-
-                let sf = db.parse(definition).tree();
+                let sf = db.parse(editioned_file_id).tree();
                 InFile::new(editioned_file_id.into(), ModuleSource::SourceFile(sf))
             }
             &ModuleOrigin::Inline { definition, definition_tree_id } => InFile::new(
                 definition_tree_id.file_id(),
                 ModuleSource::Module(
-                    AstId::new(definition_tree_id.file_id(), definition).to_node(db.upcast()),
+                    AstId::new(definition_tree_id.file_id(), definition).to_node(db),
                 ),
             ),
             ModuleOrigin::BlockExpr { block, .. } => {
-                InFile::new(block.file_id, ModuleSource::BlockExpr(block.to_node(db.upcast())))
+                InFile::new(block.file_id, ModuleSource::BlockExpr(block.to_node(db)))
             }
         }
     }
@@ -357,83 +370,93 @@ pub struct ModuleData {
     pub scope: ItemScope,
 }
 
+#[inline]
+pub fn crate_def_map(db: &dyn DefDatabase, crate_id: Crate) -> &DefMap {
+    crate_local_def_map(db, crate_id).def_map(db)
+}
+
+#[allow(unused_lifetimes)]
+mod __ {
+    use super::*;
+    #[salsa_macros::tracked]
+    pub(crate) struct DefMapPair<'db> {
+        #[tracked]
+        #[returns(ref)]
+        pub(crate) def_map: DefMap,
+        #[returns(ref)]
+        pub(crate) local: LocalDefMap,
+    }
+}
+pub(crate) use __::DefMapPair;
+
+#[salsa_macros::tracked(returns(ref))]
+pub(crate) fn crate_local_def_map(db: &dyn DefDatabase, crate_id: Crate) -> DefMapPair<'_> {
+    let krate = crate_id.data(db);
+    let _p = tracing::info_span!(
+        "crate_def_map_query",
+        name=?crate_id
+            .extra_data(db)
+            .display_name
+            .as_ref()
+            .map(|it| it.crate_name().to_smolstr())
+            .unwrap_or_default()
+    )
+    .entered();
+
+    let module_data = ModuleData::new(
+        ModuleOrigin::CrateRoot { definition: krate.root_file_id(db) },
+        Visibility::Public,
+    );
+
+    let def_map =
+        DefMap::empty(crate_id, Arc::new(DefMapCrateData::new(krate.edition)), module_data, None);
+    let (def_map, local_def_map) = collector::collect_defs(
+        db,
+        def_map,
+        TreeId::new(krate.root_file_id(db).into(), None),
+        None,
+    );
+
+    DefMapPair::new(db, def_map, local_def_map)
+}
+
+#[salsa_macros::tracked(returns(ref))]
+pub fn block_def_map(db: &dyn DefDatabase, block_id: BlockId) -> DefMap {
+    let BlockLoc { ast_id, module } = block_id.lookup(db);
+
+    let visibility = Visibility::Module(
+        ModuleId { krate: module.krate, local_id: DefMap::ROOT, block: module.block },
+        VisibilityExplicitness::Implicit,
+    );
+    let module_data =
+        ModuleData::new(ModuleOrigin::BlockExpr { block: ast_id, id: block_id }, visibility);
+
+    let local_def_map = crate_local_def_map(db, module.krate);
+    let def_map = DefMap::empty(
+        module.krate,
+        local_def_map.def_map(db).data.clone(),
+        module_data,
+        Some(BlockInfo {
+            block: block_id,
+            parent: BlockRelativeModuleId { block: module.block, local_id: module.local_id },
+        }),
+    );
+
+    let (def_map, _) = collector::collect_defs(
+        db,
+        def_map,
+        TreeId::new(ast_id.file_id, Some(block_id)),
+        Some(local_def_map.local(db)),
+    );
+    def_map
+}
+
 impl DefMap {
     /// The module id of a crate or block root.
     pub const ROOT: LocalModuleId = LocalModuleId::from_raw(la_arena::RawIdx::from_u32(0));
 
     pub fn edition(&self) -> Edition {
         self.data.edition
-    }
-
-    pub(crate) fn crate_def_map_query(db: &dyn DefDatabase, crate_id: Crate) -> Arc<DefMap> {
-        db.crate_local_def_map(crate_id).0
-    }
-
-    pub(crate) fn crate_local_def_map_query(
-        db: &dyn DefDatabase,
-        crate_id: Crate,
-    ) -> (Arc<DefMap>, Arc<LocalDefMap>) {
-        let krate = crate_id.data(db);
-        let _p = tracing::info_span!(
-            "crate_def_map_query",
-            name=?crate_id
-                .extra_data(db)
-                .display_name
-                .as_ref()
-                .map(|it| it.crate_name().to_smolstr())
-                .unwrap_or_default()
-        )
-        .entered();
-
-        let module_data = ModuleData::new(
-            ModuleOrigin::CrateRoot { definition: krate.root_file_id() },
-            Visibility::Public,
-        );
-
-        let def_map = DefMap::empty(
-            crate_id,
-            Arc::new(DefMapCrateData::new(krate.edition)),
-            module_data,
-            None,
-        );
-        let (def_map, local_def_map) = collector::collect_defs(
-            db,
-            def_map,
-            TreeId::new(krate.root_file_id().into(), None),
-            None,
-        );
-
-        (Arc::new(def_map), Arc::new(local_def_map))
-    }
-
-    pub(crate) fn block_def_map_query(db: &dyn DefDatabase, block_id: BlockId) -> Arc<DefMap> {
-        let BlockLoc { ast_id, module } = block_id.lookup(db);
-
-        let visibility = Visibility::Module(
-            ModuleId { krate: module.krate, local_id: Self::ROOT, block: module.block },
-            VisibilityExplicitness::Implicit,
-        );
-        let module_data =
-            ModuleData::new(ModuleOrigin::BlockExpr { block: ast_id, id: block_id }, visibility);
-
-        let (crate_map, crate_local_map) = db.crate_local_def_map(module.krate);
-        let def_map = DefMap::empty(
-            module.krate,
-            crate_map.data.clone(),
-            module_data,
-            Some(BlockInfo {
-                block: block_id,
-                parent: BlockRelativeModuleId { block: module.block, local_id: module.local_id },
-            }),
-        );
-
-        let (def_map, _) = collector::collect_defs(
-            db,
-            def_map,
-            TreeId::new(ast_id.file_id, Some(block_id)),
-            Some(crate_local_map),
-        );
-        Arc::new(def_map)
     }
 
     fn empty(
@@ -454,8 +477,8 @@ impl DefMap {
             macro_use_prelude: FxHashMap::default(),
             derive_helpers_in_scope: FxHashMap::default(),
             diagnostics: Vec::new(),
-            enum_definitions: FxHashMap::default(),
             data: crate_data,
+            macro_def_to_macro_id: FxHashMap::default(),
         }
     }
     fn shrink_to_fit(&mut self) {
@@ -469,14 +492,14 @@ impl DefMap {
             krate: _,
             prelude: _,
             data: _,
-            enum_definitions,
+            macro_def_to_macro_id,
         } = self;
 
+        macro_def_to_macro_id.shrink_to_fit();
         macro_use_prelude.shrink_to_fit();
         diagnostics.shrink_to_fit();
         modules.shrink_to_fit();
         derive_helpers_in_scope.shrink_to_fit();
-        enum_definitions.shrink_to_fit();
         for (_, module) in modules.iter_mut() {
             module.children.shrink_to_fit();
             module.scope.shrink_to_fit();
@@ -485,11 +508,15 @@ impl DefMap {
 }
 
 impl DefMap {
-    pub fn modules_for_file(&self, file_id: FileId) -> impl Iterator<Item = LocalModuleId> + '_ {
+    pub fn modules_for_file<'a>(
+        &'a self,
+        db: &'a dyn DefDatabase,
+        file_id: FileId,
+    ) -> impl Iterator<Item = LocalModuleId> + 'a {
         self.modules
             .iter()
             .filter(move |(_id, data)| {
-                data.origin.file_id().map(EditionedFileId::file_id) == Some(file_id)
+                data.origin.file_id().map(|file_id| file_id.file_id(db)) == Some(file_id)
             })
             .map(|(id, _data)| id)
     }
@@ -590,7 +617,7 @@ impl DefMap {
             go(&mut buf, db, current_map, "block scope", Self::ROOT);
             buf.push('\n');
             arc = block.parent.def_map(db, self.krate);
-            current_map = &arc;
+            current_map = arc;
         }
         go(&mut buf, db, current_map, "crate", Self::ROOT);
         return buf;
@@ -604,12 +631,12 @@ impl DefMap {
         ) {
             format_to!(buf, "{}\n", path);
 
-            map.modules[module].scope.dump(db.upcast(), buf);
+            map.modules[module].scope.dump(db, buf);
 
             for (name, child) in
                 map.modules[module].children.iter().sorted_by(|a, b| Ord::cmp(&a.0, &b.0))
             {
-                let path = format!("{path}::{}", name.display(db.upcast(), Edition::LATEST));
+                let path = format!("{path}::{}", name.display(db, Edition::LATEST));
                 buf.push('\n');
                 go(buf, db, map, &path, *child);
             }
@@ -623,7 +650,7 @@ impl DefMap {
         while let Some(block) = current_map.block {
             format_to!(buf, "{:?} in {:?}\n", block.block, block.parent);
             arc = block.parent.def_map(db, self.krate);
-            current_map = &arc;
+            current_map = arc;
         }
 
         format_to!(buf, "crate scope\n");
@@ -703,7 +730,7 @@ impl DefMap {
         let mut block = self.block;
         while let Some(block_info) = block {
             let parent = block_info.parent.def_map(db, self.krate);
-            if let Some(it) = f(&parent, block_info.parent.local_id) {
+            if let Some(it) = f(parent, block_info.parent.local_id) {
                 return Some(it);
             }
             block = parent.block;
@@ -745,17 +772,14 @@ impl ModuleData {
             &ModuleOrigin::File { definition, .. } | &ModuleOrigin::CrateRoot { definition } => {
                 InFile::new(
                     definition.into(),
-                    ErasedAstId::new(definition.into(), ROOT_ERASED_FILE_AST_ID)
-                        .to_range(db.upcast()),
+                    ErasedAstId::new(definition.into(), ROOT_ERASED_FILE_AST_ID).to_range(db),
                 )
             }
             &ModuleOrigin::Inline { definition, definition_tree_id } => InFile::new(
                 definition_tree_id.file_id(),
-                AstId::new(definition_tree_id.file_id(), definition).to_range(db.upcast()),
+                AstId::new(definition_tree_id.file_id(), definition).to_range(db),
             ),
-            ModuleOrigin::BlockExpr { block, .. } => {
-                InFile::new(block.file_id, block.to_range(db.upcast()))
-            }
+            ModuleOrigin::BlockExpr { block, .. } => InFile::new(block.file_id, block.to_range(db)),
         }
     }
 
@@ -763,7 +787,7 @@ impl ModuleData {
     /// `None` for the crate root or block.
     pub fn declaration_source(&self, db: &dyn DefDatabase) -> Option<InFile<ast::Module>> {
         let decl = self.origin.declaration()?;
-        let value = decl.to_node(db.upcast());
+        let value = decl.to_node(db);
         Some(InFile { file_id: decl.file_id, value })
     }
 
@@ -771,7 +795,7 @@ impl ModuleData {
     /// `None` for the crate root or block.
     pub fn declaration_source_range(&self, db: &dyn DefDatabase) -> Option<InFile<TextRange>> {
         let decl = self.origin.declaration()?;
-        Some(InFile { file_id: decl.file_id, value: decl.to_range(db.upcast()) })
+        Some(InFile { file_id: decl.file_id, value: decl.to_range(db) })
     }
 }
 

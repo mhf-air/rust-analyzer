@@ -119,7 +119,7 @@ pub(crate) fn add_turbo_fish(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
                         }
                     }
 
-                    builder.add_file_edits(ctx.file_id(), editor);
+                    builder.add_file_edits(ctx.vfs_file_id(), editor);
                 },
             )?
         } else {
@@ -141,7 +141,7 @@ pub(crate) fn add_turbo_fish(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
         |builder| {
             builder.trigger_parameter_hints();
 
-            let make = SyntaxFactory::new();
+            let make = SyntaxFactory::with_mappings();
             let mut editor = match &turbofish_target {
                 Either::Left(it) => builder.make_editor(it.syntax()),
                 Either::Right(it) => builder.make_editor(it.syntax()),
@@ -181,7 +181,7 @@ pub(crate) fn add_turbo_fish(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
             }
 
             editor.add_mappings(make.finish_with_mappings());
-            builder.add_file_edits(ctx.file_id(), editor);
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }

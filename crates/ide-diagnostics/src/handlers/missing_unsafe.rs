@@ -1,5 +1,5 @@
 use hir::db::ExpandDatabase;
-use hir::{HirFileIdExt, UnsafeLint, UnsafetyReason};
+use hir::{UnsafeLint, UnsafetyReason};
 use ide_db::text_edit::TextEdit;
 use ide_db::{assists::Assist, source_change::SourceChange};
 use syntax::{AstNode, match_ast};
@@ -23,6 +23,7 @@ pub(crate) fn missing_unsafe(ctx: &DiagnosticsContext<'_>, d: &hir::MissingUnsaf
         format!("{operation} is unsafe and requires an unsafe function or block"),
         d.node.map(|it| it.into()),
     )
+    .stable()
     .with_fixes(fixes(ctx, d))
 }
 
@@ -51,8 +52,10 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::MissingUnsafe) -> Option<Vec<Ass
 
     let replacement = format!("unsafe {{ {} }}", node_to_add_unsafe_block.text());
     let edit = TextEdit::replace(node_to_add_unsafe_block.text_range(), replacement);
-    let source_change =
-        SourceChange::from_text_edit(d.node.file_id.original_file(ctx.sema.db), edit);
+    let source_change = SourceChange::from_text_edit(
+        d.node.file_id.original_file(ctx.sema.db).file_id(ctx.sema.db),
+        edit,
+    );
     Some(vec![fix("add_unsafe", "Add unsafe block", source_change, expr.syntax().text_range())])
 }
 
@@ -874,6 +877,83 @@ fn baz() {
 fn f(it: unsafe fn()){
     it();
  // ^^^^ 💡 error: call to unsafe function is unsafe and requires an unsafe function or block
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn unsafe_call_in_const_expr() {
+        check_diagnostics(
+            r#"
+unsafe fn f() {}
+fn main() {
+    const { f(); };
+         // ^^^ 💡 error: call to unsafe function is unsafe and requires an unsafe function or block
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn asm_label() {
+        check_diagnostics(
+            r#"
+//- minicore: asm
+fn foo() {
+    unsafe {
+        core::arch::asm!(
+            "jmp {}",
+            label {
+                let p = 0xDEADBEAF as *mut u8;
+                *p = 3;
+             // ^^ error: dereference of raw pointer is unsafe and requires an unsafe function or block
+            },
+        );
+    }
+}
+            "#,
+        );
+    }
+
+    #[test]
+    fn regression_19823() {
+        check_diagnostics(
+            r#"
+pub trait FooTrait {
+    unsafe fn method1();
+    unsafe fn method2();
+}
+
+unsafe fn some_unsafe_fn() {}
+
+macro_rules! impl_foo {
+    () => {
+        unsafe fn method1() {
+            some_unsafe_fn();
+        }
+        unsafe fn method2() {
+            some_unsafe_fn();
+        }
+    };
+}
+
+pub struct S1;
+#[allow(unsafe_op_in_unsafe_fn)]
+impl FooTrait for S1 {
+    unsafe fn method1() {
+        some_unsafe_fn();
+    }
+
+    unsafe fn method2() {
+        some_unsafe_fn();
+    }
+}
+
+pub struct S2;
+#[allow(unsafe_op_in_unsafe_fn)]
+impl FooTrait for S2 {
+    impl_foo!();
 }
         "#,
         );

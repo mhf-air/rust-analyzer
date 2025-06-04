@@ -1,9 +1,13 @@
 //! base_db defines basic database traits. The concrete DB is defined by ide.
+
+pub use salsa;
+pub use salsa_macros;
+
 // FIXME: Rename this crate, base db is non descriptive
 mod change;
 mod input;
 
-use std::hash::BuildHasherDefault;
+use std::{cell::RefCell, hash::BuildHasherDefault, panic, sync::Once};
 
 pub use crate::{
     change::FileChange,
@@ -17,9 +21,9 @@ pub use crate::{
 use dashmap::{DashMap, mapref::entry::Entry};
 pub use query_group::{self};
 use rustc_hash::{FxHashSet, FxHasher};
-pub use salsa::{self};
 use salsa::{Durability, Setter};
 pub use semver::{BuildMetadata, Prerelease, Version, VersionReq};
+use span::Edition;
 use syntax::{Parse, SyntaxError, ast};
 use triomphe::Arc;
 pub use vfs::{AnchoredPath, AnchoredPathBuf, FileId, VfsPath, file_set::FileSet};
@@ -27,7 +31,8 @@ pub use vfs::{AnchoredPath, AnchoredPathBuf, FileId, VfsPath, file_set::FileSet}
 #[macro_export]
 macro_rules! impl_intern_key {
     ($id:ident, $loc:ident) => {
-        #[salsa::interned(no_debug, no_lifetime)]
+        #[salsa_macros::interned(no_lifetime)]
+        #[derive(PartialOrd, Ord)]
         pub struct $id {
             pub loc: $loc,
         }
@@ -43,10 +48,6 @@ macro_rules! impl_intern_key {
     };
 }
 
-pub trait Upcast<T: ?Sized> {
-    fn upcast(&self) -> &T;
-}
-
 pub const DEFAULT_FILE_TEXT_LRU_CAP: u16 = 16;
 pub const DEFAULT_PARSE_LRU_CAP: u16 = 128;
 pub const DEFAULT_BORROWCK_LRU_CAP: u16 = 2024;
@@ -60,7 +61,12 @@ pub struct Files {
 
 impl Files {
     pub fn file_text(&self, file_id: vfs::FileId) -> FileText {
-        *self.files.get(&file_id).expect("Unable to fetch file; this is a bug")
+        match self.files.get(&file_id) {
+            Some(text) => *text,
+            None => {
+                panic!("Unable to fetch file text for `vfs::FileId`: {file_id:?}; this is a bug")
+            }
+        }
     }
 
     pub fn set_file_text(&self, db: &mut dyn SourceDatabase, file_id: vfs::FileId, text: &str) {
@@ -96,10 +102,12 @@ impl Files {
 
     /// Source root of the file.
     pub fn source_root(&self, source_root_id: SourceRootId) -> SourceRootInput {
-        let source_root = self
-            .source_roots
-            .get(&source_root_id)
-            .expect("Unable to fetch source root id; this is a bug");
+        let source_root = match self.source_roots.get(&source_root_id) {
+            Some(source_root) => source_root,
+            None => panic!(
+                "Unable to fetch `SourceRootInput` with `SourceRootId` ({source_root_id:?}); this is a bug"
+            ),
+        };
 
         *source_root
     }
@@ -124,10 +132,12 @@ impl Files {
     }
 
     pub fn file_source_root(&self, id: vfs::FileId) -> FileSourceRootInput {
-        let file_source_root = self
-            .file_source_roots
-            .get(&id)
-            .expect("Unable to fetch FileSourceRootInput; this is a bug");
+        let file_source_root = match self.file_source_roots.get(&id) {
+            Some(file_source_root) => file_source_root,
+            None => panic!(
+                "Unable to get `FileSourceRootInput` with `vfs::FileId` ({id:?}); this is a bug",
+            ),
+        };
         *file_source_root
     }
 
@@ -155,35 +165,54 @@ impl Files {
     }
 }
 
-#[salsa::interned(no_lifetime)]
+#[salsa_macros::interned(no_lifetime, debug, constructor=from_span)]
+#[derive(PartialOrd, Ord)]
 pub struct EditionedFileId {
     pub editioned_file_id: span::EditionedFileId,
 }
 
 impl EditionedFileId {
-    pub fn file_id(&self, db: &dyn salsa::Database) -> vfs::FileId {
+    // Salsa already uses the name `new`...
+    #[inline]
+    pub fn new(db: &dyn salsa::Database, file_id: FileId, edition: Edition) -> Self {
+        EditionedFileId::from_span(db, span::EditionedFileId::new(file_id, edition))
+    }
+
+    #[inline]
+    pub fn current_edition(db: &dyn salsa::Database, file_id: FileId) -> Self {
+        EditionedFileId::new(db, file_id, Edition::CURRENT)
+    }
+
+    #[inline]
+    pub fn file_id(self, db: &dyn salsa::Database) -> vfs::FileId {
         let id = self.editioned_file_id(db);
         id.file_id()
     }
 
-    fn unpack(&self, db: &dyn salsa::Database) -> (vfs::FileId, span::Edition) {
+    #[inline]
+    pub fn unpack(self, db: &dyn salsa::Database) -> (vfs::FileId, span::Edition) {
         let id = self.editioned_file_id(db);
         (id.file_id(), id.edition())
     }
+
+    #[inline]
+    pub fn edition(self, db: &dyn SourceDatabase) -> Edition {
+        self.editioned_file_id(db).edition()
+    }
 }
 
-#[salsa::input]
+#[salsa_macros::input(debug)]
 pub struct FileText {
     pub text: Arc<str>,
     pub file_id: vfs::FileId,
 }
 
-#[salsa::input]
+#[salsa_macros::input(debug)]
 pub struct FileSourceRootInput {
     pub source_root_id: SourceRootId,
 }
 
-#[salsa::input]
+#[salsa_macros::input(debug)]
 pub struct SourceRootInput {
     pub source_root: Arc<SourceRoot>,
 }
@@ -193,7 +222,7 @@ pub struct SourceRootInput {
 #[query_group::query_group]
 pub trait RootQueryDb: SourceDatabase + salsa::Database {
     /// Parses the file into the syntax tree.
-    #[salsa::invoke_actual(parse)]
+    #[salsa::invoke(parse)]
     #[salsa::lru(128)]
     fn parse(&self, file_id: EditionedFileId) -> Parse<ast::SourceFile>;
 
@@ -205,6 +234,7 @@ pub trait RootQueryDb: SourceDatabase + salsa::Database {
     fn toolchain_channel(&self, krate: Crate) -> Option<ReleaseChannel>;
 
     /// Crates whose root file is in `id`.
+    #[salsa::invoke_interned(source_root_crates)]
     fn source_root_crates(&self, id: SourceRootId) -> Arc<[Crate]>;
 
     #[salsa::transparent]
@@ -249,7 +279,7 @@ pub fn transitive_deps(db: &dyn SourceDatabase, crate_id: Crate) -> FxHashSet<Cr
     deps
 }
 
-#[salsa::db]
+#[salsa_macros::db]
 pub trait SourceDatabase: salsa::Database {
     /// Text of the file.
     fn file_text(&self, file_id: vfs::FileId) -> FileText;
@@ -303,6 +333,19 @@ pub struct CrateWorkspaceData {
     pub toolchain: Option<Version>,
 }
 
+impl CrateWorkspaceData {
+    pub fn is_atleast_187(&self) -> bool {
+        const VERSION_187: Version = Version {
+            major: 1,
+            minor: 87,
+            patch: 0,
+            pre: Prerelease::EMPTY,
+            build: BuildMetadata::EMPTY,
+        };
+        self.toolchain.as_ref().map_or(false, |v| *v >= VERSION_187)
+    }
+}
+
 fn toolchain_channel(db: &dyn RootQueryDb, krate: Crate) -> Option<ReleaseChannel> {
     krate.workspace_data(db).toolchain.as_ref().and_then(|v| ReleaseChannel::from_str(&v.pre))
 }
@@ -315,7 +358,7 @@ fn parse(db: &dyn RootQueryDb, file_id: EditionedFileId) -> Parse<ast::SourceFil
 }
 
 fn parse_errors(db: &dyn RootQueryDb, file_id: EditionedFileId) -> Option<&[SyntaxError]> {
-    #[salsa::tracked(return_ref)]
+    #[salsa_macros::tracked(returns(ref))]
     fn parse_errors(db: &dyn RootQueryDb, file_id: EditionedFileId) -> Option<Box<[SyntaxError]>> {
         let errors = db.parse(file_id).errors();
         match &*errors {
@@ -343,4 +386,50 @@ fn relevant_crates(db: &dyn RootQueryDb, file_id: FileId) -> Arc<[Crate]> {
 
     let source_root = db.file_source_root(file_id);
     db.source_root_crates(source_root.source_root_id(db))
+}
+
+#[must_use]
+#[non_exhaustive]
+pub struct DbPanicContext;
+
+impl Drop for DbPanicContext {
+    fn drop(&mut self) {
+        Self::with_ctx(|ctx| assert!(ctx.pop().is_some()));
+    }
+}
+
+impl DbPanicContext {
+    pub fn enter(frame: String) -> DbPanicContext {
+        #[expect(clippy::print_stderr, reason = "already panicking anyway")]
+        fn set_hook() {
+            let default_hook = panic::take_hook();
+            panic::set_hook(Box::new(move |panic_info| {
+                default_hook(panic_info);
+                if let Some(backtrace) = salsa::Backtrace::capture() {
+                    eprintln!("{backtrace:#}");
+                }
+                DbPanicContext::with_ctx(|ctx| {
+                    if !ctx.is_empty() {
+                        eprintln!("additional context:");
+                        for (idx, frame) in ctx.iter().enumerate() {
+                            eprintln!("{idx:>4}: {frame}\n");
+                        }
+                    }
+                });
+            }));
+        }
+
+        static SET_HOOK: Once = Once::new();
+        SET_HOOK.call_once(set_hook);
+
+        Self::with_ctx(|ctx| ctx.push(frame));
+        DbPanicContext
+    }
+
+    fn with_ctx(f: impl FnOnce(&mut Vec<String>)) {
+        thread_local! {
+            static CTX: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        }
+        CTX.with(|ctx| f(&mut ctx.borrow_mut()));
+    }
 }

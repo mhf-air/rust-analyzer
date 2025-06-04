@@ -66,7 +66,7 @@ pub fn load_workspace_at(
 
 pub fn load_workspace(
     ws: ProjectWorkspace,
-    extra_env: &FxHashMap<String, String>,
+    extra_env: &FxHashMap<String, Option<String>>,
     load_config: &LoadCargoConfig,
 ) -> anyhow::Result<(RootDatabase, vfs::Vfs, Option<ProcMacroClient>)> {
     let (sender, receiver) = unbounded();
@@ -292,7 +292,7 @@ impl ProjectFolders {
             };
 
             let file_set_roots = vec![VfsPath::from(ratoml_path.to_owned())];
-            let entry = vfs::loader::Entry::Files(vec![ratoml_path.to_owned()]);
+            let entry = vfs::loader::Entry::Files(vec![ratoml_path]);
 
             res.watch.push(res.load.len());
             res.load.push(entry);
@@ -426,7 +426,7 @@ fn load_crate_graph(
 ) -> RootDatabase {
     let lru_cap = std::env::var("RA_LRU_CAP").ok().and_then(|it| it.parse::<u16>().ok());
     let mut db = RootDatabase::new(lru_cap);
-    let mut analysis_change = ChangeWithProcMacros::new();
+    let mut analysis_change = ChangeWithProcMacros::default();
 
     db.enable_proc_attr_macros();
 
@@ -511,10 +511,6 @@ impl ProcMacroExpander for Expander {
             Ok(Err(err)) => Err(ProcMacroExpansionError::Panic(err.0)),
             Err(err) => Err(ProcMacroExpansionError::System(err.to_string())),
         }
-    }
-
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
-        other.as_any().downcast_ref::<Self>().is_some_and(|other| self == other)
     }
 }
 

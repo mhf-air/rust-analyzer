@@ -285,8 +285,6 @@ fn main() {
     /* parse error: expected expression */
 builtin #format_args (x = );
     /* parse error: expected expression */
-/* parse error: expected R_PAREN */
-/* parse error: expected expression, item or let statement */
 builtin #format_args (x = , x = 2);
     /* parse error: expected expression */
 builtin #format_args ("{}", x = );
@@ -456,13 +454,13 @@ fn test_concat_expand() {
 #[rustc_builtin_macro]
 macro_rules! concat {}
 
-fn main() { concat!("fo", "o", 0, r#""bar""#, "\n", false, '"', '\0'); }
+fn main() { concat!("fo", "o", 0, r#""bar""#, "\n", false, '"', -4, - 4, '\0'); }
 "##,
         expect![[r##"
 #[rustc_builtin_macro]
 macro_rules! concat {}
 
-fn main() { "foo0\"bar\"\nfalse\"\u{0}"; }
+fn main() { "foo0\"bar\"\nfalse\"-4-4\u{0}"; }
 "##]],
     );
 }
@@ -507,24 +505,6 @@ macro_rules! surprise {
 }
 
 fn main() { "s"; }
-"##]],
-    );
-}
-
-#[test]
-fn test_concat_idents_expand() {
-    check(
-        r##"
-#[rustc_builtin_macro]
-macro_rules! concat_idents {}
-
-fn main() { concat_idents!(foo, bar); }
-"##,
-        expect![[r##"
-#[rustc_builtin_macro]
-macro_rules! concat_idents {}
-
-fn main() { foobar; }
 "##]],
     );
 }

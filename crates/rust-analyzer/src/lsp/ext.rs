@@ -399,6 +399,14 @@ impl Request for ParentModule {
     const METHOD: &'static str = "experimental/parentModule";
 }
 
+pub enum ChildModules {}
+
+impl Request for ChildModules {
+    type Params = lsp_types::TextDocumentPositionParams;
+    type Result = Option<lsp_types::GotoDefinitionResponse>;
+    const METHOD: &'static str = "experimental/childModules";
+}
+
 pub enum JoinLines {}
 
 impl Request for JoinLines {

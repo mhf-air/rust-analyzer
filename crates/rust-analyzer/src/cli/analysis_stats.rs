@@ -4,13 +4,13 @@
 use std::{
     env, fmt,
     ops::AddAssign,
+    panic::{AssertUnwindSafe, catch_unwind},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use cfg::{CfgAtom, CfgDiff};
 use hir::{
-    Adt, AssocItem, Crate, DefWithBody, HasSource, HirDisplay, HirFileIdExt, ImportPathConfig,
-    ModuleDef, Name,
+    Adt, AssocItem, Crate, DefWithBody, HasSource, HirDisplay, ImportPathConfig, ModuleDef, Name,
     db::{DefDatabase, ExpandDatabase, HirDatabase},
 };
 use hir_def::{
@@ -60,7 +60,7 @@ impl flags::AnalysisStats {
             all_targets: true,
             set_test: !self.no_test,
             cfg_overrides: CfgOverrides {
-                global: CfgDiff::new(vec![CfgAtom::Flag(hir::sym::miri.clone())], vec![]),
+                global: CfgDiff::new(vec![CfgAtom::Flag(hir::sym::miri)], vec![]),
                 selective: Default::default(),
             },
             ..Default::default()
@@ -142,7 +142,9 @@ impl flags::AnalysisStats {
                         if !source_root.is_library || self.with_deps {
                             let length = db.file_text(file_id).text(db).lines().count();
                             let item_stats = db
-                                .file_item_tree(EditionedFileId::current_edition(file_id).into())
+                                .file_item_tree(
+                                    EditionedFileId::current_edition(db, file_id).into(),
+                                )
                                 .item_tree_stats()
                                 .into();
 
@@ -152,7 +154,9 @@ impl flags::AnalysisStats {
                         } else {
                             let length = db.file_text(file_id).text(db).lines().count();
                             let item_stats = db
-                                .file_item_tree(EditionedFileId::current_edition(file_id).into())
+                                .file_item_tree(
+                                    EditionedFileId::current_edition(db, file_id).into(),
+                                )
                                 .item_tree_stats()
                                 .into();
 
@@ -172,7 +176,7 @@ impl flags::AnalysisStats {
             UsizeWithUnderscore(dep_loc),
             UsizeWithUnderscore(dep_item_trees),
         );
-        eprintln!("  dependency item stats: {}", dep_item_stats);
+        eprintln!("  dependency item stats: {dep_item_stats}");
 
         // FIXME(salsa-transition): bring back stats for ParseQuery (file size)
         // and ParseMacroExpansionQuery (macro expansion "file") size whenever we implement
@@ -203,7 +207,7 @@ impl flags::AnalysisStats {
             let file_id = module.definition_source_file_id(db);
             let file_id = file_id.original_file(db);
 
-            let source_root = db.file_source_root(file_id.into()).source_root_id(db);
+            let source_root = db.file_source_root(file_id.file_id(db)).source_root_id(db);
             let source_root = db.source_root(source_root).source_root(db);
             if !source_root.is_library || self.with_deps {
                 num_crates += 1;
@@ -292,7 +296,7 @@ impl flags::AnalysisStats {
             UsizeWithUnderscore(workspace_loc),
             UsizeWithUnderscore(workspace_item_trees),
         );
-        eprintln!("    usages: {}", workspace_item_stats);
+        eprintln!("    usages: {workspace_item_stats}");
 
         eprintln!("  Dependencies:");
         eprintln!(
@@ -300,7 +304,7 @@ impl flags::AnalysisStats {
             UsizeWithUnderscore(dep_loc),
             UsizeWithUnderscore(dep_item_trees),
         );
-        eprintln!("    declarations: {}", dep_item_stats);
+        eprintln!("    declarations: {dep_item_stats}");
 
         let crate_def_map_time = crate_def_map_sw.elapsed();
         eprintln!("{:<20} {}", "Item Collection:", crate_def_map_time);
@@ -437,7 +441,7 @@ impl flags::AnalysisStats {
         let mut bar = match verbosity {
             Verbosity::Quiet | Verbosity::Spammy => ProgressReport::hidden(),
             _ if self.parallel || self.output.is_some() => ProgressReport::hidden(),
-            _ => ProgressReport::new(file_ids.len() as u64),
+            _ => ProgressReport::new(file_ids.len()),
         };
 
         file_ids.sort();
@@ -457,6 +461,7 @@ impl flags::AnalysisStats {
         let mut sw = self.stop_watch();
 
         for &file_id in &file_ids {
+            let file_id = file_id.editioned_file_id(db);
             let sema = hir::Semantics::new(db);
             let display_target = match sema.first_crate(file_id.file_id()) {
                 Some(krate) => krate.to_display_target(sema.db),
@@ -646,7 +651,7 @@ impl flags::AnalysisStats {
         let mut bar = match verbosity {
             Verbosity::Quiet | Verbosity::Spammy => ProgressReport::hidden(),
             _ if self.parallel || self.output.is_some() => ProgressReport::hidden(),
-            _ => ProgressReport::new(bodies.len() as u64),
+            _ => ProgressReport::new(bodies.len()),
         };
         let mut sw = self.stop_watch();
         let mut all = 0;
@@ -692,15 +697,14 @@ impl flags::AnalysisStats {
         let mut bar = match verbosity {
             Verbosity::Quiet | Verbosity::Spammy => ProgressReport::hidden(),
             _ if self.parallel || self.output.is_some() => ProgressReport::hidden(),
-            _ => ProgressReport::new(bodies.len() as u64),
+            _ => ProgressReport::new(bodies.len()),
         };
 
         if self.parallel {
             let mut inference_sw = self.stop_watch();
-            let snap = db.snapshot();
             bodies
                 .par_iter()
-                .map_with(snap, |snap, &body| {
+                .map_with(db.clone(), |snap, &body| {
                     snap.body(body.into());
                     snap.infer(body.into());
                 })
@@ -718,6 +722,7 @@ impl flags::AnalysisStats {
         let mut num_pats_unknown = 0;
         let mut num_pats_partially_unknown = 0;
         let mut num_pat_type_mismatches = 0;
+        let mut panics = 0;
         for &body_id in bodies {
             let name = body_id.name(db).unwrap_or_else(Name::missing);
             let module = body_id.module(db);
@@ -753,11 +758,10 @@ impl flags::AnalysisStats {
                         DefWithBody::Static(it) => it.source(db).map(|it| it.syntax().cloned()),
                         DefWithBody::Const(it) => it.source(db).map(|it| it.syntax().cloned()),
                         DefWithBody::Variant(it) => it.source(db).map(|it| it.syntax().cloned()),
-                        DefWithBody::InTypeConst(_) => unimplemented!(),
                     };
                     if let Some(src) = source {
                         let original_file = src.file_id.original_file(db);
-                        let path = vfs.file_path(original_file.into());
+                        let path = vfs.file_path(original_file.file_id(db));
                         let syntax_range = src.text_range();
                         format!("processing: {} ({} {:?})", full_name(), path, syntax_range)
                     } else {
@@ -772,7 +776,20 @@ impl flags::AnalysisStats {
             }
             bar.set_message(msg);
             let body = db.body(body_id.into());
-            let inference_result = db.infer(body_id.into());
+            let inference_result = catch_unwind(AssertUnwindSafe(|| db.infer(body_id.into())));
+            let inference_result = match inference_result {
+                Ok(inference_result) => inference_result,
+                Err(p) => {
+                    if let Some(s) = p.downcast_ref::<&str>() {
+                        eprintln!("infer panicked for {}: {}", full_name(), s);
+                    } else if let Some(s) = p.downcast_ref::<String>() {
+                        eprintln!("infer panicked for {}: {}", full_name(), s);
+                    }
+                    panics += 1;
+                    bar.inc(1);
+                    continue;
+                }
+            };
             // This query is LRU'd, so actually calling it will skew the timing results.
             let sm = || db.body_with_source_map(body_id.into()).1;
 
@@ -1006,6 +1023,7 @@ impl flags::AnalysisStats {
             percentage(num_pats_partially_unknown, num_pats),
             num_pat_type_mismatches
         );
+        eprintln!("  panics: {panics}");
         eprintln!("{:<20} {}", "Inference:", inference_time);
         report_metric("unknown type", num_exprs_unknown, "#");
         report_metric("type mismatches", num_expr_type_mismatches, "#");
@@ -1024,7 +1042,7 @@ impl flags::AnalysisStats {
         let mut bar = match verbosity {
             Verbosity::Quiet | Verbosity::Spammy => ProgressReport::hidden(),
             _ if self.output.is_some() => ProgressReport::hidden(),
-            _ => ProgressReport::new(bodies.len() as u64),
+            _ => ProgressReport::new(bodies.len()),
         };
 
         let mut sw = self.stop_watch();
@@ -1067,11 +1085,10 @@ impl flags::AnalysisStats {
                         DefWithBody::Static(it) => it.source(db).map(|it| it.syntax().cloned()),
                         DefWithBody::Const(it) => it.source(db).map(|it| it.syntax().cloned()),
                         DefWithBody::Variant(it) => it.source(db).map(|it| it.syntax().cloned()),
-                        DefWithBody::InTypeConst(_) => unimplemented!(),
                     };
                     if let Some(src) = source {
                         let original_file = src.file_id.original_file(db);
-                        let path = vfs.file_path(original_file.into());
+                        let path = vfs.file_path(original_file.file_id(db));
                         let syntax_range = src.text_range();
                         format!("processing: {} ({} {:?})", full_name(), path, syntax_range)
                     } else {
@@ -1125,7 +1142,7 @@ impl flags::AnalysisStats {
                     term_search_borrowck: true,
                 },
                 ide::AssistResolveStrategy::All,
-                file_id.into(),
+                analysis.editioned_file_id_to_vfs(file_id),
             );
         }
         for &file_id in &file_ids {
@@ -1160,7 +1177,7 @@ impl flags::AnalysisStats {
                     fields_to_resolve: InlayFieldsToResolve::empty(),
                     range_exclusive_hints: true,
                 },
-                file_id.into(),
+                analysis.editioned_file_id_to_vfs(file_id),
                 None,
             );
         }
@@ -1176,7 +1193,7 @@ impl flags::AnalysisStats {
                         annotate_enum_variant_references: false,
                         location: ide::AnnotationLocation::AboveName,
                     },
-                    file_id.into(),
+                    analysis.editioned_file_id_to_vfs(file_id),
                 )
                 .unwrap()
                 .into_iter()
@@ -1201,8 +1218,8 @@ fn location_csv_expr(db: &RootDatabase, vfs: &Vfs, sm: &BodySourceMap, expr_id: 
     let root = db.parse_or_expand(src.file_id);
     let node = src.map(|e| e.to_node(&root).syntax().clone());
     let original_range = node.as_ref().original_file_range_rooted(db);
-    let path = vfs.file_path(original_range.file_id.into());
-    let line_index = db.line_index(original_range.file_id.into());
+    let path = vfs.file_path(original_range.file_id.file_id(db));
+    let line_index = db.line_index(original_range.file_id.file_id(db));
     let text_range = original_range.range;
     let (start, end) =
         (line_index.line_col(text_range.start()), line_index.line_col(text_range.end()));
@@ -1217,8 +1234,8 @@ fn location_csv_pat(db: &RootDatabase, vfs: &Vfs, sm: &BodySourceMap, pat_id: Pa
     let root = db.parse_or_expand(src.file_id);
     let node = src.map(|e| e.to_node(&root).syntax().clone());
     let original_range = node.as_ref().original_file_range_rooted(db);
-    let path = vfs.file_path(original_range.file_id.into());
-    let line_index = db.line_index(original_range.file_id.into());
+    let path = vfs.file_path(original_range.file_id.file_id(db));
+    let line_index = db.line_index(original_range.file_id.file_id(db));
     let text_range = original_range.range;
     let (start, end) =
         (line_index.line_col(text_range.start()), line_index.line_col(text_range.end()));
@@ -1236,8 +1253,8 @@ fn expr_syntax_range<'a>(
         let root = db.parse_or_expand(src.file_id);
         let node = src.map(|e| e.to_node(&root).syntax().clone());
         let original_range = node.as_ref().original_file_range_rooted(db);
-        let path = vfs.file_path(original_range.file_id.into());
-        let line_index = db.line_index(original_range.file_id.into());
+        let path = vfs.file_path(original_range.file_id.file_id(db));
+        let line_index = db.line_index(original_range.file_id.file_id(db));
         let text_range = original_range.range;
         let (start, end) =
             (line_index.line_col(text_range.start()), line_index.line_col(text_range.end()));
@@ -1257,8 +1274,8 @@ fn pat_syntax_range<'a>(
         let root = db.parse_or_expand(src.file_id);
         let node = src.map(|e| e.to_node(&root).syntax().clone());
         let original_range = node.as_ref().original_file_range_rooted(db);
-        let path = vfs.file_path(original_range.file_id.into());
-        let line_index = db.line_index(original_range.file_id.into());
+        let path = vfs.file_path(original_range.file_id.file_id(db));
+        let line_index = db.line_index(original_range.file_id.file_id(db));
         let text_range = original_range.range;
         let (start, end) =
             (line_index.line_col(text_range.start()), line_index.line_col(text_range.end()));
@@ -1292,7 +1309,7 @@ impl fmt::Display for UsizeWithUnderscore {
         let num_str = self.0.to_string();
 
         if num_str.len() <= 3 {
-            return write!(f, "{}", num_str);
+            return write!(f, "{num_str}");
         }
 
         let mut result = String::new();
@@ -1305,7 +1322,7 @@ impl fmt::Display for UsizeWithUnderscore {
         }
 
         let result = result.chars().rev().collect::<String>();
-        write!(f, "{}", result)
+        write!(f, "{result}")
     }
 }
 

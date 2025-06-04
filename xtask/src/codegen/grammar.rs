@@ -414,9 +414,8 @@ fn generate_nodes(kinds: KindsSrc, grammar: &AstSrc) -> String {
         .map(|kind| to_pascal_case(kind))
         .filter(|name| !defined_nodes.iter().any(|&it| it == name))
     {
-        drop(node)
-        // FIXME: restore this
-        // eprintln!("Warning: node {} not defined in ast source", node);
+        eprintln!("Warning: node {node} not defined in AST source");
+        drop(node);
     }
 
     let ast = quote! {
@@ -671,6 +670,7 @@ fn generate_syntax_kinds(grammar: KindsSrc) -> String {
             [ident] => { $crate::SyntaxKind::IDENT };
             [string] => { $crate::SyntaxKind::STRING };
             [shebang] => { $crate::SyntaxKind::SHEBANG };
+            [frontmatter] => { $crate::SyntaxKind::FRONTMATTER };
         }
 
         impl ::core::marker::Copy for SyntaxKind {}

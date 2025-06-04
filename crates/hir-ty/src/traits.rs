@@ -8,10 +8,7 @@ use chalk_recursive::Cache;
 use chalk_solve::{Solver, logging_db::LoggingRustIrDatabase, rust_ir};
 
 use base_db::Crate;
-use hir_def::{
-    BlockId, TraitId,
-    lang_item::{LangItem, LangItemTarget},
-};
+use hir_def::{BlockId, TraitId, lang_item::LangItem};
 use hir_expand::name::Name;
 use intern::sym;
 use span::Edition;
@@ -113,15 +110,16 @@ pub(crate) fn trait_solve_query(
     block: Option<BlockId>,
     goal: Canonical<InEnvironment<Goal>>,
 ) -> Option<Solution> {
-    let detail = match &goal.value.goal.data(Interner) {
-        GoalData::DomainGoal(DomainGoal::Holds(WhereClause::Implemented(it))) => {
-            db.trait_data(it.hir_trait_id()).name.display(db.upcast(), Edition::LATEST).to_string()
-        }
+    let _p = tracing::info_span!("trait_solve_query", detail = ?match &goal.value.goal.data(Interner) {
+        GoalData::DomainGoal(DomainGoal::Holds(WhereClause::Implemented(it))) => db
+            .trait_signature(it.hir_trait_id())
+            .name
+            .display(db, Edition::LATEST)
+            .to_string(),
         GoalData::DomainGoal(DomainGoal::Holds(WhereClause::AliasEq(_))) => "alias_eq".to_owned(),
         _ => "??".to_owned(),
-    };
-    let _p = tracing::info_span!("trait_solve_query", ?detail).entered();
-    tracing::info!("trait_solve_query({:?})", goal.value.goal);
+    })
+    .entered();
 
     if let GoalData::DomainGoal(DomainGoal::Holds(WhereClause::AliasEq(AliasEq {
         alias: AliasTy::Projection(projection_ty),
@@ -281,20 +279,21 @@ impl FnTrait {
 
     pub fn method_name(self) -> Name {
         match self {
-            FnTrait::FnOnce => Name::new_symbol_root(sym::call_once.clone()),
-            FnTrait::FnMut => Name::new_symbol_root(sym::call_mut.clone()),
-            FnTrait::Fn => Name::new_symbol_root(sym::call.clone()),
-            FnTrait::AsyncFnOnce => Name::new_symbol_root(sym::async_call_once.clone()),
-            FnTrait::AsyncFnMut => Name::new_symbol_root(sym::async_call_mut.clone()),
-            FnTrait::AsyncFn => Name::new_symbol_root(sym::async_call.clone()),
+            FnTrait::FnOnce => Name::new_symbol_root(sym::call_once),
+            FnTrait::FnMut => Name::new_symbol_root(sym::call_mut),
+            FnTrait::Fn => Name::new_symbol_root(sym::call),
+            FnTrait::AsyncFnOnce => Name::new_symbol_root(sym::async_call_once),
+            FnTrait::AsyncFnMut => Name::new_symbol_root(sym::async_call_mut),
+            FnTrait::AsyncFn => Name::new_symbol_root(sym::async_call),
         }
     }
 
     pub fn get_id(self, db: &dyn HirDatabase, krate: Crate) -> Option<TraitId> {
-        let target = db.lang_item(krate, self.lang_item())?;
-        match target {
-            LangItemTarget::Trait(t) => Some(t),
-            _ => None,
-        }
+        self.lang_item().resolve_trait(db, krate)
+    }
+
+    #[inline]
+    pub(crate) fn is_async(self) -> bool {
+        matches!(self, FnTrait::AsyncFn | FnTrait::AsyncFnMut | FnTrait::AsyncFnOnce)
     }
 }

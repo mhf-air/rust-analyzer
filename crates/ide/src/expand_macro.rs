@@ -1,10 +1,10 @@
 use hir::db::ExpandDatabase;
-use hir::{ExpandResult, InFile, MacroFileIdExt, Semantics};
+use hir::{ExpandResult, InFile, InRealFile, Semantics};
 use ide_db::{
     FileId, RootDatabase, base_db::Crate, helpers::pick_best_token,
     syntax_helpers::prettify_macro_expansion,
 };
-use span::{Edition, SpanMap, SyntaxContext, TextRange, TextSize};
+use span::{SpanMap, SyntaxContext, TextRange, TextSize};
 use stdx::format_to;
 use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxNode, T, ast, ted};
 
@@ -26,8 +26,9 @@ pub struct ExpandedMacro {
 // ![Expand Macro Recursively](https://user-images.githubusercontent.com/48062697/113020648-b3973180-917a-11eb-84a9-ecb921293dc5.gif)
 pub(crate) fn expand_macro(db: &RootDatabase, position: FilePosition) -> Option<ExpandedMacro> {
     let sema = Semantics::new(db);
-    let file = sema.parse_guess_edition(position.file_id);
-    let krate = sema.file_to_module_def(position.file_id)?.krate().into();
+    let file_id = sema.attach_first_edition(position.file_id)?;
+    let file = sema.parse(file_id);
+    let krate = sema.file_to_module_def(file_id.file_id(db))?.krate().into();
 
     let tok = pick_best_token(file.syntax().token_at_offset(position.offset), |kind| match kind {
         SyntaxKind::IDENT => 1,
@@ -86,7 +87,10 @@ pub(crate) fn expand_macro(db: &RootDatabase, position: FilePosition) -> Option<
         return derive;
     }
 
-    let mut anc = tok.parent_ancestors();
+    let mut anc = sema
+        .descend_token_into_include_expansion(InRealFile::new(file_id, tok))
+        .value
+        .parent_ancestors();
     let mut span_map = SpanMap::empty();
     let mut error = String::new();
     let (name, expanded, kind) = loop {
@@ -95,14 +99,7 @@ pub(crate) fn expand_macro(db: &RootDatabase, position: FilePosition) -> Option<
         if let Some(item) = ast::Item::cast(node.clone()) {
             if let Some(def) = sema.resolve_attr_macro_call(&item) {
                 break (
-                    def.name(db)
-                        .display(
-                            db,
-                            sema.attach_first_edition(position.file_id)
-                                .map(|it| it.edition())
-                                .unwrap_or(Edition::CURRENT),
-                        )
-                        .to_string(),
+                    def.name(db).display(db, file_id.edition(db)).to_string(),
                     expand_macro_recur(&sema, &item, &mut error, &mut span_map, TextSize::new(0))?,
                     SyntaxKind::MACRO_ITEMS,
                 );
@@ -146,10 +143,11 @@ fn expand_macro_recur(
     offset_in_original_node: TextSize,
 ) -> Option<SyntaxNode> {
     let ExpandResult { value: expanded, err } = match macro_call {
-        item @ ast::Item::MacroCall(macro_call) => {
-            sema.expand_attr_macro(item).or_else(|| sema.expand_allowed_builtins(macro_call))?
-        }
-        item => sema.expand_attr_macro(item)?,
+        item @ ast::Item::MacroCall(macro_call) => sema
+            .expand_attr_macro(item)
+            .map(|it| it.map(|it| it.value))
+            .or_else(|| sema.expand_allowed_builtins(macro_call))?,
+        item => sema.expand_attr_macro(item)?.map(|it| it.value),
     };
     let expanded = expanded.clone_for_update();
     if let Some(err) = err {
@@ -234,6 +232,8 @@ fn _format(
     file_id: FileId,
     expansion: &str,
 ) -> Option<String> {
+    use ide_db::base_db::RootQueryDb;
+
     // hack until we get hygiene working (same character amount to preserve formatting as much as possible)
     const DOLLAR_CRATE_REPLACE: &str = "__r_a_";
     const BUILTIN_REPLACE: &str = "builtin__POUND";
@@ -247,9 +247,8 @@ fn _format(
     };
     let expansion = format!("{prefix}{expansion}{suffix}");
 
-    let upcast_db = ide_db::base_db::Upcast::<dyn ide_db::base_db::RootQueryDb>::upcast(db);
-    let &crate_id = upcast_db.relevant_crates(file_id).iter().next()?;
-    let edition = crate_id.data(upcast_db).edition;
+    let &crate_id = db.relevant_crates(file_id).iter().next()?;
+    let edition = crate_id.data(db).edition;
 
     #[allow(clippy::disallowed_methods)]
     let mut cmd = std::process::Command::new(toolchain::Tool::Rustfmt.path());
@@ -550,12 +549,30 @@ macro_rules! foo {
 }
 
 fn main() {
-    let res = fo$0o!();
+    fo$0o!()
 }
 "#,
             expect![[r#"
                 foo!
                 fn f<T>(_: &dyn ::std::marker::Copy){}"#]],
+        );
+    }
+
+    #[test]
+    fn macro_expand_item_expansion_in_expression_call() {
+        check(
+            r#"
+macro_rules! foo {
+    () => {fn f<T>() {}};
+}
+
+fn main() {
+    let res = fo$0o!();
+}
+"#,
+            expect![[r#"
+                foo!
+                fn f<T>(){}"#]],
         );
     }
 
@@ -675,6 +692,112 @@ b::Foo;
 ;
 crate::Foo;
 crate::Foo;"#]],
+        );
+    }
+
+    #[test]
+    fn semi_glueing() {
+        check(
+            r#"
+macro_rules! __log_value {
+    ($key:ident :$capture:tt =) => {};
+}
+
+macro_rules! __log {
+    ($key:tt $(:$capture:tt)? $(= $value:expr)?; $($arg:tt)+) => {
+        __log_value!($key $(:$capture)* = $($value)*);
+    };
+}
+
+__log!(written:%; "Test"$0);
+    "#,
+            expect![[r#"
+                __log!
+            "#]],
+        );
+    }
+
+    #[test]
+    fn assoc_call() {
+        check(
+            r#"
+macro_rules! mac {
+    () => { fn assoc() {} }
+}
+impl () {
+    mac$0!();
+}
+    "#,
+            expect![[r#"
+                mac!
+                fn assoc(){}"#]],
+        );
+    }
+
+    #[test]
+    fn eager() {
+        check(
+            r#"
+//- minicore: concat
+macro_rules! my_concat {
+    ($head:expr, $($tail:tt)*) => { concat!($head, $($tail)*) };
+}
+
+
+fn test() {
+    _ = my_concat!(
+        conc$0at!("<", ">"),
+        "hi",
+    );
+}
+    "#,
+            expect![[r#"
+                my_concat!
+                "<>hi""#]],
+        );
+    }
+
+    #[test]
+    fn in_included() {
+        check(
+            r#"
+//- minicore: include
+//- /main.rs crate:main
+include!("./included.rs");
+//- /included.rs
+macro_rules! foo {
+    () => { fn item() {} };
+}
+foo$0!();
+"#,
+            expect![[r#"
+                foo!
+                fn item(){}"#]],
+        );
+    }
+
+    #[test]
+    fn include() {
+        check(
+            r#"
+//- minicore: include
+//- /main.rs crate:main
+include$0!("./included.rs");
+//- /included.rs
+macro_rules! foo {
+    () => { fn item() {} };
+}
+foo();
+"#,
+            expect![[r#"
+                include!
+                macro_rules! foo {
+                    () => {
+                        fn item(){}
+
+                    };
+                }
+                foo();"#]],
         );
     }
 }

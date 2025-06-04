@@ -150,6 +150,7 @@ fn add_missing_impl_members_inner(
         let new_impl_def = edit.make_mut(impl_def.clone());
         let first_new_item = add_trait_assoc_items_to_impl(
             &ctx.sema,
+            ctx.config,
             &missing_items,
             trait_,
             &new_impl_def,
@@ -590,9 +591,9 @@ mod m {
 }
 
 impl m::Foo for () {
-    $0fn get_n(&self) -> usize { {40 + 2} }
+    $0fn get_n(&self) -> usize { N }
 
-    fn get_m(&self) -> usize { {m::VAL + 1} }
+    fn get_m(&self) -> usize { M }
 }"#,
         )
     }

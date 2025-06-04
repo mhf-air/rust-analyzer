@@ -13,6 +13,7 @@
 
 mod quote;
 
+use either::Either;
 use itertools::Itertools;
 use parser::{Edition, T};
 use rowan::NodeOrToken;
@@ -32,12 +33,9 @@ pub mod ext {
     use super::*;
 
     pub fn simple_ident_pat(name: ast::Name) -> ast::IdentPat {
-        return from_text(&name.text());
-
-        fn from_text(text: &str) -> ast::IdentPat {
-            ast_from_text(&format!("fn f({text}: ())"))
-        }
+        ast_from_text(&format!("fn f({}: ())", name.text()))
     }
+
     pub fn ident_path(ident: &str) -> ast::Path {
         path_unqualified(path_segment(name_ref(ident)))
     }
@@ -72,6 +70,9 @@ pub mod ext {
     pub fn expr_todo() -> ast::Expr {
         expr_from_text("todo!()")
     }
+    pub fn expr_underscore() -> ast::Expr {
+        expr_from_text("_")
+    }
     pub fn expr_ty_default(ty: &ast::Type) -> ast::Expr {
         expr_from_text(&format!("{ty}::default()"))
     }
@@ -81,7 +82,6 @@ pub mod ext {
     pub fn expr_self() -> ast::Expr {
         expr_from_text("self")
     }
-
     pub fn zero_number() -> ast::Expr {
         expr_from_text("0")
     }
@@ -115,6 +115,10 @@ pub mod ext {
     }
     pub fn ty_result(t: ast::Type, e: ast::Type) -> ast::Type {
         ty_from_text(&format!("Result<{t}, {e}>"))
+    }
+
+    pub fn token_tree_from_node(node: &ast::SyntaxNode) -> ast::TokenTree {
+        ast_from_text(&format!("todo!{node}"))
     }
 }
 
@@ -633,18 +637,18 @@ pub fn expr_prefix(op: SyntaxKind, expr: ast::Expr) -> ast::PrefixExpr {
     let token = token(op);
     expr_from_text(&format!("{token}{expr}"))
 }
-pub fn expr_call(f: ast::Expr, arg_list: ast::ArgList) -> ast::Expr {
+pub fn expr_call(f: ast::Expr, arg_list: ast::ArgList) -> ast::CallExpr {
     expr_from_text(&format!("{f}{arg_list}"))
 }
 pub fn expr_method_call(
     receiver: ast::Expr,
     method: ast::NameRef,
     arg_list: ast::ArgList,
-) -> ast::Expr {
+) -> ast::MethodCallExpr {
     expr_from_text(&format!("{receiver}.{method}{arg_list}"))
 }
-pub fn expr_macro_call(f: ast::Expr, arg_list: ast::ArgList) -> ast::Expr {
-    expr_from_text(&format!("{f}!{arg_list}"))
+pub fn expr_macro(path: ast::Path, tt: ast::TokenTree) -> ast::MacroExpr {
+    expr_from_text(&format!("{path}!{tt}"))
 }
 pub fn expr_ref(expr: ast::Expr, exclusive: bool) -> ast::Expr {
     expr_from_text(&if exclusive { format!("&mut {expr}") } else { format!("&{expr}") })
@@ -652,14 +656,17 @@ pub fn expr_ref(expr: ast::Expr, exclusive: bool) -> ast::Expr {
 pub fn expr_reborrow(expr: ast::Expr) -> ast::Expr {
     expr_from_text(&format!("&mut *{expr}"))
 }
-pub fn expr_closure(pats: impl IntoIterator<Item = ast::Param>, expr: ast::Expr) -> ast::Expr {
+pub fn expr_closure(
+    pats: impl IntoIterator<Item = ast::Param>,
+    expr: ast::Expr,
+) -> ast::ClosureExpr {
     let params = pats.into_iter().join(", ");
     expr_from_text(&format!("|{params}| {expr}"))
 }
 pub fn expr_field(receiver: ast::Expr, field: &str) -> ast::Expr {
     expr_from_text(&format!("{receiver}.{field}"))
 }
-pub fn expr_paren(expr: ast::Expr) -> ast::Expr {
+pub fn expr_paren(expr: ast::Expr) -> ast::ParenExpr {
     expr_from_text(&format!("({expr})"))
 }
 pub fn expr_tuple(elements: impl IntoIterator<Item = ast::Expr>) -> ast::TupleExpr {
@@ -703,7 +710,7 @@ pub fn wildcard_pat() -> ast::WildcardPat {
 }
 
 pub fn rest_pat() -> ast::RestPat {
-    ast_from_text("fn f(..)")
+    ast_from_text("fn f() { let ..; }")
 }
 
 pub fn literal_pat(lit: &str) -> ast::LiteralPat {
@@ -782,8 +789,8 @@ pub fn record_pat_field(name_ref: ast::NameRef, pat: ast::Pat) -> ast::RecordPat
     ast_from_text(&format!("fn f(S {{ {name_ref}: {pat} }}: ()))"))
 }
 
-pub fn record_pat_field_shorthand(name_ref: ast::NameRef) -> ast::RecordPatField {
-    ast_from_text(&format!("fn f(S {{ {name_ref} }}: ()))"))
+pub fn record_pat_field_shorthand(pat: ast::Pat) -> ast::RecordPatField {
+    ast_from_text(&format!("fn f(S {{ {pat} }}: ()))"))
 }
 
 /// Returns a `IdentPat` if the path has just one segment, a `PathPat` otherwise.
@@ -795,14 +802,36 @@ pub fn path_pat(path: ast::Path) -> ast::Pat {
 }
 
 /// Returns a `Pat` if the path has just one segment, an `OrPat` otherwise.
-pub fn or_pat(pats: impl IntoIterator<Item = ast::Pat>, leading_pipe: bool) -> ast::Pat {
+///
+/// Invariant: `pats` must be length > 1.
+pub fn or_pat(pats: impl IntoIterator<Item = ast::Pat>, leading_pipe: bool) -> ast::OrPat {
     let leading_pipe = if leading_pipe { "| " } else { "" };
     let pats = pats.into_iter().join(" | ");
 
     return from_text(&format!("{leading_pipe}{pats}"));
-    fn from_text(text: &str) -> ast::Pat {
+    fn from_text(text: &str) -> ast::OrPat {
         ast_from_text(&format!("fn f({text}: ())"))
     }
+}
+
+pub fn box_pat(pat: ast::Pat) -> ast::BoxPat {
+    ast_from_text(&format!("fn f(box {pat}: ())"))
+}
+
+pub fn paren_pat(pat: ast::Pat) -> ast::ParenPat {
+    ast_from_text(&format!("fn f(({pat}): ())"))
+}
+
+pub fn range_pat(start: Option<ast::Pat>, end: Option<ast::Pat>) -> ast::RangePat {
+    ast_from_text(&format!(
+        "fn f({}..{}: ())",
+        start.map(|e| e.to_string()).unwrap_or_default(),
+        end.map(|e| e.to_string()).unwrap_or_default()
+    ))
+}
+
+pub fn ref_pat(pat: ast::Pat) -> ast::RefPat {
+    ast_from_text(&format!("fn f(&{pat}: ())"))
 }
 
 pub fn match_arm(pat: ast::Pat, guard: Option<ast::MatchGuard>, expr: ast::Expr) -> ast::MatchArm {
@@ -853,7 +882,7 @@ pub fn match_arm_list(arms: impl IntoIterator<Item = ast::MatchArm>) -> ast::Mat
 }
 
 pub fn where_pred(
-    path: ast::Type,
+    path: Either<ast::Lifetime, ast::Type>,
     bounds: impl IntoIterator<Item = ast::TypeBound>,
 ) -> ast::WherePred {
     let bounds = bounds.into_iter().join(" + ");
@@ -1223,7 +1252,7 @@ pub fn meta_path(path: ast::Path) -> ast::Meta {
 
 pub fn token_tree(
     delimiter: SyntaxKind,
-    tt: Vec<NodeOrToken<ast::TokenTree, SyntaxToken>>,
+    tt: impl IntoIterator<Item = NodeOrToken<ast::TokenTree, SyntaxToken>>,
 ) -> ast::TokenTree {
     let (l_delimiter, r_delimiter) = match delimiter {
         T!['('] => ('(', ')'),

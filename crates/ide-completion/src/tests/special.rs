@@ -1008,6 +1008,7 @@ fn here_we_go() {
             kw if
             kw if let
             kw impl
+            kw impl for
             kw let
             kw letm
             kw loop
@@ -1059,6 +1060,7 @@ fn here_we_go() {
             kw if
             kw if let
             kw impl
+            kw impl for
             kw let
             kw letm
             kw loop
@@ -1184,6 +1186,7 @@ fn bar() { qu$0 }
             kw if
             kw if let
             kw impl
+            kw impl for
             kw let
             kw letm
             kw loop
@@ -1355,7 +1358,7 @@ pub fn foo<'x, T>(x: &'x mut T) -> u8 where T: Clone, { 0u8 }
 fn main() { fo$0 }
 "#,
         CompletionItemKind::SymbolKind(ide_db::SymbolKind::Function),
-        expect!("fn(&mut T) -> u8"),
+        expect!("fn(&'x mut T) -> u8"),
         expect!("pub fn foo<'x, T>(x: &'x mut T) -> u8 where T: Clone,"),
     );
 
@@ -1388,7 +1391,7 @@ fn main() {
 }
 "#,
         CompletionItemKind::SymbolKind(SymbolKind::Method),
-        expect!("const fn(&'foo mut self, &Foo) -> !"),
+        expect!("const fn(&'foo mut self, &'foo Foo) -> !"),
         expect!("pub const fn baz<'foo>(&'foo mut self, x: &'foo Foo) -> !"),
     );
 }
@@ -1441,6 +1444,7 @@ fn foo() {
             kw if
             kw if let
             kw impl
+            kw impl for
             kw let
             kw letm
             kw loop

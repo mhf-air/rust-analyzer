@@ -8,7 +8,7 @@ use intern::{
     sym::{self},
 };
 use mbe::{DelimiterKind, expect_fragment};
-use span::{Edition, EditionedFileId, FileId, Span};
+use span::{Edition, FileId, Span};
 use stdx::format_to;
 use syntax::{
     format_smolstr,
@@ -17,7 +17,7 @@ use syntax::{
 use syntax_bridge::syntax_node_to_token_tree;
 
 use crate::{
-    ExpandError, ExpandResult, HirFileIdExt, Lookup as _, MacroCallId,
+    EditionedFileId, ExpandError, ExpandResult, Lookup as _, MacroCallId,
     builtin::quote::{WithDelimiter, dollar_crate, quote},
     db::ExpandDatabase,
     hygiene::{span_with_call_site_ctxt, span_with_def_site_ctxt},
@@ -72,7 +72,7 @@ impl BuiltinFnLikeExpander {
         tt: &tt::TopSubtree,
         span: Span,
     ) -> ExpandResult<tt::TopSubtree> {
-        let span = span_with_def_site_ctxt(db, span, id, Edition::CURRENT);
+        let span = span_with_def_site_ctxt(db, span, id.into(), Edition::CURRENT);
         self.expander()(db, id, tt, span)
     }
 
@@ -89,7 +89,7 @@ impl EagerExpander {
         tt: &tt::TopSubtree,
         span: Span,
     ) -> ExpandResult<tt::TopSubtree> {
-        let span = span_with_def_site_ctxt(db, span, id, Edition::CURRENT);
+        let span = span_with_def_site_ctxt(db, span, id.into(), Edition::CURRENT);
         self.expander()(db, id, tt, span)
     }
 
@@ -140,7 +140,6 @@ register_builtin! {
     EagerExpander:
     (compile_error, CompileError) => compile_error_expand,
     (concat, Concat) => concat_expand,
-    (concat_idents, ConcatIdents) => concat_idents_expand,
     (concat_bytes, ConcatBytes) => concat_bytes_expand,
     (include, Include) => include_expand,
     (include_bytes, IncludeBytes) => include_bytes_expand,
@@ -177,10 +176,10 @@ fn line_expand(
     ExpandResult::ok(tt::TopSubtree::invisible_from_leaves(
         span,
         [tt::Leaf::Literal(tt::Literal {
-            symbol: sym::INTEGER_0.clone(),
+            symbol: sym::INTEGER_0,
             span,
             kind: tt::LitKind::Integer,
-            suffix: Some(sym::u32.clone()),
+            suffix: Some(sym::u32),
         })],
     ))
 }
@@ -224,7 +223,7 @@ fn assert_expand(
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let call_site_span = span_with_call_site_ctxt(db, span, id, Edition::CURRENT);
+    let call_site_span = span_with_call_site_ctxt(db, span, id.into(), Edition::CURRENT);
 
     let mut iter = tt.iter();
 
@@ -345,13 +344,9 @@ fn panic_expand(
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
     let dollar_crate = dollar_crate(span);
-    let call_site_span = span_with_call_site_ctxt(db, span, id, Edition::CURRENT);
+    let call_site_span = span_with_call_site_ctxt(db, span, id.into(), Edition::CURRENT);
 
-    let mac = if use_panic_2021(db, call_site_span) {
-        sym::panic_2021.clone()
-    } else {
-        sym::panic_2015.clone()
-    };
+    let mac = if use_panic_2021(db, call_site_span) { sym::panic_2021 } else { sym::panic_2015 };
 
     // Pass the original arguments
     let subtree = WithDelimiter {
@@ -376,12 +371,12 @@ fn unreachable_expand(
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
     let dollar_crate = dollar_crate(span);
-    let call_site_span = span_with_call_site_ctxt(db, span, id, Edition::CURRENT);
+    let call_site_span = span_with_call_site_ctxt(db, span, id.into(), Edition::CURRENT);
 
     let mac = if use_panic_2021(db, call_site_span) {
-        sym::unreachable_2021.clone()
+        sym::unreachable_2021
     } else {
-        sym::unreachable_2015.clone()
+        sym::unreachable_2015
     };
 
     // Pass the original arguments
@@ -407,11 +402,11 @@ fn use_panic_2021(db: &dyn ExpandDatabase, span: Span) -> bool {
         let Some(expn) = span.ctx.outer_expn(db) else {
             break false;
         };
-        let expn = db.lookup_intern_macro_call(expn);
+        let expn = db.lookup_intern_macro_call(expn.into());
         // FIXME: Record allow_internal_unstable in the macro def (not been done yet because it
         // would consume quite a bit extra memory for all call locs...)
         // if let Some(features) = expn.def.allow_internal_unstable {
-        //     if features.iter().any(|&f| f == sym::edition_panic.clone()) {
+        //     if features.iter().any(|&f| f == sym::edition_panic) {
         //         span = expn.call_site;
         //         continue;
         //     }
@@ -456,7 +451,10 @@ fn concat_expand(
         Some(_) => (),
         None => span = Some(s),
     };
-    for (i, mut t) in tt.iter().enumerate() {
+
+    let mut i = 0;
+    let mut iter = tt.iter();
+    while let Some(mut t) = iter.next() {
         // FIXME: hack on top of a hack: `$e:expr` captures get surrounded in parentheses
         // to ensure the right parsing order, so skip the parentheses here. Ideally we'd
         // implement rustc's model. cc https://github.com/rust-lang/rust-analyzer/pull/10623
@@ -508,10 +506,40 @@ fn concat_expand(
                 record_span(id.span);
             }
             TtElement::Leaf(tt::Leaf::Punct(punct)) if i % 2 == 1 && punct.char == ',' => (),
+            // handle negative numbers
+            TtElement::Leaf(tt::Leaf::Punct(punct)) if i % 2 == 0 && punct.char == '-' => {
+                let t = match iter.next() {
+                    Some(t) => t,
+                    None => {
+                        err.get_or_insert(ExpandError::other(
+                            call_site,
+                            "unexpected end of input after '-'",
+                        ));
+                        break;
+                    }
+                };
+
+                match t {
+                    TtElement::Leaf(tt::Leaf::Literal(it))
+                        if matches!(it.kind, tt::LitKind::Integer | tt::LitKind::Float) =>
+                    {
+                        format_to!(text, "-{}", it.symbol.as_str());
+                        record_span(punct.span.cover(it.span));
+                    }
+                    _ => {
+                        err.get_or_insert(ExpandError::other(
+                            call_site,
+                            "expected integer or floating pointer number after '-'",
+                        ));
+                        break;
+                    }
+                }
+            }
             _ => {
                 err.get_or_insert(ExpandError::other(call_site, "unexpected token"));
             }
         }
+        i += 1;
     }
     let span = span.unwrap_or_else(|| tt.top_subtree().delimiter.open);
     ExpandResult { value: quote!(span =>#text), err }
@@ -631,30 +659,6 @@ fn concat_bytes_expand_subtree(
     Ok(())
 }
 
-fn concat_idents_expand(
-    _db: &dyn ExpandDatabase,
-    _arg_id: MacroCallId,
-    tt: &tt::TopSubtree,
-    span: Span,
-) -> ExpandResult<tt::TopSubtree> {
-    let mut err = None;
-    let mut ident = String::new();
-    for (i, t) in tt.iter().enumerate() {
-        match t {
-            TtElement::Leaf(tt::Leaf::Ident(id)) => {
-                ident.push_str(id.sym.as_str());
-            }
-            TtElement::Leaf(tt::Leaf::Punct(punct)) if i % 2 == 1 && punct.char == ',' => (),
-            _ => {
-                err.get_or_insert(ExpandError::other(span, "unexpected token"));
-            }
-        }
-    }
-    // FIXME merge spans
-    let ident = tt::Ident { sym: Symbol::intern(&ident), span, is_raw: tt::IdentIsRaw::No };
-    ExpandResult { value: quote!(span =>#ident), err }
-}
-
 fn relative_file(
     db: &dyn ExpandDatabase,
     call_id: MacroCallId,
@@ -663,7 +667,7 @@ fn relative_file(
     err_span: Span,
 ) -> Result<EditionedFileId, ExpandError> {
     let lookup = db.lookup_intern_macro_call(call_id);
-    let call_site = lookup.kind.file_id().original_file_respecting_includes(db).file_id();
+    let call_site = lookup.kind.file_id().original_file_respecting_includes(db).file_id(db);
     let path = AnchoredPath { anchor: call_site, path: path_str };
     let res: FileId = db
         .resolve_path(path)
@@ -672,7 +676,7 @@ fn relative_file(
     if res == call_site && !allow_recursion {
         Err(ExpandError::other(err_span, format!("recursive inclusion of `{path_str}`")))
     } else {
-        Ok(EditionedFileId::new(res, lookup.krate.data(db).edition))
+        Ok(EditionedFileId::new(db, res, lookup.krate.data(db).edition))
     }
 }
 
@@ -731,10 +735,8 @@ fn include_expand(
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let (file_id_wrapper, editioned_file_id) = match include_input_to_file_id(db, arg_id, tt) {
-        Ok(editioned_file_id) => {
-            (base_db::EditionedFileId::new(db, editioned_file_id), editioned_file_id)
-        }
+    let editioned_file_id = match include_input_to_file_id(db, arg_id, tt) {
+        Ok(editioned_file_id) => editioned_file_id,
         Err(e) => {
             return ExpandResult::new(
                 tt::TopSubtree::empty(DelimSpan { open: span, close: span }),
@@ -745,7 +747,7 @@ fn include_expand(
     let span_map = db.real_span_map(editioned_file_id);
     // FIXME: Parse errors
     ExpandResult::ok(syntax_node_to_token_tree(
-        &db.parse(file_id_wrapper).syntax_node(),
+        &db.parse(editioned_file_id).syntax_node(),
         SpanMap::RealSpanMap(span_map),
         span,
         syntax_bridge::DocCommentDesugarMode::ProcMacro,
@@ -784,13 +786,13 @@ fn include_str_expand(
     db: &dyn ExpandDatabase,
     arg_id: MacroCallId,
     tt: &tt::TopSubtree,
-    span: Span,
+    call_site: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let (path, span) = match parse_string(tt) {
+    let (path, input_span) = match parse_string(tt) {
         Ok(it) => it,
         Err(e) => {
             return ExpandResult::new(
-                tt::TopSubtree::empty(DelimSpan { open: span, close: span }),
+                tt::TopSubtree::empty(DelimSpan { open: call_site, close: call_site }),
                 e,
             );
         }
@@ -800,17 +802,17 @@ fn include_str_expand(
     // it's unusual to `include_str!` a Rust file), but we can return an empty string.
     // Ideally, we'd be able to offer a precise expansion if the user asks for macro
     // expansion.
-    let file_id = match relative_file(db, arg_id, path.as_str(), true, span) {
+    let file_id = match relative_file(db, arg_id, path.as_str(), true, input_span) {
         Ok(file_id) => file_id,
         Err(_) => {
-            return ExpandResult::ok(quote!(span =>""));
+            return ExpandResult::ok(quote!(call_site =>""));
         }
     };
 
-    let text = db.file_text(file_id.file_id());
+    let text = db.file_text(file_id.file_id(db));
     let text = &*text.text(db);
 
-    ExpandResult::ok(quote!(span =>#text))
+    ExpandResult::ok(quote!(call_site =>#text))
 }
 
 fn get_env_inner(db: &dyn ExpandDatabase, arg_id: MacroCallId, key: &Symbol) -> Option<String> {

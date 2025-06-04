@@ -55,7 +55,7 @@ pub(crate) fn flip_comma(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<(
             editor.replace(next.clone(), prev.clone());
         }
 
-        builder.add_file_edits(ctx.file_id(), editor);
+        builder.add_file_edits(ctx.vfs_file_id(), editor);
     })
 }
 
@@ -101,7 +101,7 @@ fn flip_tree(tree: ast::TokenTree, comma: SyntaxToken) -> (ast::TokenTree, Synta
     ]
     .concat();
 
-    let make = SyntaxFactory::new();
+    let make = SyntaxFactory::with_mappings();
     let new_token_tree = make.token_tree(tree.left_delimiter_token().unwrap().kind(), result);
     (new_token_tree, make.finish_with_mappings())
 }

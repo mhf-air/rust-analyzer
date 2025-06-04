@@ -4,7 +4,7 @@ mod logger_db;
 use logger_db::LoggerDb;
 use query_group_macro::query_group;
 
-#[salsa::input]
+#[salsa_macros::input]
 struct Input {
     str: String,
 }
@@ -30,7 +30,7 @@ fn invoke_length_query_actual(db: &dyn PartialMigrationDatabase, input: Input) -
     input.str(db).len()
 }
 
-#[salsa::tracked]
+#[salsa_macros::tracked]
 fn invoke_length_tracked_actual(db: &dyn PartialMigrationDatabase, input: Input) -> usize {
     input.str(db).len()
 }
@@ -46,9 +46,7 @@ fn unadorned_query() {
     db.assert_logs(expect![[r#"
         [
             "salsa_event(WillCheckCancellation)",
-            "salsa_event(WillExecute { database_key: create_data_PartialMigrationDatabase(Id(400)) })",
-            "salsa_event(WillCheckCancellation)",
-            "salsa_event(WillExecute { database_key: length_query_shim(Id(c00)) })",
+            "salsa_event(WillExecute { database_key: length_query_shim(Id(0)) })",
         ]"#]]);
 }
 
@@ -63,9 +61,7 @@ fn invoke_query() {
     db.assert_logs(expect![[r#"
         [
             "salsa_event(WillCheckCancellation)",
-            "salsa_event(WillExecute { database_key: create_data_PartialMigrationDatabase(Id(400)) })",
-            "salsa_event(WillCheckCancellation)",
-            "salsa_event(WillExecute { database_key: invoke_length_query_shim(Id(c00)) })",
+            "salsa_event(WillExecute { database_key: invoke_length_query_shim(Id(0)) })",
         ]"#]]);
 }
 
@@ -81,9 +77,7 @@ fn invoke_tracked_query() {
     db.assert_logs(expect![[r#"
         [
             "salsa_event(WillCheckCancellation)",
-            "salsa_event(WillExecute { database_key: create_data_PartialMigrationDatabase(Id(400)) })",
-            "salsa_event(WillCheckCancellation)",
-            "salsa_event(WillExecute { database_key: invoke_length_tracked_shim(Id(c00)) })",
+            "salsa_event(WillExecute { database_key: invoke_length_tracked_shim(Id(0)) })",
             "salsa_event(WillCheckCancellation)",
             "salsa_event(WillExecute { database_key: invoke_length_tracked_actual(Id(0)) })",
         ]"#]]);
@@ -93,12 +87,12 @@ fn invoke_tracked_query() {
 fn new_salsa_baseline() {
     let db = LoggerDb::default();
 
-    #[salsa::input]
+    #[salsa_macros::input]
     struct Input {
         str: String,
     }
 
-    #[salsa::tracked]
+    #[salsa_macros::tracked]
     fn new_salsa_length_query(db: &dyn PartialMigrationDatabase, input: Input) -> usize {
         input.str(db).len()
     }

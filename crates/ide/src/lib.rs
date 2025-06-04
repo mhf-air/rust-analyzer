@@ -20,6 +20,7 @@ mod navigation_target;
 
 mod annotations;
 mod call_hierarchy;
+mod child_modules;
 mod doc_links;
 mod expand_macro;
 mod extend_selection;
@@ -57,21 +58,19 @@ mod view_memory_layout;
 mod view_mir;
 mod view_syntax_tree;
 
-use std::panic::UnwindSafe;
+use std::panic::{AssertUnwindSafe, UnwindSafe};
 
 use cfg::CfgOptions;
 use fetch_crates::CrateInfo;
-use hir::{ChangeWithProcMacros, sym};
+use hir::{ChangeWithProcMacros, EditionedFileId, crate_def_map, sym};
 use ide_db::{
     FxHashMap, FxIndexSet, LineIndexDatabase,
     base_db::{
-        CrateOrigin, CrateWorkspaceData, Env, FileSet, RootQueryDb, SourceDatabase, Upcast,
-        VfsPath,
-        salsa::{AsDynDatabase, Cancelled},
+        CrateOrigin, CrateWorkspaceData, Env, FileSet, RootQueryDb, SourceDatabase, VfsPath,
+        salsa::Cancelled,
     },
     prime_caches, symbol_index,
 };
-use span::EditionedFileId;
 use syntax::SourceFile;
 use triomphe::Arc;
 use view_memory_layout::{RecursiveMemoryLayout, view_memory_layout};
@@ -124,9 +123,9 @@ pub use ide_completion::{
     CallableSnippets, CompletionConfig, CompletionFieldsToResolve, CompletionItem,
     CompletionItemKind, CompletionItemRefMode, CompletionRelevance, Snippet, SnippetScope,
 };
-pub use ide_db::text_edit::{Indel, TextEdit};
 pub use ide_db::{
     FileId, FilePosition, FileRange, RootDatabase, Severity, SymbolKind,
+    assists::ExprFillDefaultMode,
     base_db::{Crate, CrateGraphBuilder, FileChange, SourceRoot, SourceRootId},
     documentation::Documentation,
     label::Label,
@@ -135,8 +134,9 @@ pub use ide_db::{
     search::{ReferenceCategory, SearchScope},
     source_change::{FileSystemEdit, SnippetEdit, SourceChange},
     symbol_index::Query,
+    text_edit::{Indel, TextEdit},
 };
-pub use ide_diagnostics::{Diagnostic, DiagnosticCode, DiagnosticsConfig, ExprFillDefaultMode};
+pub use ide_diagnostics::{Diagnostic, DiagnosticCode, DiagnosticsConfig};
 pub use ide_ssr::SsrError;
 pub use span::Edition;
 pub use syntax::{TextRange, TextSize};
@@ -182,7 +182,7 @@ impl AnalysisHost {
     /// Returns a snapshot of the current state, which you can query for
     /// semantic information.
     pub fn analysis(&self) -> Analysis {
-        Analysis { db: self.db.snapshot() }
+        Analysis { db: self.db.clone() }
     }
 
     /// Applies changes to the current state of the world. If there are
@@ -238,7 +238,7 @@ impl Analysis {
         file_set.insert(file_id, VfsPath::new_virtual_path("/main.rs".to_owned()));
         let source_root = SourceRoot::new_local(file_set);
 
-        let mut change = ChangeWithProcMacros::new();
+        let mut change = ChangeWithProcMacros::default();
         change.set_roots(vec![source_root]);
         let mut crate_graph = CrateGraphBuilder::default();
         // FIXME: cfg options
@@ -250,7 +250,7 @@ impl Analysis {
             TryFrom::try_from(&*std::env::current_dir().unwrap().as_path().to_string_lossy())
                 .unwrap(),
         );
-        cfg_options.insert_atom(sym::test.clone());
+        cfg_options.insert_atom(sym::test);
         crate_graph.add_crate_root(
             file_id,
             Edition::CURRENT,
@@ -306,10 +306,7 @@ impl Analysis {
     pub fn parse(&self, file_id: FileId) -> Cancellable<SourceFile> {
         // FIXME edition
         self.with_db(|db| {
-            let editioned_file_id_wrapper = ide_db::base_db::EditionedFileId::new(
-                self.db.as_dyn_database(),
-                EditionedFileId::current_edition(file_id),
-            );
+            let editioned_file_id_wrapper = EditionedFileId::current_edition(&self.db, file_id);
 
             db.parse(editioned_file_id_wrapper).tree()
         })
@@ -338,10 +335,7 @@ impl Analysis {
     /// supported).
     pub fn matching_brace(&self, position: FilePosition) -> Cancellable<Option<TextSize>> {
         self.with_db(|db| {
-            let file_id = ide_db::base_db::EditionedFileId::new(
-                self.db.as_dyn_database(),
-                EditionedFileId::current_edition(position.file_id),
-            );
+            let file_id = EditionedFileId::current_edition(&self.db, position.file_id);
             let parse = db.parse(file_id);
             let file = parse.tree();
             matching_brace::matching_brace(&file, position.offset)
@@ -401,10 +395,8 @@ impl Analysis {
     /// stuff like trailing commas.
     pub fn join_lines(&self, config: &JoinLinesConfig, frange: FileRange) -> Cancellable<TextEdit> {
         self.with_db(|db| {
-            let editioned_file_id_wrapper = ide_db::base_db::EditionedFileId::new(
-                self.db.as_dyn_database(),
-                EditionedFileId::current_edition(frange.file_id),
-            );
+            let editioned_file_id_wrapper =
+                EditionedFileId::current_edition(&self.db, frange.file_id);
             let parse = db.parse(editioned_file_id_wrapper);
             join_lines::join_lines(config, &parse.tree(), frange.range)
         })
@@ -441,10 +433,7 @@ impl Analysis {
     pub fn file_structure(&self, file_id: FileId) -> Cancellable<Vec<StructureNode>> {
         // FIXME: Edition
         self.with_db(|db| {
-            let editioned_file_id_wrapper = ide_db::base_db::EditionedFileId::new(
-                self.db.as_dyn_database(),
-                EditionedFileId::current_edition(file_id),
-            );
+            let editioned_file_id_wrapper = EditionedFileId::current_edition(&self.db, file_id);
 
             file_structure::file_structure(&db.parse(editioned_file_id_wrapper).tree())
         })
@@ -475,10 +464,7 @@ impl Analysis {
     /// Returns the set of folding ranges.
     pub fn folding_ranges(&self, file_id: FileId) -> Cancellable<Vec<Fold>> {
         self.with_db(|db| {
-            let editioned_file_id_wrapper = ide_db::base_db::EditionedFileId::new(
-                self.db.as_dyn_database(),
-                EditionedFileId::current_edition(file_id),
-            );
+            let editioned_file_id_wrapper = EditionedFileId::current_edition(&self.db, file_id);
 
             folding_ranges::folding_ranges(&db.parse(editioned_file_id_wrapper).tree())
         })
@@ -528,13 +514,16 @@ impl Analysis {
         self.with_db(|db| goto_type_definition::goto_type_definition(db, position))
     }
 
-    /// Finds all usages of the reference at point.
     pub fn find_all_refs(
         &self,
         position: FilePosition,
         search_scope: Option<SearchScope>,
     ) -> Cancellable<Option<Vec<ReferenceSearchResult>>> {
-        self.with_db(|db| references::find_all_refs(&Semantics::new(db), position, search_scope))
+        let search_scope = AssertUnwindSafe(search_scope);
+        self.with_db(|db| {
+            let _ = &search_scope;
+            references::find_all_refs(&Semantics::new(db), position, search_scope.0)
+        })
     }
 
     /// Returns a short text describing element at position.
@@ -605,6 +594,11 @@ impl Analysis {
         self.with_db(|db| parent_module::parent_module(db, position))
     }
 
+    /// Returns vec of `mod name;` declaration which are created by the current module.
+    pub fn child_modules(&self, position: FilePosition) -> Cancellable<Vec<NavigationTarget>> {
+        self.with_db(|db| child_modules::child_modules(db, position))
+    }
+
     /// Returns crates that this file belongs to.
     pub fn crates_for(&self, file_id: FileId) -> Cancellable<Vec<Crate>> {
         self.with_db(|db| parent_module::crates_for(db, file_id))
@@ -617,10 +611,7 @@ impl Analysis {
 
     /// Returns crates that this file *might* belong to.
     pub fn relevant_crates_for(&self, file_id: FileId) -> Cancellable<Vec<Crate>> {
-        self.with_db(|db| {
-            let db = Upcast::<dyn RootQueryDb>::upcast(db);
-            db.relevant_crates(file_id).iter().copied().collect()
-        })
+        self.with_db(|db| db.relevant_crates(file_id).iter().copied().collect())
     }
 
     /// Returns the edition of the given crate.
@@ -635,7 +626,7 @@ impl Analysis {
 
     /// Returns true if this crate has `no_std` or `no_core` specified.
     pub fn is_crate_no_std(&self, crate_id: Crate) -> Cancellable<bool> {
-        self.with_db(|db| hir::db::DefDatabase::crate_def_map(db, crate_id).is_no_std())
+        self.with_db(|db| crate_def_map(db, crate_id).is_no_std())
     }
 
     /// Returns the root file of the given crate.
@@ -654,7 +645,11 @@ impl Analysis {
         position: FilePosition,
         search_scope: Option<SearchScope>,
     ) -> Cancellable<Vec<Runnable>> {
-        self.with_db(|db| runnables::related_tests(db, position, search_scope))
+        let search_scope = AssertUnwindSafe(search_scope);
+        self.with_db(|db| {
+            let _ = &search_scope;
+            runnables::related_tests(db, position, search_scope.0)
+        })
     }
 
     /// Computes syntax highlighting for the given file
@@ -753,7 +748,7 @@ impl Analysis {
         frange: FileRange,
     ) -> Cancellable<Vec<Assist>> {
         let include_fixes = match &assist_config.allowed {
-            Some(it) => it.iter().any(|&it| it == AssistKind::QuickFix),
+            Some(it) => it.contains(&AssistKind::QuickFix),
             None => true,
         };
 
@@ -847,6 +842,10 @@ impl Analysis {
         self.with_db(|db| view_memory_layout(db, position))
     }
 
+    pub fn editioned_file_id_to_vfs(&self, file_id: hir::EditionedFileId) -> FileId {
+        file_id.file_id(&self.db)
+    }
+
     /// Performs an operation on the database that may be canceled.
     ///
     /// rust-analyzer needs to be able to answer semantic questions about the
@@ -864,7 +863,7 @@ impl Analysis {
     where
         F: FnOnce(&RootDatabase) -> T + std::panic::UnwindSafe,
     {
-        let snap = self.db.snapshot();
+        let snap = self.db.clone();
         Cancelled::catch(|| f(&snap))
     }
 }

@@ -24,7 +24,7 @@ pub(crate) fn introduce_named_type_parameter(
     let fn_ = param.syntax().ancestors().nth(2).and_then(ast::Fn::cast)?;
     let type_bound_list = impl_trait_type.type_bound_list()?;
 
-    let make = SyntaxFactory::new();
+    let make = SyntaxFactory::with_mappings();
     let target = fn_.syntax().text_range();
     acc.add(
         AssistId::refactor_rewrite("introduce_named_type_parameter"),
@@ -59,7 +59,7 @@ pub(crate) fn introduce_named_type_parameter(
             }
 
             editor.add_mappings(make.finish_with_mappings());
-            builder.add_file_edits(ctx.file_id(), editor);
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }

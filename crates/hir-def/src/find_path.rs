@@ -5,6 +5,7 @@ use std::{cell::Cell, cmp::Ordering, iter};
 use base_db::{Crate, CrateOrigin, LangCrateOrigin};
 use hir_expand::{
     Lookup,
+    mod_path::{ModPath, PathKind},
     name::{AsName, Name},
 };
 use intern::sym;
@@ -15,7 +16,6 @@ use crate::{
     db::DefDatabase,
     item_scope::ItemInNs,
     nameres::DefMap,
-    path::{ModPath, PathKind},
     visibility::{Visibility, VisibilityExplicitness},
 };
 
@@ -52,7 +52,7 @@ pub fn find_path(
             ignore_local_imports,
             is_std_item: item_module.krate().data(db).origin.is_lang(),
             from,
-            from_def_map: &from.def_map(db),
+            from_def_map: from.def_map(db),
             fuel: Cell::new(FIND_PATH_FUEL),
         },
         item,
@@ -134,10 +134,11 @@ fn find_path_inner(ctx: &FindPathCtx<'_>, item: ItemInNs, max_len: usize) -> Opt
 
     if let Some(ModuleDefId::EnumVariantId(variant)) = item.as_module_def_id() {
         // - if the item is an enum variant, refer to it via the enum
-        if let Some(mut path) =
-            find_path_inner(ctx, ItemInNs::Types(variant.lookup(ctx.db).parent.into()), max_len)
-        {
-            path.push_segment(ctx.db.enum_variant_data(variant).name.clone());
+        let loc = variant.lookup(ctx.db);
+        if let Some(mut path) = find_path_inner(ctx, ItemInNs::Types(loc.parent.into()), max_len) {
+            path.push_segment(
+                ctx.db.enum_variants(loc.parent).variants[loc.index as usize].1.clone(),
+            );
             return Some(path);
         }
         // If this doesn't work, it seems we have no way of referring to the
@@ -690,7 +691,7 @@ mod tests {
         let (def_map, local_def_map) = module.local_def_map(&db);
         let resolved = def_map
             .resolve_path(
-                &local_def_map,
+                local_def_map,
                 &db,
                 module.local_id,
                 &mod_path,

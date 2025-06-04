@@ -1,10 +1,10 @@
 use hir::{
-    Adt, AsAssocItem, HasSource, HirDisplay, HirFileIdExt, Module, PathResolution, Semantics,
-    StructKind, Type, TypeInfo,
+    Adt, AsAssocItem, HasSource, HirDisplay, Module, PathResolution, Semantics, StructKind, Type,
+    TypeInfo,
 };
-use ide_db::base_db::salsa::AsDynDatabase;
 use ide_db::{
     FileId, FxHashMap, FxHashSet, RootDatabase, SnippetCap,
+    assists::ExprFillDefaultMode,
     defs::{Definition, NameRefClass},
     famous_defs::FamousDefs,
     helpers::is_editable_crate,
@@ -47,7 +47,7 @@ use crate::{
 //     bar("", baz());
 // }
 //
-// fn bar(arg: &str, baz: Baz) ${0:-> _} {
+// fn bar(arg: &'static str, baz: Baz) ${0:-> _} {
 //     todo!()
 // }
 //
@@ -207,14 +207,11 @@ fn get_adt_source(
 ) -> Option<(Option<ast::Impl>, FileId)> {
     let range = adt.source(ctx.sema.db)?.syntax().original_file_range_rooted(ctx.sema.db);
 
-    let editioned_file_id =
-        ide_db::base_db::EditionedFileId::new(ctx.sema.db.as_dyn_database(), range.file_id);
-
-    let file = ctx.sema.parse(editioned_file_id);
+    let file = ctx.sema.parse(range.file_id);
     let adt_source =
         ctx.sema.find_node_at_offset_with_macros(file.syntax(), range.range.start())?;
     find_struct_impl(ctx, &adt_source, &[fn_name.to_owned()])
-        .map(|impl_| (impl_, range.file_id.file_id()))
+        .map(|impl_| (impl_, range.file_id.file_id(ctx.db())))
 }
 
 struct FunctionBuilder {
@@ -280,7 +277,11 @@ impl FunctionBuilder {
                 target_module,
                 &mut necessary_generic_params,
             );
-            let placeholder_expr = make::ext::expr_todo();
+            let placeholder_expr = match ctx.config.expr_fill_default {
+                ExprFillDefaultMode::Todo => make::ext::expr_todo(),
+                ExprFillDefaultMode::Underscore => make::ext::expr_underscore(),
+                ExprFillDefaultMode::Default => make::ext::expr_todo(),
+            };
             fn_body = make::block_expr(vec![], Some(placeholder_expr));
         };
 
@@ -335,7 +336,11 @@ impl FunctionBuilder {
         let (generic_param_list, where_clause) =
             fn_generic_params(ctx, necessary_generic_params, &target)?;
 
-        let placeholder_expr = make::ext::expr_todo();
+        let placeholder_expr = match ctx.config.expr_fill_default {
+            ExprFillDefaultMode::Todo => make::ext::expr_todo(),
+            ExprFillDefaultMode::Underscore => make::ext::expr_underscore(),
+            ExprFillDefaultMode::Default => make::ext::expr_todo(),
+        };
         let fn_body = make::block_expr(vec![], Some(placeholder_expr));
 
         Some(Self {
@@ -387,14 +392,14 @@ impl FunctionBuilder {
                 // Focus the return type if there is one
                 match ret_type {
                     Some(ret_type) => {
-                        edit.add_placeholder_snippet(cap, ret_type.clone());
+                        edit.add_placeholder_snippet(cap, ret_type);
                     }
                     None => {
-                        edit.add_placeholder_snippet(cap, tail_expr.clone());
+                        edit.add_placeholder_snippet(cap, tail_expr);
                     }
                 }
             } else {
-                edit.add_placeholder_snippet(cap, tail_expr.clone());
+                edit.add_placeholder_snippet(cap, tail_expr);
             }
         }
 
@@ -448,7 +453,11 @@ fn make_fn_body_as_new_function(
     let adt_info = adt_info.as_ref()?;
 
     let path_self = make::ext::ident_path("Self");
-    let placeholder_expr = make::ext::expr_todo();
+    let placeholder_expr = match ctx.config.expr_fill_default {
+        ExprFillDefaultMode::Todo => make::ext::expr_todo(),
+        ExprFillDefaultMode::Underscore => make::ext::expr_underscore(),
+        ExprFillDefaultMode::Default => make::ext::expr_todo(),
+    };
     let tail_expr = if let Some(strukt) = adt_info.adt.as_struct() {
         match strukt.kind(ctx.db()) {
             StructKind::Record => {
@@ -475,7 +484,7 @@ fn make_fn_body_as_new_function(
                     .map(|_| placeholder_expr.clone())
                     .collect::<Vec<_>>();
 
-                make::expr_call(make::expr_path(path_self), make::arg_list(args))
+                make::expr_call(make::expr_path(path_self), make::arg_list(args)).into()
             }
             StructKind::Unit => make::expr_path(path_self),
         }
@@ -501,7 +510,7 @@ fn get_fn_target(
     target_module: Option<Module>,
     call: CallExpr,
 ) -> Option<(GeneratedFunctionTarget, FileId)> {
-    let mut file = ctx.file_id().into();
+    let mut file = ctx.vfs_file_id();
     let target = match target_module {
         Some(target_module) => {
             let (in_file, target) = next_space_for_fn_in_module(ctx.db(), target_module);
@@ -1166,7 +1175,7 @@ fn next_space_for_fn_in_module(
     target_module: hir::Module,
 ) -> (FileId, GeneratedFunctionTarget) {
     let module_source = target_module.definition_source(db);
-    let file = module_source.file_id.original_file(db.upcast());
+    let file = module_source.file_id.original_file(db);
     let assist_item = match &module_source.value {
         hir::ModuleSource::SourceFile(it) => match it.items().last() {
             Some(last_item) => GeneratedFunctionTarget::AfterItem(last_item.syntax().clone()),
@@ -1191,7 +1200,7 @@ fn next_space_for_fn_in_module(
         }
     };
 
-    (file.file_id(), assist_item)
+    (file.file_id(db), assist_item)
 }
 
 #[derive(Clone, Copy)]
@@ -1509,7 +1518,7 @@ fn foo() {
     bar("bar")
 }
 
-fn bar(arg: &str) {
+fn bar(arg: &'static str) {
     ${0:todo!()}
 }
 "#,
@@ -2126,7 +2135,7 @@ fn foo() {
     bar(baz(), baz(), "foo", "bar")
 }
 
-fn bar(baz_1: Baz, baz_2: Baz, arg_1: &str, arg_2: &str) {
+fn bar(baz_1: Baz, baz_2: Baz, arg_1: &'static str, arg_2: &'static str) {
     ${0:todo!()}
 }
 "#,
@@ -3094,7 +3103,7 @@ pub struct Foo {
     field_2: String,
 }
 impl Foo {
-    fn new(baz_1: Baz, baz_2: Baz, arg_1: &str, arg_2: &str) -> Self {
+    fn new(baz_1: Baz, baz_2: Baz, arg_1: &'static str, arg_2: &'static str) -> Self {
         ${0:Self { field_1: todo!(), field_2: todo!() }}
     }
 }

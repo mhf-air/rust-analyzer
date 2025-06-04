@@ -69,8 +69,7 @@ impl InferenceContext<'_> {
                 }
             }
             Expr::Const(id) => {
-                let loc = self.db.lookup_intern_anonymous_const(*id);
-                self.infer_mut_expr(loc.root, Mutability::Not);
+                self.infer_mut_expr(*id, Mutability::Not);
             }
             Expr::Let { pat, expr } => self.infer_mut_expr(*expr, self.pat_bound_mutability(*pat)),
             Expr::Block { id: _, statements, tail, label: _ }
@@ -127,15 +126,13 @@ impl InferenceContext<'_> {
             &Expr::Index { base, index } => {
                 if mutability == Mutability::Mut {
                     if let Some((f, _)) = self.result.method_resolutions.get_mut(&tgt_expr) {
-                        if let Some(index_trait) = self
-                            .db
-                            .lang_item(self.table.trait_env.krate, LangItem::IndexMut)
-                            .and_then(|l| l.as_trait())
+                        if let Some(index_trait) =
+                            LangItem::IndexMut.resolve_trait(self.db, self.table.trait_env.krate)
                         {
                             if let Some(index_fn) = self
                                 .db
                                 .trait_items(index_trait)
-                                .method_by_name(&Name::new_symbol_root(sym::index_mut.clone()))
+                                .method_by_name(&Name::new_symbol_root(sym::index_mut))
                             {
                                 *f = index_fn;
                                 let mut base_ty = None;
@@ -184,10 +181,8 @@ impl InferenceContext<'_> {
                 let mut mutability = mutability;
                 if let Some((f, _)) = self.result.method_resolutions.get_mut(&tgt_expr) {
                     if mutability == Mutability::Mut {
-                        if let Some(deref_trait) = self
-                            .db
-                            .lang_item(self.table.trait_env.krate, LangItem::DerefMut)
-                            .and_then(|l| l.as_trait())
+                        if let Some(deref_trait) =
+                            LangItem::DerefMut.resolve_trait(self.db, self.table.trait_env.krate)
                         {
                             let ty = self.result.type_of_expr.get(*expr);
                             let is_mut_ptr = ty.is_some_and(|ty| {
@@ -202,7 +197,7 @@ impl InferenceContext<'_> {
                             } else if let Some(deref_fn) = self
                                 .db
                                 .trait_items(deref_trait)
-                                .method_by_name(&Name::new_symbol_root(sym::deref_mut.clone()))
+                                .method_by_name(&Name::new_symbol_root(sym::deref_mut))
                             {
                                 *f = deref_fn;
                             }

@@ -45,18 +45,18 @@ pub mod syntax_helpers {
     pub use parser::LexedStr;
 }
 
-pub use hir::ChangeWithProcMacros;
+pub use hir::{ChangeWithProcMacros, EditionedFileId};
 use salsa::Durability;
 
 use std::{fmt, mem::ManuallyDrop};
 
 use base_db::{
     CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, Files, RootQueryDb,
-    SourceDatabase, SourceRoot, SourceRootId, SourceRootInput, Upcast, query_group,
+    SourceDatabase, SourceRoot, SourceRootId, SourceRootInput, query_group,
 };
 use hir::{
     FilePositionWrapper, FileRangeWrapper,
-    db::{DefDatabase, ExpandDatabase, HirDatabase},
+    db::{DefDatabase, ExpandDatabase},
 };
 use triomphe::Arc;
 
@@ -67,7 +67,7 @@ pub use ::line_index;
 
 /// `base_db` is normally also needed in places where `ide_db` is used, so this re-export is for convenience.
 pub use base_db;
-pub use span::{EditionedFileId, FileId};
+pub use span::{self, FileId};
 
 pub type FxIndexSet<T> = indexmap::IndexSet<T, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 pub type FxIndexMap<K, V> =
@@ -76,8 +76,10 @@ pub type FxIndexMap<K, V> =
 pub type FilePosition = FilePositionWrapper<FileId>;
 pub type FileRange = FileRangeWrapper<FileId>;
 
-#[salsa::db]
+#[salsa_macros::db]
 pub struct RootDatabase {
+    // FIXME: Revisit this commit now that we migrated to the new salsa, given we store arcs in this
+    // db directly now
     // We use `ManuallyDrop` here because every codegen unit that contains a
     // `&RootDatabase -> &dyn OtherDatabase` cast will instantiate its drop glue in the vtable,
     // which duplicates `Weak::drop` and `Arc::drop` tens of thousands of times, which makes
@@ -89,10 +91,8 @@ pub struct RootDatabase {
 
 impl std::panic::RefUnwindSafe for RootDatabase {}
 
-#[salsa::db]
-impl salsa::Database for RootDatabase {
-    fn salsa_event(&self, _event: &dyn Fn() -> salsa::Event) {}
-}
+#[salsa_macros::db]
+impl salsa::Database for RootDatabase {}
 
 impl Drop for RootDatabase {
     fn drop(&mut self) {
@@ -116,40 +116,7 @@ impl fmt::Debug for RootDatabase {
     }
 }
 
-impl Upcast<dyn ExpandDatabase> for RootDatabase {
-    #[inline]
-    fn upcast(&self) -> &(dyn ExpandDatabase + 'static) {
-        self
-    }
-}
-
-impl Upcast<dyn DefDatabase> for RootDatabase {
-    #[inline]
-    fn upcast(&self) -> &(dyn DefDatabase + 'static) {
-        self
-    }
-}
-
-impl Upcast<dyn HirDatabase> for RootDatabase {
-    #[inline]
-    fn upcast(&self) -> &(dyn HirDatabase + 'static) {
-        self
-    }
-}
-
-impl Upcast<dyn RootQueryDb> for RootDatabase {
-    fn upcast(&self) -> &(dyn RootQueryDb + 'static) {
-        self
-    }
-}
-
-impl Upcast<dyn SourceDatabase> for RootDatabase {
-    fn upcast(&self) -> &(dyn SourceDatabase + 'static) {
-        self
-    }
-}
-
-#[salsa::db]
+#[salsa_macros::db]
 impl SourceDatabase for RootDatabase {
     fn file_text(&self, file_id: vfs::FileId) -> FileText {
         self.files.file_text(file_id)
@@ -267,18 +234,11 @@ impl RootDatabase {
         // );
         // hir::db::BodyWithSourceMapQuery.in_db_mut(self).set_lru_capacity(2048);
     }
-
-    pub fn snapshot(&self) -> Self {
-        Self {
-            storage: self.storage.clone(),
-            files: self.files.clone(),
-            crates_map: self.crates_map.clone(),
-        }
-    }
 }
 
 #[query_group::query_group]
 pub trait LineIndexDatabase: base_db::RootQueryDb {
+    #[salsa::invoke_interned(line_index)]
     fn line_index(&self, file_id: FileId) -> Arc<LineIndex>;
 }
 

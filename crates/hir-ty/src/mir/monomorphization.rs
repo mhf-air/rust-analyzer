@@ -19,13 +19,13 @@ use triomphe::Arc;
 use crate::{
     Const, Interner, ProjectionTy, Substitution, TraitEnvironment, Ty, TyKind,
     consteval::{intern_const_scalar, unknown_const},
-    db::{HirDatabase, HirDatabaseData, InternedClosure, InternedClosureId},
+    db::{HirDatabase, InternedClosure, InternedClosureId},
     from_placeholder_idx,
     generics::{Generics, generics},
     infer::normalize,
 };
 
-use super::{MirBody, MirLowerError, Operand, Rvalue, StatementKind, TerminatorKind};
+use super::{MirBody, MirLowerError, Operand, OperandKind, Rvalue, StatementKind, TerminatorKind};
 
 macro_rules! not_supported {
     ($it: expr) => {
@@ -77,7 +77,7 @@ impl FallibleTypeFolder<Interner> for Filler<'_> {
                             owner: self.owner,
                             trait_env: self.trait_env.clone(),
                             subst: &subst,
-                            generics: Some(generics(self.db.upcast(), func.into())),
+                            generics: Some(generics(self.db, func.into())),
                         };
                         filler.try_fold_ty(infer.type_of_rpit[idx].clone(), outer_binder)
                     }
@@ -170,8 +170,8 @@ impl Filler<'_> {
     }
 
     fn fill_operand(&mut self, op: &mut Operand) -> Result<(), MirLowerError> {
-        match op {
-            Operand::Constant(c) => {
+        match &mut op.kind {
+            OperandKind::Constant(c) => {
                 match &c.data(Interner).value {
                     chalk_ir::ConstValue::BoundVar(b) => {
                         let resolved = self
@@ -215,7 +215,7 @@ impl Filler<'_> {
                 }
                 self.fill_const(c)?;
             }
-            Operand::Copy(_) | Operand::Move(_) | Operand::Static(_) => (),
+            OperandKind::Copy(_) | OperandKind::Move(_) | OperandKind::Static(_) => (),
         }
         Ok(())
     }
@@ -305,7 +305,7 @@ pub fn monomorphized_mir_body_query(
     subst: Substitution,
     trait_env: Arc<crate::TraitEnvironment>,
 ) -> Result<Arc<MirBody>, MirLowerError> {
-    let generics = owner.as_generic_def_id(db.upcast()).map(|g_def| generics(db.upcast(), g_def));
+    let generics = owner.as_generic_def_id(db).map(|g_def| generics(db, g_def));
     let filler = &mut Filler { db, subst: &subst, trait_env, generics, owner };
     let body = db.mir_body(owner)?;
     let mut body = (*body).clone();
@@ -313,10 +313,8 @@ pub fn monomorphized_mir_body_query(
     Ok(Arc::new(body))
 }
 
-pub(crate) fn monomorphized_mir_body_recover(
-    _: &dyn HirDatabase,
-    _: &salsa::Cycle,
-    _: HirDatabaseData,
+pub(crate) fn monomorphized_mir_body_cycle_result(
+    _db: &dyn HirDatabase,
     _: DefWithBodyId,
     _: Substitution,
     _: Arc<crate::TraitEnvironment>,
@@ -331,7 +329,7 @@ pub fn monomorphized_mir_body_for_closure_query(
     trait_env: Arc<crate::TraitEnvironment>,
 ) -> Result<Arc<MirBody>, MirLowerError> {
     let InternedClosure(owner, _) = db.lookup_intern_closure(closure);
-    let generics = owner.as_generic_def_id(db.upcast()).map(|g_def| generics(db.upcast(), g_def));
+    let generics = owner.as_generic_def_id(db).map(|g_def| generics(db, g_def));
     let filler = &mut Filler { db, subst: &subst, trait_env, generics, owner };
     let body = db.mir_body_for_closure(closure)?;
     let mut body = (*body).clone();
@@ -347,7 +345,7 @@ pub fn monomorphize_mir_body_bad(
     trait_env: Arc<crate::TraitEnvironment>,
 ) -> Result<MirBody, MirLowerError> {
     let owner = body.owner;
-    let generics = owner.as_generic_def_id(db.upcast()).map(|g_def| generics(db.upcast(), g_def));
+    let generics = owner.as_generic_def_id(db).map(|g_def| generics(db, g_def));
     let filler = &mut Filler { db, subst: &subst, trait_env, generics, owner };
     filler.fill_body(&mut body)?;
     Ok(body)

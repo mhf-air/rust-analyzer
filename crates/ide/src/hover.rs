@@ -58,6 +58,7 @@ pub struct MemoryLayoutHoverConfig {
     pub size: Option<MemoryLayoutHoverRenderKind>,
     pub offset: Option<MemoryLayoutHoverRenderKind>,
     pub alignment: Option<MemoryLayoutHoverRenderKind>,
+    pub padding: Option<MemoryLayoutHoverRenderKind>,
     pub niches: bool,
 }
 
@@ -133,7 +134,7 @@ pub(crate) fn hover(
     let sema = &hir::Semantics::new(db);
     let file = sema.parse_guess_edition(file_id).syntax().clone();
     let edition =
-        sema.attach_first_edition(file_id).map(|it| it.edition()).unwrap_or(Edition::CURRENT);
+        sema.attach_first_edition(file_id).map(|it| it.edition(db)).unwrap_or(Edition::CURRENT);
     let display_target = sema.first_crate(file_id)?.to_display_target(db);
     let mut res = if range.is_empty() {
         hover_offset(
@@ -199,7 +200,7 @@ fn hover_offset(
         });
     }
 
-    if let Some((range, resolution)) =
+    if let Some((range, _, _, resolution)) =
         sema.check_for_format_args_template(original_token.clone(), offset)
     {
         let res = hover_for_definition(
@@ -456,7 +457,7 @@ pub(crate) fn hover_for_definition(
     let notable_traits = def_ty.map(|ty| notable_traits(db, &ty)).unwrap_or_default();
     let subst_types = subst.map(|subst| subst.types(db));
 
-    let markup = render::definition(
+    let (markup, range_map) = render::definition(
         sema.db,
         def,
         famous_defs.as_ref(),
@@ -469,7 +470,7 @@ pub(crate) fn hover_for_definition(
         display_target,
     );
     HoverResult {
-        markup: render::process_markup(sema.db, def, &markup, config),
+        markup: render::process_markup(sema.db, def, &markup, range_map, config),
         actions: [
             show_fn_references_action(sema.db, def),
             show_implementations_action(sema.db, def),
@@ -505,6 +506,7 @@ fn notable_traits(
                 )
             })
         })
+        .sorted_by_cached_key(|(trait_, _)| trait_.name(db))
         .collect::<Vec<_>>()
 }
 
@@ -550,7 +552,7 @@ fn runnable_action(
         Definition::Module(it) => runnable_mod(sema, it).map(HoverAction::Runnable),
         Definition::Function(func) => {
             let src = func.source(sema.db)?;
-            if src.file_id != file_id {
+            if src.file_id.file_id().is_none_or(|f| f.file_id(sema.db) != file_id) {
                 cov_mark::hit!(hover_macro_generated_struct_fn_doc_comment);
                 cov_mark::hit!(hover_macro_generated_struct_fn_doc_attr);
                 return None;
@@ -633,9 +635,7 @@ fn walk_and_push_ty(
         } else if let Some(trait_) = t.as_associated_type_parent_trait(db) {
             push_new_def(trait_.into());
         } else if let Some(tp) = t.as_type_param(db) {
-            let sized_trait = db
-                .lang_item(t.krate(db).into(), LangItem::Sized)
-                .and_then(|lang_item| lang_item.as_trait());
+            let sized_trait = LangItem::Sized.resolve_trait(db, t.krate(db).into());
             tp.trait_bounds(db)
                 .into_iter()
                 .filter(|&it| Some(it.into()) != sized_trait)

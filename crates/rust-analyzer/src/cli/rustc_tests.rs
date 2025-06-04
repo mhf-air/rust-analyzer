@@ -7,6 +7,7 @@ use std::{cell::RefCell, fs::read_to_string, panic::AssertUnwindSafe, path::Path
 
 use hir::{ChangeWithProcMacros, Crate};
 use ide::{AnalysisHost, DiagnosticCode, DiagnosticsConfig};
+use ide_db::base_db;
 use itertools::Either;
 use paths::Utf8PathBuf;
 use profile::StopWatch;
@@ -139,7 +140,7 @@ impl Tester {
             FxHashMap::default()
         };
         let text = read_to_string(&p).unwrap();
-        let mut change = ChangeWithProcMacros::new();
+        let mut change = ChangeWithProcMacros::default();
         // Ignore unstable tests, since they move too fast and we do not intend to support all of them.
         let mut ignore_test = text.contains("#![feature");
         // Ignore test with extern crates, as this infra don't support them yet.
@@ -310,7 +311,7 @@ impl flags::RustcTests {
                 let tester = AssertUnwindSafe(&mut tester);
                 let p = p.clone();
                 move || {
-                    let _guard = stdx::panic_context::enter(p.display().to_string());
+                    let _guard = base_db::DbPanicContext::enter(p.display().to_string());
                     { tester }.0.test(p);
                 }
             }) {

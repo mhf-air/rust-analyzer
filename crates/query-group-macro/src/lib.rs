@@ -10,9 +10,14 @@ use queries::{
     Queries, SetterKind, TrackedQuery, Transparent,
 };
 use quote::{ToTokens, format_ident, quote};
+use syn::parse::{Parse, ParseStream};
+use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;
-use syn::{Attribute, FnArg, ItemTrait, Path, TraitItem, TraitItemFn, parse_quote};
+use syn::{
+    Attribute, FnArg, ItemTrait, Path, Token, TraitItem, TraitItemFn, parse_quote,
+    parse_quote_spanned,
+};
 
 mod queries;
 
@@ -104,6 +109,66 @@ enum QueryKind {
     Interned,
 }
 
+#[derive(Default, Debug, Clone)]
+struct Cycle {
+    cycle_fn: Option<(syn::Ident, Path)>,
+    cycle_initial: Option<(syn::Ident, Path)>,
+    cycle_result: Option<(syn::Ident, Path)>,
+}
+
+impl Parse for Cycle {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let options = Punctuated::<Option, Token![,]>::parse_terminated(input)?;
+        let mut cycle_fn = None;
+        let mut cycle_initial = None;
+        let mut cycle_result = None;
+        for option in options {
+            let name = option.name.to_string();
+            match &*name {
+                "cycle_fn" => {
+                    if cycle_fn.is_some() {
+                        return Err(syn::Error::new_spanned(&option.name, "duplicate option"));
+                    }
+                    cycle_fn = Some((option.name, option.value));
+                }
+                "cycle_initial" => {
+                    if cycle_initial.is_some() {
+                        return Err(syn::Error::new_spanned(&option.name, "duplicate option"));
+                    }
+                    cycle_initial = Some((option.name, option.value));
+                }
+                "cycle_result" => {
+                    if cycle_result.is_some() {
+                        return Err(syn::Error::new_spanned(&option.name, "duplicate option"));
+                    }
+                    cycle_result = Some((option.name, option.value));
+                }
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        &option.name,
+                        "unknown cycle option. Accepted values: `cycle_result`, `cycle_fn`, `cycle_initial`",
+                    ));
+                }
+            }
+        }
+        return Ok(Self { cycle_fn, cycle_initial, cycle_result });
+
+        struct Option {
+            name: syn::Ident,
+            value: Path,
+        }
+
+        impl Parse for Option {
+            fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+                let name = input.parse()?;
+                input.parse::<Token![=]>()?;
+                let value = input.parse()?;
+                Ok(Self { name, value })
+            }
+        }
+    }
+}
+
 pub(crate) fn query_group_impl(
     _args: proc_macro::TokenStream,
     input: proc_macro::TokenStream,
@@ -113,7 +178,7 @@ pub(crate) fn query_group_impl(
     let supertraits = &item_trait.supertraits;
 
     let db_attr: Attribute = parse_quote! {
-        #[salsa::db]
+        #[salsa_macros::db]
     };
     item_trait.attrs.push(db_attr);
 
@@ -127,14 +192,14 @@ pub(crate) fn query_group_impl(
     let mut lookup_signatures = vec![];
     let mut lookup_methods = vec![];
 
-    for item in item_trait.clone().items {
+    for item in &mut item_trait.items {
         if let syn::TraitItem::Fn(method) = item {
             let method_name = &method.sig.ident;
-            let signature = &method.sig.clone();
+            let signature = &method.sig;
 
-            let (_attrs, salsa_attrs) = filter_attrs(method.attrs);
+            let (_attrs, salsa_attrs) = filter_attrs(method.attrs.clone());
 
-            let mut query_kind = QueryKind::Tracked;
+            let mut query_kind = QueryKind::TrackedWithSalsaStruct;
             let mut invoke = None;
             let mut cycle = None;
             let mut interned_struct_path = None;
@@ -145,7 +210,7 @@ pub(crate) fn query_group_impl(
                 .into_iter()
                 .filter(|fn_arg| matches!(fn_arg, FnArg::Typed(_)))
                 .map(|fn_arg| match fn_arg {
-                    FnArg::Typed(pat_type) => pat_type.clone(),
+                    FnArg::Typed(pat_type) => pat_type,
                     FnArg::Receiver(_) => unreachable!("this should have been filtered out"),
                 })
                 .collect::<Vec<syn::PatType>>();
@@ -153,8 +218,8 @@ pub(crate) fn query_group_impl(
             for SalsaAttr { name, tts, span } in salsa_attrs {
                 match name.as_str() {
                     "cycle" => {
-                        let path = syn::parse::<Parenthesized<Path>>(tts)?;
-                        cycle = Some(path.0.clone())
+                        let c = syn::parse::<Parenthesized<Cycle>>(tts)?;
+                        cycle = Some(c.0);
                     }
                     "input" => {
                         if !pat_and_tys.is_empty() {
@@ -181,13 +246,19 @@ pub(crate) fn query_group_impl(
                         interned_struct_path = Some(path.path.clone());
                         query_kind = QueryKind::Interned;
                     }
+                    "invoke_interned" => {
+                        let path = syn::parse::<Parenthesized<Path>>(tts)?;
+                        invoke = Some(path.0.clone());
+                        query_kind = QueryKind::Tracked;
+                    }
                     "invoke" => {
                         let path = syn::parse::<Parenthesized<Path>>(tts)?;
                         invoke = Some(path.0.clone());
+                        if query_kind != QueryKind::Transparent {
+                            query_kind = QueryKind::TrackedWithSalsaStruct;
+                        }
                     }
-                    "invoke_actual" => {
-                        let path = syn::parse::<Parenthesized<Path>>(tts)?;
-                        invoke = Some(path.0.clone());
+                    "tracked" if method.default.is_some() => {
                         query_kind = QueryKind::TrackedWithSalsaStruct;
                     }
                     "lru" => {
@@ -216,6 +287,10 @@ pub(crate) fn query_group_impl(
 
                     input_struct_fields.push(field);
                 }
+            }
+
+            if let Some(block) = &mut method.default {
+                SelfToDbRewriter.visit_block_mut(block);
             }
 
             match (query_kind, invoke) {
@@ -277,31 +352,31 @@ pub(crate) fn query_group_impl(
                         invoke,
                         cycle,
                         lru,
+                        default: method.default.take(),
                     };
 
                     trait_methods.push(Queries::TrackedQuery(method));
                 }
-                (QueryKind::TrackedWithSalsaStruct, Some(invoke)) => {
+                (QueryKind::TrackedWithSalsaStruct, invoke) => {
                     let method = TrackedQuery {
                         trait_name: trait_name_ident.clone(),
                         generated_struct: None,
                         signature: signature.clone(),
                         pat_and_tys: pat_and_tys.clone(),
-                        invoke: Some(invoke),
+                        invoke,
                         cycle,
                         lru,
+                        default: method.default.take(),
                     };
 
                     trait_methods.push(Queries::TrackedQuery(method))
                 }
-                // while it is possible to make this reachable, it's not really worthwhile for a migration aid.
-                // doing this would require attaching an attribute to the salsa struct parameter in the query.
-                (QueryKind::TrackedWithSalsaStruct, None) => unreachable!(),
                 (QueryKind::Transparent, invoke) => {
                     let method = Transparent {
                         signature: method.sig.clone(),
                         pat_and_tys: pat_and_tys.clone(),
                         invoke,
+                        default: method.default.take(),
                     };
                     trait_methods.push(Queries::Transparent(method));
                 }
@@ -332,7 +407,7 @@ pub(crate) fn query_group_impl(
         .collect::<Vec<proc_macro2::TokenStream>>();
 
     let input_struct = quote! {
-        #[salsa::input]
+        #[salsa_macros::input]
         pub(crate) struct #input_struct_name {
             #(#fields),*
         }
@@ -343,7 +418,7 @@ pub(crate) fn query_group_impl(
 
     let create_data_method = quote! {
         #[allow(non_snake_case)]
-        #[salsa::tracked]
+        #[salsa_macros::tracked]
         fn #create_data_ident(db: &dyn #trait_name_ident) -> #input_struct_name {
             #input_struct_name::new(db, #(#field_params),*)
         }
@@ -368,7 +443,7 @@ pub(crate) fn query_group_impl(
     item_trait.items.append(&mut lookup_signatures);
 
     let trait_impl = quote! {
-        #[salsa::db]
+        #[salsa_macros::db]
         impl<DB> #trait_name_ident for DB
         where
             DB: #supertraits,
@@ -403,7 +478,7 @@ impl<T> syn::parse::Parse for Parenthesized<T>
 where
     T: syn::parse::Parse,
 {
-    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let content;
         syn::parenthesized!(content in input);
         content.parse::<T>().map(Parenthesized)
@@ -434,4 +509,14 @@ impl VisitMut for RemoveAttrsFromTraitMethods {
 pub(crate) fn token_stream_with_error(mut tokens: TokenStream, error: syn::Error) -> TokenStream {
     tokens.extend(TokenStream::from(error.into_compile_error()));
     tokens
+}
+
+struct SelfToDbRewriter;
+
+impl VisitMut for SelfToDbRewriter {
+    fn visit_expr_path_mut(&mut self, i: &mut syn::ExprPath) {
+        if i.path.is_ident("self") {
+            i.path = parse_quote_spanned!(i.path.span() => db);
+        }
+    }
 }

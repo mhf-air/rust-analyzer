@@ -54,12 +54,12 @@ pub(crate) fn remove_parentheses(acc: &mut Assists, ctx: &AssistContext<'_>) -> 
                 None => false,
             };
             if need_to_add_ws {
-                let make = SyntaxFactory::new();
+                let make = SyntaxFactory::with_mappings();
                 editor.insert(Position::before(parens.syntax()), make.whitespace(" "));
                 editor.add_mappings(make.finish_with_mappings());
             }
             editor.replace(parens.syntax(), expr.syntax());
-            builder.add_file_edits(ctx.file_id(), editor);
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }

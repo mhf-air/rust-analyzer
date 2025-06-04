@@ -33,6 +33,7 @@ pub(crate) fn inactive_code(
         message,
         ctx.sema.diagnostics_display_range(d.node),
     )
+    .stable()
     .with_unused(true);
     Some(res)
 }
@@ -41,6 +42,7 @@ pub(crate) fn inactive_code(
 mod tests {
     use crate::{DiagnosticsConfig, tests::check_diagnostics_with_config};
 
+    #[track_caller]
     pub(crate) fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
         let config = DiagnosticsConfig {
             disabled: std::iter::once("unlinked-file".to_owned()).collect(),

@@ -1,13 +1,12 @@
 //! Expansion of associated items
 
 use hir_expand::{AstId, InFile, Intern, Lookup, MacroCallKind, MacroDefKind, name::Name};
-use span::MacroCallId;
 use syntax::ast;
 use triomphe::Arc;
 
 use crate::{
     AssocItemId, AstIdWithPath, ConstLoc, FunctionId, FunctionLoc, ImplId, ItemContainerId,
-    ItemLoc, ModuleId, TraitId, TypeAliasId, TypeAliasLoc,
+    ItemLoc, MacroCallId, ModuleId, TraitId, TypeAliasId, TypeAliasLoc,
     db::DefDatabase,
     item_tree::{AssocItem, ItemTree, ItemTreeId, MacroCall, ModItem, TreeId},
     macro_call_as_call_id,
@@ -67,7 +66,16 @@ impl TraitItems {
         })
     }
 
-    pub fn attribute_calls(&self) -> impl Iterator<Item = (AstId<ast::Item>, MacroCallId)> + '_ {
+    pub fn assoc_item_by_name(&self, name: &Name) -> Option<AssocItemId> {
+        self.items.iter().find_map(|&(ref item_name, item)| match item {
+            AssocItemId::FunctionId(_) if item_name == name => Some(item),
+            AssocItemId::TypeAliasId(_) if item_name == name => Some(item),
+            AssocItemId::ConstId(_) if item_name == name => Some(item),
+            _ => None,
+        })
+    }
+
+    pub fn macro_calls(&self) -> impl Iterator<Item = (AstId<ast::Item>, MacroCallId)> + '_ {
         self.macro_calls.iter().flat_map(|it| it.iter()).copied()
     }
 }
@@ -101,7 +109,7 @@ impl ImplItems {
         (Arc::new(ImplItems { items, macro_calls }), DefDiagnostics::new(diagnostics))
     }
 
-    pub fn attribute_calls(&self) -> impl Iterator<Item = (AstId<ast::Item>, MacroCallId)> + '_ {
+    pub fn macro_calls(&self) -> impl Iterator<Item = (AstId<ast::Item>, MacroCallId)> + '_ {
         self.macro_calls.iter().flat_map(|it| it.iter()).copied()
     }
 }
@@ -109,8 +117,8 @@ impl ImplItems {
 struct AssocItemCollector<'a> {
     db: &'a dyn DefDatabase,
     module_id: ModuleId,
-    def_map: Arc<DefMap>,
-    local_def_map: Arc<LocalDefMap>,
+    def_map: &'a DefMap,
+    local_def_map: &'a LocalDefMap,
     diagnostics: Vec<DefDiagnostic>,
     container: ItemContainerId,
 
@@ -175,7 +183,7 @@ impl<'a> AssocItemCollector<'a> {
             let ast_id_with_path = AstIdWithPath { path: attr.path.clone(), ast_id };
 
             match self.def_map.resolve_attr_macro(
-                &self.local_def_map,
+                self.local_def_map,
                 self.db,
                 self.module_id.local_id,
                 ast_id_with_path,
@@ -247,7 +255,7 @@ impl<'a> AssocItemCollector<'a> {
                 let resolver = |path: &_| {
                     self.def_map
                         .resolve_path(
-                            &self.local_def_map,
+                            self.local_def_map,
                             self.db,
                             self.module_id.local_id,
                             path,
@@ -259,19 +267,26 @@ impl<'a> AssocItemCollector<'a> {
                         .map(|it| self.db.macro_def(it))
                 };
                 match macro_call_as_call_id(
-                    self.db.upcast(),
-                    &AstIdWithPath::new(tree_id.file_id(), ast_id, Clone::clone(path)),
+                    self.db,
+                    InFile::new(tree_id.file_id(), ast_id),
+                    path,
                     ctxt,
                     expand_to,
                     self.module_id.krate(),
                     resolver,
+                    &mut |ptr, call_id| {
+                        self.macro_calls.push((ptr.map(|(_, it)| it.upcast()), call_id))
+                    },
                 ) {
-                    Ok(Some(call_id)) => {
-                        self.macro_calls
-                            .push((InFile::new(tree_id.file_id(), ast_id.upcast()), call_id));
-                        self.collect_macro_items(call_id);
-                    }
-                    Ok(None) => (),
+                    // FIXME: Expansion error?
+                    Ok(call_id) => match call_id.value {
+                        Some(call_id) => {
+                            self.macro_calls
+                                .push((InFile::new(tree_id.file_id(), ast_id.upcast()), call_id));
+                            self.collect_macro_items(call_id);
+                        }
+                        None => (),
+                    },
                     Err(_) => {
                         self.diagnostics.push(DefDiagnostic::unresolved_macro_call(
                             self.module_id.local_id,
@@ -293,9 +308,8 @@ impl<'a> AssocItemCollector<'a> {
             tracing::warn!("macro expansion is too deep");
             return;
         }
-        let file_id = macro_call_id.as_file();
-        let tree_id = TreeId::new(file_id, None);
-        let item_tree = self.db.file_item_tree(file_id);
+        let tree_id = TreeId::new(macro_call_id.into(), None);
+        let item_tree = self.db.file_item_tree(macro_call_id.into());
 
         self.depth += 1;
         for item in item_tree.top_level_items().iter().filter_map(ModItem::as_assoc_item) {

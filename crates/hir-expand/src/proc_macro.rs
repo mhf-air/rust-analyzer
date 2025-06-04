@@ -19,18 +19,8 @@ pub enum ProcMacroKind {
     Attr,
 }
 
-pub trait AsAny: Any {
-    fn as_any(&self) -> &dyn Any;
-}
-
-impl<T: Any> AsAny for T {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
 /// A proc-macro expander implementation.
-pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + AsAny {
+pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
     /// Run the expander with the given input subtree, optional attribute input subtree (for
     /// [`ProcMacroKind::Attr`]), environment variables, and span information.
     fn expand(
@@ -44,7 +34,9 @@ pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + AsAny {
         current_dir: String,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError>;
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool;
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+        other.type_id() == self.type_id()
+    }
 }
 
 impl PartialEq for dyn ProcMacroExpander {
@@ -253,7 +245,6 @@ impl CustomProcMacroExpander {
         self.proc_macro_id == Self::PROC_MACRO_ATTR_DISABLED
     }
 
-    /// The macro is explicitly disabled due to proc-macro attribute expansion being disabled.
     pub fn as_expand_error(&self, def_crate: Crate) -> Option<ExpandErrorKind> {
         match self.proc_macro_id {
             Self::PROC_MACRO_ATTR_DISABLED => Some(ExpandErrorKind::ProcMacroAttrExpansionDisabled),

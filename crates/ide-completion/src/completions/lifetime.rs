@@ -31,13 +31,13 @@ pub(crate) fn complete_lifetime(
             acc.add_lifetime(ctx, name);
         }
     });
-    acc.add_lifetime(ctx, Name::new_symbol_root(sym::tick_static.clone()));
+    acc.add_lifetime(ctx, Name::new_symbol_root(sym::tick_static));
     if !in_lifetime_param_bound
         && def.is_some_and(|def| {
             !matches!(def, hir::GenericDef::Function(_) | hir::GenericDef::Impl(_))
         })
     {
-        acc.add_lifetime(ctx, Name::new_symbol_root(sym::tick_underscore.clone()));
+        acc.add_lifetime(ctx, Name::new_symbol_root(sym::tick_underscore));
     }
 }
 
@@ -116,13 +116,13 @@ fn foo<'lifetime>(foo: &'a$0) {}
         check(
             r#"
 struct Foo;
-impl<'impl> Foo {
+impl<'r#impl> Foo {
     fn foo<'func>(&'a$0 self) {}
 }
 "#,
             expect![[r#"
                 lt 'func
-                lt 'impl
+                lt 'r#impl
                 lt 'static
             "#]],
         );

@@ -8,6 +8,14 @@
 //! for text occurrences of the identifier. If there's an `ast::NameRef`
 //! at the index that the match starts at and its tree parent is
 //! resolved to the search element definition, we get a reference.
+//!
+//! Special handling for constructors/initializations:
+//! When searching for references to a struct/enum/variant, if the cursor is positioned on:
+//! - `{` after a struct/enum/variant definition
+//! - `(` for tuple structs/variants
+//! - `;` for unit structs
+//! - The type name in a struct/enum/variant definition
+//!   Then only constructor/initialization usages will be shown, filtering out other references.
 
 use hir::{PathResolution, Semantics};
 use ide_db::{
@@ -28,27 +36,76 @@ use syntax::{
 
 use crate::{FilePosition, HighlightedRange, NavigationTarget, TryToNav, highlight_related};
 
+/// Result of a reference search operation.
 #[derive(Debug, Clone)]
 pub struct ReferenceSearchResult {
+    /// Information about the declaration site of the searched item.
+    /// For ADTs (structs/enums), this points to the type definition.
+    /// May be None for primitives or items without clear declaration sites.
     pub declaration: Option<Declaration>,
+    /// All references found, grouped by file.
+    /// For ADTs when searching from a constructor position (e.g. on '{', '(', ';'),
+    /// this only includes constructor/initialization usages.
+    /// The map key is the file ID, and the value is a vector of (range, category) pairs.
+    /// - range: The text range of the reference in the file
+    /// - category: Metadata about how the reference is used (read/write/etc)
     pub references: IntMap<FileId, Vec<(TextRange, ReferenceCategory)>>,
 }
 
+/// Information about the declaration site of a searched item.
 #[derive(Debug, Clone)]
 pub struct Declaration {
+    /// Navigation information to jump to the declaration
     pub nav: NavigationTarget,
+    /// Whether the declared item is mutable (relevant for variables)
     pub is_mut: bool,
 }
 
 // Feature: Find All References
 //
-// Shows all references of the item at the cursor location
+// Shows all references of the item at the cursor location. This includes:
+// - Direct references to variables, functions, types, etc.
+// - Constructor/initialization references when cursor is on struct/enum definition tokens
+// - References in patterns and type contexts
+// - References through dereferencing and borrowing
+// - References in macro expansions
+//
+// Special handling for constructors:
+// - When the cursor is on `{`, `(`, or `;` in a struct/enum definition
+// - When the cursor is on the type name in a struct/enum definition
+// These cases will show only constructor/initialization usages of the type
 //
 // | Editor  | Shortcut |
 // |---------|----------|
 // | VS Code | <kbd>Shift+Alt+F12</kbd> |
 //
 // ![Find All References](https://user-images.githubusercontent.com/48062697/113020670-b7c34f00-917a-11eb-8003-370ac5f2b3cb.gif)
+
+/// Find all references to the item at the given position.
+///
+/// # Arguments
+/// * `sema` - Semantic analysis context
+/// * `position` - Position in the file where to look for the item
+/// * `search_scope` - Optional scope to limit the search (e.g. current crate only)
+///
+/// # Returns
+/// Returns `None` if no valid item is found at the position.
+/// Otherwise returns a vector of `ReferenceSearchResult`, usually with one element.
+/// Multiple results can occur in case of ambiguity or when searching for trait items.
+///
+/// # Special cases
+/// - Control flow keywords (break, continue, etc): Shows all related jump points
+/// - Constructor search: When on struct/enum definition tokens (`{`, `(`, `;`), shows only initialization sites
+/// - Format string arguments: Shows template parameter usages
+/// - Lifetime parameters: Shows lifetime constraint usages
+///
+/// # Constructor search
+/// When the cursor is on specific tokens in a struct/enum definition:
+/// - `{` after struct/enum/variant: Shows record literal initializations
+/// - `(` after tuple struct/variant: Shows tuple literal initializations
+/// - `;` after unit struct: Shows unit literal initializations
+/// - Type name in definition: Shows all initialization usages
+///   In these cases, other kinds of references (like type references) are filtered out.
 pub(crate) fn find_all_refs(
     sema: &Semantics<'_, RootDatabase>,
     position: FilePosition,
@@ -68,7 +125,7 @@ pub(crate) fn find_all_refs(
                 .into_iter()
                 .map(|(file_id, refs)| {
                     (
-                        file_id.into(),
+                        file_id.file_id(sema.db),
                         refs.into_iter()
                             .map(|file_ref| (file_ref.range, file_ref.category))
                             .unique()
@@ -124,11 +181,11 @@ pub(crate) fn find_all_refs(
     }
 }
 
-pub(crate) fn find_defs<'a>(
-    sema: &'a Semantics<'_, RootDatabase>,
+pub(crate) fn find_defs(
+    sema: &Semantics<'_, RootDatabase>,
     syntax: &SyntaxNode,
     offset: TextSize,
-) -> Option<impl IntoIterator<Item = Definition> + 'a> {
+) -> Option<Vec<Definition>> {
     let token = syntax.token_at_offset(offset).find(|t| {
         matches!(
             t.kind(),
@@ -143,7 +200,7 @@ pub(crate) fn find_defs<'a>(
         )
     })?;
 
-    if let Some((_, resolution)) = sema.check_for_format_args_template(token.clone(), offset) {
+    if let Some((.., resolution)) = sema.check_for_format_args_template(token.clone(), offset) {
         return resolution.map(Definition::from).map(|it| vec![it]);
     }
 
@@ -219,7 +276,19 @@ fn retain_adt_literal_usages(
     }
 }
 
-/// Returns `Some` if the cursor is at a position for an item to search for all its constructor/literal usages
+/// Returns `Some` if the cursor is at a position where we should search for constructor/initialization usages.
+/// This is used to implement the special constructor search behavior when the cursor is on specific tokens
+/// in a struct/enum/variant definition.
+///
+/// # Returns
+/// - `Some(name)` if the cursor is on:
+///   - `{` after a struct/enum/variant definition
+///   - `(` for tuple structs/variants
+///   - `;` for unit structs
+///   - The type name in a struct/enum/variant definition
+/// - `None` otherwise
+///
+/// The returned name is the name of the type whose constructor usages should be searched for.
 fn name_for_constructor_search(syntax: &SyntaxNode, position: FilePosition) -> Option<ast::Name> {
     let token = syntax.token_at_offset(position.offset).right_biased()?;
     let token_parent = token.parent()?;
@@ -257,6 +326,16 @@ fn name_for_constructor_search(syntax: &SyntaxNode, position: FilePosition) -> O
     }
 }
 
+/// Checks if a name reference is part of an enum variant literal expression.
+/// Used to filter references when searching for enum variant constructors.
+///
+/// # Arguments
+/// * `sema` - Semantic analysis context
+/// * `enum_` - The enum type to check against
+/// * `name_ref` - The name reference to check
+///
+/// # Returns
+/// `true` if the name reference is used as part of constructing a variant of the given enum.
 fn is_enum_lit_name_ref(
     sema: &Semantics<'_, RootDatabase>,
     enum_: hir::Enum,
@@ -284,12 +363,19 @@ fn is_enum_lit_name_ref(
         .unwrap_or(false)
 }
 
+/// Checks if a path ends with the given name reference.
+/// Helper function for checking constructor usage patterns.
 fn path_ends_with(path: Option<ast::Path>, name_ref: &ast::NameRef) -> bool {
     path.and_then(|path| path.segment())
         .and_then(|segment| segment.name_ref())
         .map_or(false, |segment| segment == *name_ref)
 }
 
+/// Checks if a name reference is used in a literal (constructor) context.
+/// Used to filter references when searching for struct/variant constructors.
+///
+/// # Returns
+/// `true` if the name reference is used as part of a struct/variant literal expression.
 fn is_lit_name_ref(name_ref: &ast::NameRef) -> bool {
     name_ref.syntax().ancestors().find_map(|ancestor| {
         match_ast! {
@@ -307,8 +393,10 @@ fn handle_control_flow_keywords(
     FilePosition { file_id, offset }: FilePosition,
 ) -> Option<ReferenceSearchResult> {
     let file = sema.parse_guess_edition(file_id);
-    let edition =
-        sema.attach_first_edition(file_id).map(|it| it.edition()).unwrap_or(Edition::CURRENT);
+    let edition = sema
+        .attach_first_edition(file_id)
+        .map(|it| it.edition(sema.db))
+        .unwrap_or(Edition::CURRENT);
     let token = file.syntax().token_at_offset(offset).find(|t| t.kind().is_keyword(edition))?;
 
     let references = match token.kind() {
@@ -328,7 +416,7 @@ fn handle_control_flow_keywords(
             .into_iter()
             .map(|HighlightedRange { range, category }| (range, category))
             .collect();
-        (file_id.into(), ranges)
+        (file_id.file_id(sema.db), ranges)
     })
     .collect();
 
@@ -338,8 +426,8 @@ fn handle_control_flow_keywords(
 #[cfg(test)]
 mod tests {
     use expect_test::{Expect, expect};
-    use ide_db::FileId;
-    use span::EditionedFileId;
+    use hir::EditionedFileId;
+    use ide_db::{FileId, RootDatabase};
     use stdx::format_to;
 
     use crate::{SearchScope, fixture};
@@ -1004,7 +1092,9 @@ pub(super) struct Foo$0 {
 
         check_with_scope(
             code,
-            Some(SearchScope::single_file(EditionedFileId::current_edition(FileId::from_raw(2)))),
+            Some(&mut |db| {
+                SearchScope::single_file(EditionedFileId::current_edition(db, FileId::from_raw(2)))
+            }),
             expect![[r#"
                 quux Function FileId(0) 19..35 26..30
 
@@ -1260,11 +1350,12 @@ impl Foo {
 
     fn check_with_scope(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
-        search_scope: Option<SearchScope>,
+        search_scope: Option<&mut dyn FnMut(&RootDatabase) -> SearchScope>,
         expect: Expect,
     ) {
         let (analysis, pos) = fixture::position(ra_fixture);
-        let refs = analysis.find_all_refs(pos, search_scope).unwrap().unwrap();
+        let refs =
+            analysis.find_all_refs(pos, search_scope.map(|it| it(&analysis.db))).unwrap().unwrap();
 
         let mut actual = String::new();
         for mut refs in refs {

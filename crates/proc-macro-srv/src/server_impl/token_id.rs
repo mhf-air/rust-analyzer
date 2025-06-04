@@ -24,8 +24,6 @@ type Literal = tt::Literal;
 type Span = tt::TokenId;
 type TokenStream = crate::server_impl::TokenStream<Span>;
 
-#[derive(Clone)]
-pub struct SourceFile;
 pub struct FreeFunctions;
 
 pub struct TokenIdServer {
@@ -37,7 +35,6 @@ pub struct TokenIdServer {
 impl server::Types for TokenIdServer {
     type FreeFunctions = FreeFunctions;
     type TokenStream = TokenStream;
-    type SourceFile = SourceFile;
     type Span = Span;
     type Symbol = Symbol;
 }
@@ -156,16 +153,38 @@ impl server::TokenStream for TokenIdServer {
             }
 
             bridge::TokenTree::Literal(literal) => {
-                let literal = Literal {
-                    symbol: literal.symbol,
-                    suffix: literal.suffix,
-                    span: literal.span,
-                    kind: literal_kind_to_internal(literal.kind),
-                };
+                let token_trees =
+                    if let Some((_minus, symbol)) = literal.symbol.as_str().split_once('-') {
+                        let punct = tt::Punct {
+                            spacing: tt::Spacing::Alone,
+                            span: literal.span,
+                            char: '-' as char,
+                        };
+                        let leaf: tt::Leaf = tt::Leaf::from(punct);
+                        let minus_tree = tt::TokenTree::from(leaf);
 
-                let leaf = tt::Leaf::from(literal);
-                let tree = TokenTree::from(leaf);
-                TokenStream { token_trees: vec![tree] }
+                        let literal = Literal {
+                            symbol: Symbol::intern(symbol),
+                            suffix: literal.suffix,
+                            span: literal.span,
+                            kind: literal_kind_to_internal(literal.kind),
+                        };
+                        let leaf: tt::Leaf = tt::Leaf::from(literal);
+                        let tree = tt::TokenTree::from(leaf);
+                        vec![minus_tree, tree]
+                    } else {
+                        let literal = Literal {
+                            symbol: literal.symbol,
+                            suffix: literal.suffix,
+                            span: literal.span,
+                            kind: literal_kind_to_internal(literal.kind),
+                        };
+
+                        let leaf: tt::Leaf = tt::Leaf::from(literal);
+                        let tree = tt::TokenTree::from(leaf);
+                        vec![tree]
+                    };
+                TokenStream { token_trees }
             }
 
             bridge::TokenTree::Punct(p) => {
@@ -190,7 +209,7 @@ impl server::TokenStream for TokenIdServer {
         base: Option<Self::TokenStream>,
         trees: Vec<bridge::TokenTree<Self::TokenStream, Self::Span, Self::Symbol>>,
     ) -> Self::TokenStream {
-        let mut builder = TokenStreamBuilder::new();
+        let mut builder = TokenStreamBuilder::default();
         if let Some(base) = base {
             builder.push(base);
         }
@@ -205,7 +224,7 @@ impl server::TokenStream for TokenIdServer {
         base: Option<Self::TokenStream>,
         streams: Vec<Self::TokenStream>,
     ) -> Self::TokenStream {
-        let mut builder = TokenStreamBuilder::new();
+        let mut builder = TokenStreamBuilder::default();
         if let Some(base) = base {
             builder.push(base);
         }
@@ -219,19 +238,8 @@ impl server::TokenStream for TokenIdServer {
         &mut self,
         stream: Self::TokenStream,
     ) -> Vec<bridge::TokenTree<Self::TokenStream, Self::Span, Self::Symbol>> {
-        stream.into_bridge()
-    }
-}
-
-impl server::SourceFile for TokenIdServer {
-    fn eq(&mut self, _file1: &Self::SourceFile, _file2: &Self::SourceFile) -> bool {
-        true
-    }
-    fn path(&mut self, _file: &Self::SourceFile) -> String {
-        String::new()
-    }
-    fn is_real(&mut self, _file: &Self::SourceFile) -> bool {
-        true
+        // Can't join with `TokenId`.
+        stream.into_bridge(&mut |first, _second| first)
     }
 }
 
@@ -239,8 +247,11 @@ impl server::Span for TokenIdServer {
     fn debug(&mut self, span: Self::Span) -> String {
         format!("{:?}", span.0)
     }
-    fn source_file(&mut self, _span: Self::Span) -> Self::SourceFile {
-        SourceFile {}
+    fn file(&mut self, _span: Self::Span) -> String {
+        String::new()
+    }
+    fn local_file(&mut self, _span: Self::Span) -> Option<String> {
+        None
     }
     fn save_span(&mut self, _span: Self::Span) -> usize {
         0
