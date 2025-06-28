@@ -661,6 +661,9 @@ pub(crate) fn handle_workspace_symbol(
         if libs {
             q.libs();
         }
+        if config.search_exclude_imports {
+            q.exclude_imports();
+        }
         q
     };
     let mut res = exec_query(&snap, query, config.search_limit)?;
@@ -1476,7 +1479,7 @@ pub(crate) fn handle_code_action(
     };
     let assists = snap.analysis.assists_with_fixes(
         &assists_config,
-        &snap.config.diagnostics(Some(source_root)),
+        &snap.config.diagnostic_fixes(Some(source_root)),
         resolve,
         frange,
     )?;
@@ -1567,7 +1570,7 @@ pub(crate) fn handle_code_action_resolve(
 
     let assists = snap.analysis.assists_with_fixes(
         &assists_config,
-        &snap.config.diagnostics(Some(source_root)),
+        &snap.config.diagnostic_fixes(Some(source_root)),
         AssistResolveStrategy::Single(assist_resolve),
         frange,
     )?;
@@ -2467,17 +2470,14 @@ fn run_rustfmt(
             }
             _ => {
                 // Something else happened - e.g. `rustfmt` is missing or caught a signal
-                Err(LspError::new(
-                    -32900,
-                    format!(
-                        r#"rustfmt exited with:
-                           Status: {}
-                           stdout: {captured_stdout}
-                           stderr: {captured_stderr}"#,
-                        output.status,
-                    ),
-                )
-                .into())
+                tracing::error!(
+                    ?command,
+                    %output.status,
+                    %captured_stdout,
+                    %captured_stderr,
+                    "rustfmt failed"
+                );
+                Ok(None)
             }
         };
     }

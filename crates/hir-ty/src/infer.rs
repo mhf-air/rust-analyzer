@@ -1673,7 +1673,7 @@ impl<'db> InferenceContext<'db> {
                     // If we can resolve to an enum variant, it takes priority over associated type
                     // of the same name.
                     if let Some((AdtId::EnumId(id), _)) = ty.as_adt() {
-                        let enum_data = self.db.enum_variants(id);
+                        let enum_data = id.enum_variants(self.db);
                         if let Some(variant) = enum_data.variant(current_segment.name) {
                             return if remaining_segments.len() == 1 {
                                 (ty, Some(variant.into()))
@@ -1792,7 +1792,7 @@ impl<'db> InferenceContext<'db> {
                 let segment = path.segments().last().unwrap();
                 // this could be an enum variant or associated type
                 if let Some((AdtId::EnumId(enum_id), _)) = ty.as_adt() {
-                    let enum_data = self.db.enum_variants(enum_id);
+                    let enum_data = enum_id.enum_variants(self.db);
                     if let Some(variant) = enum_data.variant(segment) {
                         return (ty, Some(variant.into()));
                     }
@@ -1813,7 +1813,7 @@ impl<'db> InferenceContext<'db> {
     }
 
     fn resolve_output_on(&self, trait_: TraitId) -> Option<TypeAliasId> {
-        self.db.trait_items(trait_).associated_type_by_name(&Name::new_symbol_root(sym::Output))
+        trait_.trait_items(self.db).associated_type_by_name(&Name::new_symbol_root(sym::Output))
     }
 
     fn resolve_lang_trait(&self, lang: LangItem) -> Option<TraitId> {
