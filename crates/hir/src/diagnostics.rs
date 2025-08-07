@@ -36,16 +36,16 @@ pub use hir_ty::{
 };
 
 macro_rules! diagnostics {
-    ($($diag:ident $(<$lt:lifetime>)?,)*) => {
+    ($AnyDiagnostic:ident <$db:lifetime> -> $($diag:ident $(<$lt:lifetime>)?,)*) => {
         #[derive(Debug)]
-        pub enum AnyDiagnostic<'db> {$(
+        pub enum $AnyDiagnostic<$db> {$(
             $diag(Box<$diag $(<$lt>)?>),
         )*}
 
         $(
-            impl<'db> From<$diag $(<$lt>)?> for AnyDiagnostic<'db> {
-                fn from(d: $diag $(<$lt>)?) -> AnyDiagnostic<'db> {
-                    AnyDiagnostic::$diag(Box::new(d))
+            impl<$db> From<$diag $(<$lt>)?> for $AnyDiagnostic<$db> {
+                fn from(d: $diag $(<$lt>)?) -> $AnyDiagnostic<$db> {
+                    $AnyDiagnostic::$diag(Box::new(d))
                 }
             }
         )*
@@ -66,7 +66,7 @@ macro_rules! diagnostics {
 // }, ...
 // ]
 
-diagnostics![
+diagnostics![AnyDiagnostic<'db> ->
     AwaitOutsideOfAsync,
     BreakOutsideOfLoop,
     CastToUnsized<'db>,
@@ -604,13 +604,13 @@ impl<'db> AnyDiagnostic<'db> {
                 }
             }
             BodyValidationDiagnostic::RemoveUnnecessaryElse { if_expr } => {
-                if let Ok(source_ptr) = source_map.expr_syntax(if_expr) {
-                    if let Some(ptr) = source_ptr.value.cast::<ast::IfExpr>() {
-                        return Some(
-                            RemoveUnnecessaryElse { if_expr: InFile::new(source_ptr.file_id, ptr) }
-                                .into(),
-                        );
-                    }
+                if let Ok(source_ptr) = source_map.expr_syntax(if_expr)
+                    && let Some(ptr) = source_ptr.value.cast::<ast::IfExpr>()
+                {
+                    return Some(
+                        RemoveUnnecessaryElse { if_expr: InFile::new(source_ptr.file_id, ptr) }
+                            .into(),
+                    );
                 }
             }
         }

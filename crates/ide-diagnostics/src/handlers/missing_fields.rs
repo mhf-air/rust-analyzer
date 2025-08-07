@@ -66,7 +66,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::MissingFields) -> Option<Vec<Ass
     let current_module =
         ctx.sema.scope(d.field_list_parent.to_node(&root).syntax()).map(|it| it.module());
     let range = InFile::new(d.file, d.field_list_parent.text_range())
-        .original_node_file_range_rooted(ctx.sema.db);
+        .original_node_file_range_rooted_opt(ctx.sema.db)?;
 
     let build_text_edit = |new_syntax: &SyntaxNode, old_syntax| {
         let edit = {
@@ -227,12 +227,11 @@ fn get_default_constructor(
     // Look for a ::new() associated function
     let has_new_func = ty
         .iterate_assoc_items(ctx.sema.db, krate, |assoc_item| {
-            if let AssocItem::Function(func) = assoc_item {
-                if func.name(ctx.sema.db) == sym::new
-                    && func.assoc_fn_params(ctx.sema.db).is_empty()
-                {
-                    return Some(());
-                }
+            if let AssocItem::Function(func) = assoc_item
+                && func.name(ctx.sema.db) == sym::new
+                && func.assoc_fn_params(ctx.sema.db).is_empty()
+            {
+                return Some(());
             }
 
             None

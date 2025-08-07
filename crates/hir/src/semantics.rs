@@ -677,8 +677,7 @@ impl<'db> SemanticsImpl<'db> {
     pub fn rename_conflicts(&self, to_be_renamed: &Local, new_name: &Name) -> Vec<Local> {
         let body = self.db.body(to_be_renamed.parent);
         let resolver = to_be_renamed.parent.resolver(self.db);
-        let starting_expr =
-            body.binding_owners.get(&to_be_renamed.binding_id).copied().unwrap_or(body.body_expr);
+        let starting_expr = body.binding_owner(to_be_renamed.binding_id).unwrap_or(body.body_expr);
         let mut visitor = RenameConflictsVisitor {
             body: &body,
             conflicts: FxHashSet::default(),
@@ -934,19 +933,18 @@ impl<'db> SemanticsImpl<'db> {
                 InFile::new(file.file_id, last),
                 false,
                 &mut |InFile { value: last, file_id: last_fid }, _ctx| {
-                    if let Some(InFile { value: first, file_id: first_fid }) = scratch.next() {
-                        if first_fid == last_fid {
-                            if let Some(p) = first.parent() {
-                                let range = first.text_range().cover(last.text_range());
-                                let node = find_root(&p)
-                                    .covering_element(range)
-                                    .ancestors()
-                                    .take_while(|it| it.text_range() == range)
-                                    .find_map(N::cast);
-                                if let Some(node) = node {
-                                    res.push(node);
-                                }
-                            }
+                    if let Some(InFile { value: first, file_id: first_fid }) = scratch.next()
+                        && first_fid == last_fid
+                        && let Some(p) = first.parent()
+                    {
+                        let range = first.text_range().cover(last.text_range());
+                        let node = find_root(&p)
+                            .covering_element(range)
+                            .ancestors()
+                            .take_while(|it| it.text_range() == range)
+                            .find_map(N::cast);
+                        if let Some(node) = node {
+                            res.push(node);
                         }
                     }
                 },
@@ -1243,29 +1241,27 @@ impl<'db> SemanticsImpl<'db> {
                                         adt,
                                     ))
                                 })?;
-                            let mut res = None;
                             for (_, derive_attr, derives) in derives {
                                 // as there may be multiple derives registering the same helper
                                 // name, we gotta make sure to call this for all of them!
                                 // FIXME: We need to call `f` for all of them as well though!
-                                res = res.or(process_expansion_for_token(
-                                    ctx,
-                                    &mut stack,
-                                    derive_attr,
-                                ));
+                                process_expansion_for_token(ctx, &mut stack, derive_attr);
                                 for derive in derives.into_iter().flatten() {
-                                    res = res
-                                        .or(process_expansion_for_token(ctx, &mut stack, derive));
+                                    process_expansion_for_token(ctx, &mut stack, derive);
                                 }
                             }
                             // remove all tokens that are within the derives expansion
                             filter_duplicates(tokens, adt.syntax().text_range());
-                            Some(res)
+                            Some(())
                         });
                         // if we found derives, we can early exit. There is no way we can be in any
                         // macro call at this point given we are not in a token tree
-                        if let Some(res) = res {
-                            return res;
+                        if let Some(()) = res {
+                            // Note: derives do not remap the original token. Furthermore, we want
+                            // the original token to be before the derives in the list, because if they
+                            // upmap to the same token and we deduplicate them (e.g. in rename), we
+                            // want the original token to remain, not the derive.
+                            return None;
                         }
                     }
                     // Then check for token trees, that means we are either in a function-like macro or
@@ -1392,10 +1388,10 @@ impl<'db> SemanticsImpl<'db> {
                     }
                 })()
                 .is_none();
-                if was_not_remapped {
-                    if let ControlFlow::Break(b) = f(InFile::new(expansion, token), ctx) {
-                        return Some(b);
-                    }
+                if was_not_remapped
+                    && let ControlFlow::Break(b) = f(InFile::new(expansion, token), ctx)
+                {
+                    return Some(b);
                 }
             }
         }
@@ -1776,7 +1772,7 @@ impl<'db> SemanticsImpl<'db> {
 
     pub fn is_unsafe_macro_call(&self, macro_call: &ast::MacroCall) -> bool {
         let Some(mac) = self.resolve_macro_call(macro_call) else { return false };
-        if mac.is_asm_or_global_asm(self.db) {
+        if mac.is_asm_like(self.db) {
             return true;
         }
 
@@ -2069,14 +2065,12 @@ impl<'db> SemanticsImpl<'db> {
                 break false;
             }
 
-            if let Some(parent) = ast::Expr::cast(parent.clone()) {
-                if let Some(ExprOrPatId::ExprId(expr_id)) =
+            if let Some(parent) = ast::Expr::cast(parent.clone())
+                && let Some(ExprOrPatId::ExprId(expr_id)) =
                     source_map.node_expr(InFile { file_id, value: &parent })
-                {
-                    if let Expr::Unsafe { .. } = body[expr_id] {
-                        break true;
-                    }
-                }
+                && let Expr::Unsafe { .. } = body[expr_id]
+            {
+                break true;
             }
 
             let Some(parent_) = parent.parent() else { break false };
@@ -2355,32 +2349,30 @@ struct RenameConflictsVisitor<'a> {
 
 impl RenameConflictsVisitor<'_> {
     fn resolve_path(&mut self, node: ExprOrPatId, path: &Path) {
-        if let Path::BarePath(path) = path {
-            if let Some(name) = path.as_ident() {
-                if *name.symbol() == self.new_name {
-                    if let Some(conflicting) = self.resolver.rename_will_conflict_with_renamed(
-                        self.db,
-                        name,
-                        path,
-                        self.body.expr_or_pat_path_hygiene(node),
-                        self.to_be_renamed,
-                    ) {
-                        self.conflicts.insert(conflicting);
-                    }
-                } else if *name.symbol() == self.old_name {
-                    if let Some(conflicting) =
-                        self.resolver.rename_will_conflict_with_another_variable(
-                            self.db,
-                            name,
-                            path,
-                            self.body.expr_or_pat_path_hygiene(node),
-                            &self.new_name,
-                            self.to_be_renamed,
-                        )
-                    {
-                        self.conflicts.insert(conflicting);
-                    }
+        if let Path::BarePath(path) = path
+            && let Some(name) = path.as_ident()
+        {
+            if *name.symbol() == self.new_name {
+                if let Some(conflicting) = self.resolver.rename_will_conflict_with_renamed(
+                    self.db,
+                    name,
+                    path,
+                    self.body.expr_or_pat_path_hygiene(node),
+                    self.to_be_renamed,
+                ) {
+                    self.conflicts.insert(conflicting);
                 }
+            } else if *name.symbol() == self.old_name
+                && let Some(conflicting) = self.resolver.rename_will_conflict_with_another_variable(
+                    self.db,
+                    name,
+                    path,
+                    self.body.expr_or_pat_path_hygiene(node),
+                    &self.new_name,
+                    self.to_be_renamed,
+                )
+            {
+                self.conflicts.insert(conflicting);
             }
         }
     }
