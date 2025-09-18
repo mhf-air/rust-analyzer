@@ -1,3 +1,4 @@
+use base_db::salsa;
 use expect_test::{Expect, expect};
 use hir::HirDisplay;
 
@@ -9,11 +10,16 @@ use crate::{
 fn check_expected_type_and_name(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
     let (db, pos) = position(ra_fixture);
     let config = TEST_CONFIG;
-    let (completion_context, _analysis) = CompletionContext::new(&db, pos, &config).unwrap();
+    let (completion_context, _analysis) =
+        salsa::attach(&db, || CompletionContext::new(&db, pos, &config).unwrap());
 
     let ty = completion_context
         .expected_type
-        .map(|t| t.display_test(&db, completion_context.krate.to_display_target(&db)).to_string())
+        .map(|t| {
+            salsa::attach(&db, || {
+                t.display_test(&db, completion_context.krate.to_display_target(&db)).to_string()
+            })
+        })
         .unwrap_or("?".to_owned());
 
     let name =
@@ -479,6 +485,42 @@ fn foo() {
             *x = $0
         },
     }
+}
+"#,
+        expect![[r#"ty: State, name: ?"#]],
+    );
+}
+
+#[test]
+fn expected_type_return_expr() {
+    check_expected_type_and_name(
+        r#"
+enum State { Stop }
+fn foo() -> State {
+    let _: i32 = if true {
+        8
+    } else {
+        return $0;
+    };
+}
+"#,
+        expect![[r#"ty: State, name: ?"#]],
+    );
+}
+
+#[test]
+fn expected_type_return_expr_in_closure() {
+    check_expected_type_and_name(
+        r#"
+enum State { Stop }
+fn foo() {
+    let _f: fn() -> State = || {
+        let _: i32 = if true {
+            8
+        } else {
+            return $0;
+        };
+    };
 }
 "#,
         expect![[r#"ty: State, name: ?"#]],
