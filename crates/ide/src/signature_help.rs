@@ -11,7 +11,6 @@ use hir::{
 use ide_db::{
     FilePosition, FxIndexMap,
     active_parameter::{callable_for_arg_list, generic_def_for_node},
-    base_db::salsa,
     documentation::{Documentation, HasDocs},
 };
 use itertools::Itertools;
@@ -176,6 +175,9 @@ fn signature_help_for_call(
     match callable.kind() {
         hir::CallableKind::Function(func) => {
             res.doc = func.docs(db);
+            if func.is_async(db) {
+                format_to!(res.signature, "async ");
+            }
             format_to!(res.signature, "fn {}", func.name(db).display(db, edition));
 
             let generic_params = GenericDef::Function(func)
@@ -267,7 +269,7 @@ fn signature_help_for_call(
             // In that case, fall back to render definitions of the respective parameters.
             // This is overly conservative: we do not substitute known type vars
             // (see FIXME in tests::impl_trait) and falling back on any unknowns.
-            salsa::attach(db, || match (p.ty().contains_unknown(), fn_params.as_deref()) {
+            hir::attach_db(db, || match (p.ty().contains_unknown(), fn_params.as_deref()) {
                 (true, Some(fn_params)) => {
                     format_to!(buf, "{}", fn_params[idx].ty().display(db, display_target))
                 }
@@ -284,13 +286,16 @@ fn signature_help_for_call(
         }
     };
     match callable.kind() {
-        hir::CallableKind::Function(func) if callable.return_type().contains_unknown() => {
-            render(func.ret_type(db))
+        hir::CallableKind::Function(func) => render(func.async_ret_type(db).unwrap_or_else(|| {
+            if callable.return_type().contains_unknown() {
+                func.ret_type(db)
+            } else {
+                callable.return_type()
+            }
+        })),
+        hir::CallableKind::Closure(_) | hir::CallableKind::FnPtr | hir::CallableKind::FnImpl(_) => {
+            render(callable.return_type())
         }
-        hir::CallableKind::Function(_)
-        | hir::CallableKind::Closure(_)
-        | hir::CallableKind::FnPtr
-        | hir::CallableKind::FnImpl(_) => render(callable.return_type()),
         hir::CallableKind::TupleStruct(_) | hir::CallableKind::TupleEnumVariant(_) => {}
     }
     Some(res)
@@ -526,7 +531,7 @@ fn signature_help_for_tuple_struct_pat(
         pat.syntax(),
         token,
         pat.fields(),
-        fields.into_iter().map(|it| it.ty(db)),
+        fields.into_iter().map(|it| it.ty(db).to_type(db)),
         display_target,
     ))
 }
@@ -730,7 +735,7 @@ fn signature_help_for_tuple_pat_ish<'db>(
 mod tests {
 
     use expect_test::{Expect, expect};
-    use ide_db::{FilePosition, base_db::salsa};
+    use ide_db::FilePosition;
     use stdx::format_to;
     use test_fixture::ChangeFixture;
 
@@ -752,14 +757,8 @@ mod tests {
 
     #[track_caller]
     fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
-        let fixture = format!(
-            r#"
-//- minicore: sized, fn
-{ra_fixture}
-            "#
-        );
-        let (db, position) = position(&fixture);
-        let sig_help = salsa::attach(&db, || crate::signature_help::signature_help(&db, position));
+        let (db, position) = position(ra_fixture);
+        let sig_help = hir::attach_db(&db, || crate::signature_help::signature_help(&db, position));
         let actual = match sig_help {
             Some(sig_help) => {
                 let mut rendered = String::new();
@@ -796,6 +795,7 @@ mod tests {
     fn test_fn_signature_two_args() {
         check(
             r#"
+//- minicore: sized, fn
 fn foo(x: u32, y: u32) -> u32 {x + y}
 fn bar() { foo($03, ); }
 "#,
@@ -806,6 +806,7 @@ fn bar() { foo($03, ); }
         );
         check(
             r#"
+//- minicore: sized, fn
 fn foo(x: u32, y: u32) -> u32 {x + y}
 fn bar() { foo(3$0, ); }
 "#,
@@ -816,6 +817,7 @@ fn bar() { foo(3$0, ); }
         );
         check(
             r#"
+//- minicore: sized, fn
 fn foo(x: u32, y: u32) -> u32 {x + y}
 fn bar() { foo(3,$0 ); }
 "#,
@@ -826,6 +828,7 @@ fn bar() { foo(3,$0 ); }
         );
         check(
             r#"
+//- minicore: sized, fn
 fn foo(x: u32, y: u32) -> u32 {x + y}
 fn bar() { foo(3, $0); }
 "#,
@@ -840,6 +843,7 @@ fn bar() { foo(3, $0); }
     fn test_fn_signature_two_args_empty() {
         check(
             r#"
+//- minicore: sized, fn
 fn foo(x: u32, y: u32) -> u32 {x + y}
 fn bar() { foo($0); }
 "#,
@@ -854,6 +858,7 @@ fn bar() { foo($0); }
     fn test_fn_signature_two_args_first_generics() {
         check(
             r#"
+//- minicore: sized, fn
 fn foo<T, U: Copy + Display>(x: T, y: U) -> u32
     where T: Copy + Display, U: Debug
 { x + y }
@@ -871,6 +876,7 @@ fn bar() { foo($03, ); }
     fn test_fn_signature_no_params() {
         check(
             r#"
+//- minicore: sized, fn
 fn foo<T>() -> T where T: Copy + Display {}
 fn bar() { foo($0); }
 "#,
@@ -884,6 +890,7 @@ fn bar() { foo($0); }
     fn test_fn_signature_for_impl() {
         check(
             r#"
+//- minicore: sized, fn
 struct F;
 impl F { pub fn new() { } }
 fn bar() {
@@ -900,6 +907,7 @@ fn bar() {
     fn test_fn_signature_for_method_self() {
         check(
             r#"
+//- minicore: sized, fn
 struct S;
 impl S { pub fn do_it(&self) {} }
 
@@ -918,6 +926,7 @@ fn bar() {
     fn test_fn_signature_for_method_with_arg() {
         check(
             r#"
+//- minicore: sized, fn
 struct S;
 impl S {
     fn foo(&self, x: i32) {}
@@ -936,6 +945,7 @@ fn main() { S.foo($0); }
     fn test_fn_signature_for_generic_method() {
         check(
             r#"
+//- minicore: sized, fn
 struct S<T>(T);
 impl<T> S<T> {
     fn foo(&self, x: T) {}
@@ -954,6 +964,7 @@ fn main() { S(1u32).foo($0); }
     fn test_fn_signature_for_method_with_arg_as_assoc_fn() {
         check(
             r#"
+//- minicore: sized, fn
 struct S;
 impl S {
     fn foo(&self, x: i32) {}
@@ -972,6 +983,7 @@ fn main() { S::foo($0); }
     fn test_fn_signature_with_docs_simple() {
         check(
             r#"
+//- minicore: sized, fn
 /// test
 // non-doc-comment
 fn foo(j: u32) -> u32 {
@@ -995,6 +1007,7 @@ fn bar() {
     fn test_fn_signature_with_docs() {
         check(
             r#"
+//- minicore: sized, fn
 /// Adds one to the number given.
 ///
 /// # Examples
@@ -1032,6 +1045,7 @@ pub fn r#do() {
     fn test_fn_signature_with_docs_impl() {
         check(
             r#"
+//- minicore: sized, fn
 struct addr;
 impl addr {
     /// Adds one to the number given.
@@ -1074,6 +1088,7 @@ pub fn do_it() {
     fn test_fn_signature_with_docs_from_actix() {
         check(
             r#"
+//- minicore: sized, fn
 trait Actor {
     /// Actor execution context type
     type Context;
@@ -1107,6 +1122,7 @@ fn foo(mut r: impl WriteHandler<()>) {
     fn call_info_bad_offset() {
         check(
             r#"
+//- minicore: sized, fn
 fn foo(x: u32, y: u32) -> u32 {x + y}
 fn bar() { foo $0 (3, ); }
 "#,
@@ -1118,6 +1134,7 @@ fn bar() { foo $0 (3, ); }
     fn outside_of_arg_list() {
         check(
             r#"
+//- minicore: sized, fn
 fn foo(a: u8) {}
 fn f() {
     foo(123)$0
@@ -1127,6 +1144,7 @@ fn f() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn foo<T>(a: u8) {}
 fn f() {
     foo::<u32>$0()
@@ -1136,6 +1154,7 @@ fn f() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn foo(a: u8) -> u8 {a}
 fn bar(a: u8) -> u8 {a}
 fn f() {
@@ -1149,6 +1168,7 @@ fn f() {
         );
         check(
             r#"
+//- minicore: sized, fn
 struct Vec<T>(T);
 struct Vec2<T>(T);
 fn f() {
@@ -1166,6 +1186,7 @@ fn f() {
     fn test_nested_method_in_lambda() {
         check(
             r#"
+//- minicore: sized, fn
 struct Foo;
 impl Foo { fn bar(&self, _: u32) { } }
 
@@ -1187,6 +1208,7 @@ fn main() {
     fn works_for_tuple_structs() {
         check(
             r#"
+//- minicore: sized, fn
 /// A cool tuple struct
 struct S(u32, i32);
 fn main() {
@@ -1206,6 +1228,7 @@ fn main() {
     fn tuple_struct_pat() {
         check(
             r#"
+//- minicore: sized, fn
 /// A cool tuple struct
 struct S(u32, i32);
 fn main() {
@@ -1225,6 +1248,7 @@ fn main() {
     fn tuple_struct_pat_rest() {
         check(
             r#"
+//- minicore: sized, fn
 /// A cool tuple struct
 struct S(u32, i32, f32, u16);
 fn main() {
@@ -1240,6 +1264,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 /// A cool tuple struct
 struct S(u32, i32, f32, u16, u8);
 fn main() {
@@ -1255,6 +1280,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 /// A cool tuple struct
 struct S(u32, i32, f32, u16);
 fn main() {
@@ -1270,6 +1296,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 /// A cool tuple struct
 struct S(u32, i32, f32, u16, u8);
 fn main() {
@@ -1285,6 +1312,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 /// A cool tuple struct
 struct S(u32, i32, f32, u16);
 fn main() {
@@ -1300,6 +1328,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 /// A cool tuple struct
 struct S(u32, i32, f32, u16);
 fn main() {
@@ -1319,6 +1348,7 @@ fn main() {
     fn generic_struct() {
         check(
             r#"
+//- minicore: sized, fn
 struct S<T>(T);
 fn main() {
     let s = S($0);
@@ -1335,6 +1365,7 @@ fn main() {
     fn works_for_enum_variants() {
         check(
             r#"
+//- minicore: sized, fn
 enum E {
     /// A Variant
     A(i32),
@@ -1361,6 +1392,7 @@ fn main() {
     fn cant_call_struct_record() {
         check(
             r#"
+//- minicore: sized, fn
 struct S { x: u32, y: i32 }
 fn main() {
     let s = S($0);
@@ -1374,6 +1406,7 @@ fn main() {
     fn cant_call_enum_record() {
         check(
             r#"
+//- minicore: sized, fn
 enum E {
     /// A Variant
     A(i32),
@@ -1395,6 +1428,7 @@ fn main() {
     fn fn_signature_for_call_in_macro() {
         check(
             r#"
+//- minicore: sized, fn
 macro_rules! id { ($($tt:tt)*) => { $($tt)* } }
 fn foo() { }
 id! {
@@ -1411,6 +1445,7 @@ id! {
     fn fn_signature_for_method_call_defined_in_macro() {
         check(
             r#"
+//- minicore: sized, fn
 macro_rules! id { ($($tt:tt)*) => { $($tt)* } }
 struct S;
 id! {
@@ -1430,6 +1465,7 @@ fn test() { S.foo($0); }
     fn call_info_for_lambdas() {
         check(
             r#"
+//- minicore: sized, fn
 struct S;
 fn foo(s: S) -> i32 { 92 }
 fn main() {
@@ -1444,6 +1480,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 struct S;
 fn foo(s: S) -> i32 { 92 }
 fn main() {
@@ -1457,6 +1494,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 struct S;
 fn foo(s: S) -> i32 { 92 }
 fn main() {
@@ -1475,6 +1513,7 @@ fn main() {
     fn call_info_for_fn_def_over_reference() {
         check(
             r#"
+//- minicore: sized, fn
 struct S;
 fn foo(s: S) -> i32 { 92 }
 fn main() {
@@ -1493,6 +1532,7 @@ fn main() {
     fn call_info_for_fn_ptr() {
         check(
             r#"
+//- minicore: sized, fn
 fn main(f: fn(i32, f64) -> char) {
     f(0, $0)
 }
@@ -1508,6 +1548,7 @@ fn main(f: fn(i32, f64) -> char) {
     fn call_info_for_fn_impl() {
         check(
             r#"
+//- minicore: sized, fn
 struct S;
 impl core::ops::FnOnce<(i32, f64)> for S {
     type Output = char;
@@ -1525,6 +1566,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 struct S;
 impl core::ops::FnOnce<(i32, f64)> for S {
     type Output = char;
@@ -1542,6 +1584,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 struct S;
 impl core::ops::FnOnce<(i32, f64)> for S {
     type Output = char;
@@ -1557,6 +1600,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 struct S;
 impl core::ops::FnOnce<(i32, f64)> for S {
     type Output = char;
@@ -1577,6 +1621,7 @@ fn main() {
     fn call_info_for_unclosed_call() {
         check(
             r#"
+//- minicore: sized, fn
 fn foo(foo: u32, bar: u32) {}
 fn main() {
     foo($0
@@ -1589,6 +1634,7 @@ fn main() {
         // check with surrounding space
         check(
             r#"
+//- minicore: sized, fn
 fn foo(foo: u32, bar: u32) {}
 fn main() {
     foo( $0
@@ -1604,6 +1650,7 @@ fn main() {
     fn test_multiline_argument() {
         check(
             r#"
+//- minicore: sized, fn
 fn callee(a: u8, b: u8) {}
 fn main() {
     callee(match 0 {
@@ -1614,6 +1661,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn callee(a: u8, b: u8) {}
 fn main() {
     callee(match 0 {
@@ -1627,6 +1675,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn callee(a: u8, b: u8) {}
 fn main() {
     callee($0match 0 {
@@ -1644,6 +1693,7 @@ fn main() {
     fn test_generics_simple() {
         check(
             r#"
+//- minicore: sized, fn
 /// Option docs.
 enum Option<T> {
     Some(T),
@@ -1667,6 +1717,7 @@ fn f() {
     fn test_generics_on_variant() {
         check(
             r#"
+//- minicore: sized, fn
 /// Option docs.
 enum Option<T> {
     /// Some docs.
@@ -1694,6 +1745,7 @@ fn f() {
     fn test_lots_of_generics() {
         check(
             r#"
+//- minicore: sized, fn
 trait Tr<T> {}
 
 struct S<T>(T);
@@ -1717,6 +1769,7 @@ fn f() {
     fn test_generics_in_trait_ufcs() {
         check(
             r#"
+//- minicore: sized, fn
 trait Tr {
     fn f<T: Tr, U>() {}
 }
@@ -1740,6 +1793,7 @@ fn f() {
     fn test_generics_in_method_call() {
         check(
             r#"
+//- minicore: sized, fn
 struct S;
 
 impl S {
@@ -1761,6 +1815,7 @@ fn f() {
     fn test_generic_param_in_method_call() {
         check(
             r#"
+//- minicore: sized, fn
 struct Foo;
 impl Foo {
     fn test<V>(&mut self, val: V) {}
@@ -1780,6 +1835,7 @@ fn sup() {
     fn test_generic_kinds() {
         check(
             r#"
+//- minicore: sized, fn
 fn callee<'a, const A: u8, T, const C: u8>() {}
 
 fn f() {
@@ -1793,6 +1849,7 @@ fn f() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn callee<'a, const A: u8, T, const C: u8>() {}
 
 fn f() {
@@ -1810,6 +1867,7 @@ fn f() {
     fn test_trait_assoc_types() {
         check(
             r#"
+//- minicore: sized, fn
 trait Trait<'a, T> {
     type Assoc;
 }
@@ -1822,6 +1880,7 @@ fn f() -> impl Trait<(), $0
         );
         check(
             r#"
+//- minicore: sized, fn
 trait Iterator {
     type Item;
 }
@@ -1834,6 +1893,7 @@ fn f() -> impl Iterator<$0
         );
         check(
             r#"
+//- minicore: sized, fn
 trait Iterator {
     type Item;
 }
@@ -1846,6 +1906,7 @@ fn f() -> impl Iterator<Item = $0
         );
         check(
             r#"
+//- minicore: sized, fn
 trait Tr {
     type A;
     type B;
@@ -1859,6 +1920,7 @@ fn f() -> impl Tr<$0
         );
         check(
             r#"
+//- minicore: sized, fn
 trait Tr {
     type A;
     type B;
@@ -1872,6 +1934,7 @@ fn f() -> impl Tr<B$0
         );
         check(
             r#"
+//- minicore: sized, fn
 trait Tr {
     type A;
     type B;
@@ -1885,6 +1948,7 @@ fn f() -> impl Tr<B = $0
         );
         check(
             r#"
+//- minicore: sized, fn
 trait Tr {
     type A;
     type B;
@@ -1902,6 +1966,7 @@ fn f() -> impl Tr<B = (), $0
     fn test_supertrait_assoc() {
         check(
             r#"
+//- minicore: sized, fn
 trait Super {
     type SuperTy;
 }
@@ -1921,6 +1986,7 @@ fn f() -> impl Sub<$0
     fn no_assoc_types_outside_type_bounds() {
         check(
             r#"
+//- minicore: sized, fn
 trait Tr<T> {
     type Assoc;
 }
@@ -1939,6 +2005,7 @@ impl Tr<$0
         // FIXME: Substitute type vars in impl trait (`U` -> `i8`)
         check(
             r#"
+//- minicore: sized, fn
 trait Trait<T> {}
 struct Wrap<T>(T);
 fn foo<U>(x: Wrap<impl Trait<U>>) {}
@@ -1957,6 +2024,7 @@ fn f() {
     fn fully_qualified_syntax() {
         check(
             r#"
+//- minicore: sized, fn
 fn f() {
     trait A { fn foo(&self, other: Self); }
     A::foo(&self$0, other);
@@ -1973,6 +2041,7 @@ fn f() {
     fn help_for_generic_call() {
         check(
             r#"
+//- minicore: sized, fn
 fn f<F: FnOnce(u8, u16) -> i32>(f: F) {
     f($0)
 }
@@ -1984,6 +2053,7 @@ fn f<F: FnOnce(u8, u16) -> i32>(f: F) {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn f<T, F: FnMut(&T, u16) -> &T>(f: F) {
     f($0)
 }
@@ -1997,8 +2067,15 @@ fn f<T, F: FnMut(&T, u16) -> &T>(f: F) {
 
     #[test]
     fn regression_13579() {
+        // FIXME(next-solver): There should be signature help available here.
+        // The reason it is not is because of a trait solver bug. Since `Error` is not provided
+        // nor it can be inferred, it becomes an error type. The bug is that the solver ignores
+        // predicates on error types, and they do not guide infer vars, not allowing us to infer
+        // that `take`'s return type is callable.
+        // https://github.com/rust-lang/rust/pull/146602 should fix the solver bug.
         check(
             r#"
+//- minicore: sized, fn
 fn f() {
     take(2)($0);
 }
@@ -2009,9 +2086,7 @@ fn take<C, Error>(
     move || count
 }
 "#,
-            expect![[r#"
-                impl Fn() -> i32
-            "#]],
+            expect![""],
         );
     }
 
@@ -2019,6 +2094,7 @@ fn take<C, Error>(
     fn record_literal() {
         check(
             r#"
+//- minicore: sized, fn
 struct Strukt<T, U = ()> {
     t: T,
     u: U,
@@ -2042,6 +2118,7 @@ fn f() {
     fn record_literal_nonexistent_field() {
         check(
             r#"
+//- minicore: sized, fn
 struct Strukt {
     a: u8,
 }
@@ -2063,6 +2140,7 @@ fn f() {
     fn tuple_variant_record_literal() {
         check(
             r#"
+//- minicore: sized, fn
 enum Opt {
     Some(u8),
 }
@@ -2077,6 +2155,7 @@ fn f() {
         );
         check(
             r#"
+//- minicore: sized, fn
 enum Opt {
     Some(u8),
 }
@@ -2095,6 +2174,7 @@ fn f() {
     fn record_literal_self() {
         check(
             r#"
+//- minicore: sized, fn
 struct S { t: u8 }
 impl S {
     fn new() -> Self {
@@ -2113,6 +2193,7 @@ impl S {
     fn record_pat() {
         check(
             r#"
+//- minicore: sized, fn
 struct Strukt<T, U = ()> {
     t: T,
     u: U,
@@ -2136,6 +2217,7 @@ fn f() {
     fn test_enum_in_nested_method_in_lambda() {
         check(
             r#"
+//- minicore: sized, fn
 enum A {
     A,
     B
@@ -2159,6 +2241,7 @@ fn main() {
     fn test_tuple_expr_free() {
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     (0$0, 1, 3);
 }
@@ -2170,6 +2253,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     ($0 1, 3);
 }
@@ -2181,6 +2265,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     (1, 3 $0);
 }
@@ -2192,6 +2277,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     (1, 3 $0,);
 }
@@ -2207,6 +2293,7 @@ fn main() {
     fn test_tuple_expr_expected() {
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let _: (&str, u32, u32)= ($0, 1, 3);
 }
@@ -2219,6 +2306,7 @@ fn main() {
         // FIXME: Should typeck report a 4-ary tuple for the expression here?
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let _: (&str, u32, u32, u32) = ($0, 1, 3);
 }
@@ -2230,6 +2318,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let _: (&str, u32, u32)= ($0, 1, 3, 5);
 }
@@ -2245,6 +2334,7 @@ fn main() {
     fn test_tuple_pat_free() {
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let ($0, 1, 3);
 }
@@ -2256,6 +2346,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let (0$0, 1, 3);
 }
@@ -2267,6 +2358,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let ($0 1, 3);
 }
@@ -2278,6 +2370,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let (1, 3 $0);
 }
@@ -2289,6 +2382,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let (1, 3 $0,);
 }
@@ -2300,6 +2394,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let (1, 3 $0, ..);
 }
@@ -2311,6 +2406,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let (1, 3, .., $0);
 }
@@ -2327,6 +2423,7 @@ fn main() {
     fn test_tuple_pat_expected() {
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let (0$0, 1, 3): (i32, i32, i32);
 }
@@ -2338,6 +2435,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let ($0, 1, 3): (i32, i32, i32);
 }
@@ -2349,6 +2447,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let (1, 3 $0): (i32,);
 }
@@ -2360,6 +2459,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let (1, 3 $0, ..): (i32, i32, i32, i32);
 }
@@ -2371,6 +2471,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let (1, 3, .., $0): (i32, i32, i32);
 }
@@ -2385,6 +2486,7 @@ fn main() {
     fn test_tuple_pat_expected_inferred() {
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let (0$0, 1, 3) = (1, 2 ,3);
 }
@@ -2396,6 +2498,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let ($0 1, 3) = (1, 2, 3);
 }
@@ -2408,6 +2511,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let (1, 3 $0) = (1,);
 }
@@ -2419,6 +2523,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let (1, 3 $0, ..) = (1, 2, 3, 4);
 }
@@ -2430,6 +2535,7 @@ fn main() {
         );
         check(
             r#"
+//- minicore: sized, fn
 fn main() {
     let (1, 3, .., $0) = (1, 2, 3);
 }
@@ -2445,6 +2551,7 @@ fn main() {
     fn test_tuple_generic_param() {
         check(
             r#"
+//- minicore: sized, fn
 struct S<T>(T);
 
 fn main() {
@@ -2462,6 +2569,7 @@ fn main() {
     fn test_enum_generic_param() {
         check(
             r#"
+//- minicore: sized, fn
 enum Option<T> {
     Some(T),
     None,
@@ -2482,6 +2590,7 @@ fn main() {
     fn test_enum_variant_generic_param() {
         check(
             r#"
+//- minicore: sized, fn
 enum Option<T> {
     Some(T),
     None,
@@ -2502,6 +2611,7 @@ fn main() {
     fn test_generic_arg_with_default() {
         check(
             r#"
+//- minicore: sized, fn
 struct S<T = u8> {
     field: T,
 }
@@ -2518,6 +2628,7 @@ fn main() {
 
         check(
             r#"
+//- minicore: sized, fn
 struct S<const C: u8 = 5> {
     field: C,
 }
@@ -2529,6 +2640,29 @@ fn main() {
             expect![[r#"
                 struct S<const C: u8 = 5>
                          ^^^^^^^^^^^^^^^
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_async_function() {
+        check(
+            r#"
+//- minicore: sized, fn, future, result
+pub async fn conn_mut<F, T>(f: F) -> Result<T, i32>
+where
+    F: FnOnce() -> T,
+{
+    Ok(f())
+}
+
+fn main() {
+    conn_mut($0)
+}
+            "#,
+            expect![[r#"
+                async fn conn_mut<F: FnOnce() -> T, T>(f: F) -> Result<T, i32>
+                                                       ^^^^
             "#]],
         );
     }

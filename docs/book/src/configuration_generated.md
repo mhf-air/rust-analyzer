@@ -635,6 +635,13 @@ Default: `"client"`
 Controls file watching implementation.
 
 
+## rust-analyzer.gotoImplementations.filterAdjacentDerives {#gotoImplementations.filterAdjacentDerives}
+
+Default: `false`
+
+If this is `true`, when "Goto Implementations" and in "Implementations" lens, are triggered on a `struct` or `enum` or `union`, we filter out trait implementations that originate from `derive`s above the type.
+
+
 ## rust-analyzer.highlightRelated.branchExitPoints.enable {#highlightRelated.branchExitPoints.enable}
 
 Default: `true`
@@ -1046,6 +1053,8 @@ Default: `25`
 
 Maximum length for inlay hints. Set to null to have an unlimited length.
 
+**Note:** This is mostly a hint, and we don't guarantee to strictly follow the limit.
+
 
 ## rust-analyzer.inlayHints.parameterHints.enable {#inlayHints.parameterHints.enable}
 
@@ -1321,7 +1330,7 @@ tests or binaries. For example, it may be `--release`.
 Default:
 ```json
 [
-  "--show-output"
+  "--nocapture"
 ]
 ```
 

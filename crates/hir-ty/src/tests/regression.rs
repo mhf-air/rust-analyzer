@@ -632,7 +632,7 @@ fn issue_4053_diesel_where_clauses() {
             488..522 '{     ...     }': <SelectStatement<F, S, D, W, O, LOf, {unknown}, {unknown}> as BoxedDsl<DB>>::Output
             498..502 'self': SelectStatement<F, S, D, W, O, LOf, {unknown}, {unknown}>
             498..508 'self.order': O
-            498..515 'self.o...into()': dyn QueryFragment<DB> + '?
+            498..515 'self.o...into()': dyn QueryFragment<DB> + 'static
         "#]],
     );
 }
@@ -725,7 +725,7 @@ fn issue_4885() {
             138..146 'bar(key)': impl Future<Output = <K as Foo<R>>::Bar>
             142..145 'key': &'? K
             162..165 'key': &'? K
-            224..227 '{ }': ()
+            224..227 '{ }': impl Future<Output = <K as Foo<R>>::Bar>
         "#]],
     );
 }
@@ -1257,8 +1257,8 @@ fn test() {
             16..66 'for _ ...     }': fn into_iter<()>(()) -> <() as IntoIterator>::IntoIter
             16..66 'for _ ...     }': <() as IntoIterator>::IntoIter
             16..66 'for _ ...     }': !
-            16..66 'for _ ...     }': <() as IntoIterator>::IntoIter
-            16..66 'for _ ...     }': &'? mut <() as IntoIterator>::IntoIter
+            16..66 'for _ ...     }': {unknown}
+            16..66 'for _ ...     }': &'? mut {unknown}
             16..66 'for _ ...     }': fn next<{unknown}>(&'? mut {unknown}) -> Option<<{unknown} as Iterator>::Item>
             16..66 'for _ ...     }': Option<<{unknown} as Iterator>::Item>
             16..66 'for _ ...     }': ()
@@ -1951,7 +1951,7 @@ fn main() {
     Alias::Braced;
   //^^^^^^^^^^^^^ {unknown}
     let Alias::Braced = loop {};
-      //^^^^^^^^^^^^^ {unknown}
+      //^^^^^^^^^^^^^ !
   let Alias::Braced(..) = loop {};
     //^^^^^^^^^^^^^^^^^ Enum
 
@@ -2363,8 +2363,8 @@ fn test() {
             108..125 '{     ...     }': usize
             118..119 'N': usize
             139..157 '{     ...= N; }': ()
-            149..150 '_': Foo<_>
-            153..154 'N': Foo<_>
+            149..150 '_': Foo<N>
+            153..154 'N': Foo<N>
         "#]],
     );
 }
@@ -2504,5 +2504,21 @@ fn main() {
     node(Eth);
 }
 "#,
+    );
+}
+
+#[test]
+fn foo() {
+    check_types(
+        r#"
+fn foo() {
+    mod my_mod {
+        pub type Bool = bool;
+    }
+
+    let _: my_mod::Bool;
+     // ^ bool
+}
+    "#,
     );
 }

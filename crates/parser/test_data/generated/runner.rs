@@ -265,6 +265,8 @@ mod ok {
     #[test]
     fn for_type() { run_and_expect_no_errors("test_data/parser/inline/ok/for_type.rs"); }
     #[test]
+    fn frontmatter() { run_and_expect_no_errors("test_data/parser/inline/ok/frontmatter.rs"); }
+    #[test]
     fn full_range_expr() {
         run_and_expect_no_errors("test_data/parser/inline/ok/full_range_expr.rs");
     }
@@ -749,6 +751,10 @@ mod err {
     #[test]
     fn bad_asm_expr() { run_and_expect_errors("test_data/parser/inline/err/bad_asm_expr.rs"); }
     #[test]
+    fn closure_ret_recovery() {
+        run_and_expect_errors("test_data/parser/inline/err/closure_ret_recovery.rs");
+    }
+    #[test]
     fn comma_after_default_values_syntax() {
         run_and_expect_errors("test_data/parser/inline/err/comma_after_default_values_syntax.rs");
     }
@@ -771,6 +777,10 @@ mod err {
     #[test]
     fn fn_pointer_type_missing_fn() {
         run_and_expect_errors("test_data/parser/inline/err/fn_pointer_type_missing_fn.rs");
+    }
+    #[test]
+    fn fn_ret_recovery() {
+        run_and_expect_errors("test_data/parser/inline/err/fn_ret_recovery.rs");
     }
     #[test]
     fn gen_fn() {
@@ -824,8 +834,16 @@ mod err {
         run_and_expect_errors("test_data/parser/inline/err/misplaced_label_err.rs");
     }
     #[test]
+    fn missing_const_type() {
+        run_and_expect_errors("test_data/parser/inline/err/missing_const_type.rs");
+    }
+    #[test]
     fn missing_fn_param_type() {
         run_and_expect_errors("test_data/parser/inline/err/missing_fn_param_type.rs");
+    }
+    #[test]
+    fn missing_static_type() {
+        run_and_expect_errors("test_data/parser/inline/err/missing_static_type.rs");
     }
     #[test]
     fn path_item_without_excl() {
@@ -834,6 +852,10 @@ mod err {
     #[test]
     fn pointer_type_no_mutability() {
         run_and_expect_errors("test_data/parser/inline/err/pointer_type_no_mutability.rs");
+    }
+    #[test]
+    fn postfix_dot_expr_ambiguity() {
+        run_and_expect_errors("test_data/parser/inline/err/postfix_dot_expr_ambiguity.rs");
     }
     #[test]
     fn precise_capturing_invalid() {

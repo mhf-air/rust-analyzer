@@ -5,7 +5,7 @@ use hir::{Semantics, db::HirDatabase, setup_tracing};
 use ide_db::{
     EditionedFileId, FileRange, RootDatabase, SnippetCap,
     assists::ExprFillDefaultMode,
-    base_db::{SourceDatabase, salsa},
+    base_db::SourceDatabase,
     imports::insert_use::{ImportGranularity, InsertUseConfig},
     source_change::FileSystemEdit,
 };
@@ -109,7 +109,7 @@ fn assists(
     resolve: AssistResolveStrategy,
     range: ide_db::FileRange,
 ) -> Vec<Assist> {
-    salsa::attach(db, || {
+    hir::attach_db(db, || {
         HirDatabase::zalsa_register_downcaster(db);
         crate::assists(db, config, resolve, range)
     })
@@ -180,6 +180,7 @@ pub(crate) fn check_assist_import_one(
 
 // There is no way to choose what assist within a group you want to test against,
 // so this is here to allow you choose.
+#[track_caller]
 pub(crate) fn check_assist_by_label(
     assist: Handler,
     #[rust_analyzer::rust_fixture] ra_fixture_before: &str,
@@ -331,7 +332,7 @@ fn check_with_config(
         _ => AssistResolveStrategy::All,
     };
     let mut acc = Assists::new(&ctx, resolve);
-    salsa::attach(&db, || {
+    hir::attach_db(&db, || {
         HirDatabase::zalsa_register_downcaster(&db);
         handler(&mut acc, &ctx);
     });

@@ -28,7 +28,10 @@ use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::AsName,
 };
-use hir_ty::diagnostics::{unsafe_operations, unsafe_operations_for_body};
+use hir_ty::{
+    diagnostics::{unsafe_operations, unsafe_operations_for_body},
+    next_solver::DbInterner,
+};
 use intern::{Interned, Symbol, sym};
 use itertools::Itertools;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1553,8 +1556,8 @@ impl<'db> SemanticsImpl<'db> {
 
     pub fn expr_adjustments(&self, expr: &ast::Expr) -> Option<Vec<Adjustment<'db>>> {
         let mutability = |m| match m {
-            hir_ty::Mutability::Not => Mutability::Shared,
-            hir_ty::Mutability::Mut => Mutability::Mut,
+            hir_ty::next_solver::Mutability::Not => Mutability::Shared,
+            hir_ty::next_solver::Mutability::Mut => Mutability::Mut,
         };
 
         let analyzer = self.analyze(expr.syntax())?;
@@ -1565,7 +1568,7 @@ impl<'db> SemanticsImpl<'db> {
             it.iter()
                 .map(|adjust| {
                     let target =
-                        Type::new_with_resolver(self.db, &analyzer.resolver, adjust.target.clone());
+                        Type::new_with_resolver(self.db, &analyzer.resolver, adjust.target);
                     let kind = match adjust.kind {
                         hir_ty::Adjust::NeverToAny => Adjust::NeverToAny,
                         hir_ty::Adjust::Deref(Some(hir_ty::OverloadedDeref(m))) => {
@@ -1652,11 +1655,15 @@ impl<'db> SemanticsImpl<'db> {
         func: Function,
         subst: impl IntoIterator<Item = Type<'db>>,
     ) -> Option<Function> {
-        let mut substs = hir_ty::TyBuilder::subst_for_def(self.db, TraitId::from(trait_), None);
-        for s in subst {
-            substs = substs.push(s.ty);
-        }
-        Some(self.db.lookup_impl_method(env.env, func.into(), substs.build()).0.into())
+        let interner = DbInterner::new_with(self.db, None, None);
+        let mut subst = subst.into_iter();
+        let substs =
+            hir_ty::next_solver::GenericArgs::for_item(interner, trait_.id.into(), |_, id, _| {
+                assert!(matches!(id, hir_def::GenericParamId::TypeParamId(_)), "expected a type");
+                subst.next().expect("too few subst").ty.into()
+            });
+        assert!(subst.next().is_none(), "too many subst");
+        Some(self.db.lookup_impl_method(env.env, func.into(), substs).0.into())
     }
 
     fn resolve_range_pat(&self, range_pat: &ast::RangePat) -> Option<StructId> {
@@ -2097,6 +2104,22 @@ impl<'db> SemanticsImpl<'db> {
             let Some(parent_) = parent.parent() else { break false };
             parent = parent_;
         }
+    }
+
+    pub fn impl_generated_from_derive(&self, impl_: Impl) -> Option<Adt> {
+        let source = hir_def::src::HasSource::ast_ptr(&impl_.id.loc(self.db), self.db);
+        let mut file_id = source.file_id;
+        let adt_ast_id = loop {
+            let macro_call = file_id.macro_file()?;
+            match macro_call.loc(self.db).kind {
+                hir_expand::MacroCallKind::Derive { ast_id, .. } => break ast_id,
+                hir_expand::MacroCallKind::FnLike { ast_id, .. } => file_id = ast_id.file_id,
+                hir_expand::MacroCallKind::Attr { ast_id, .. } => file_id = ast_id.file_id,
+            }
+        };
+        let adt_source = adt_ast_id.to_in_file_node(self.db);
+        self.cache(adt_source.value.syntax().ancestors().last().unwrap(), adt_source.file_id);
+        ToDef::to_def(self, adt_source.as_ref())
     }
 }
 
