@@ -1,10 +1,10 @@
 //! Describes items defined or visible (ie, imported) in a certain scope.
 //! This is shared between modules and blocks.
 
-use std::sync::LazyLock;
+use std::{fmt, sync::LazyLock};
 
 use base_db::Crate;
-use hir_expand::{AstId, MacroCallId, attrs::AttrId, db::ExpandDatabase, name::Name};
+use hir_expand::{AstId, MacroCallId, attrs::AttrId, name::Name};
 use indexmap::map::Entry;
 use itertools::Itertools;
 use la_arena::Idx;
@@ -17,7 +17,7 @@ use thin_vec::ThinVec;
 
 use crate::{
     AdtId, BuiltinType, ConstId, ExternBlockId, ExternCrateId, FxIndexMap, HasModule, ImplId,
-    LocalModuleId, Lookup, MacroId, ModuleDefId, ModuleId, TraitId, UseId,
+    Lookup, MacroCallStyles, MacroId, ModuleDefId, ModuleId, TraitId, UseId,
     db::DefDatabase,
     per_ns::{Item, MacrosItem, PerNs, TypesItem, ValuesItem},
     visibility::Visibility,
@@ -25,9 +25,9 @@ use crate::{
 
 #[derive(Debug, Default)]
 pub struct PerNsGlobImports {
-    types: FxHashSet<(LocalModuleId, Name)>,
-    values: FxHashSet<(LocalModuleId, Name)>,
-    macros: FxHashSet<(LocalModuleId, Name)>,
+    types: FxHashSet<(ModuleId, Name)>,
+    values: FxHashSet<(ModuleId, Name)>,
+    macros: FxHashSet<(ModuleId, Name)>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -133,13 +133,13 @@ pub struct GlobId {
 }
 
 impl PerNsGlobImports {
-    pub(crate) fn contains_type(&self, module_id: LocalModuleId, name: Name) -> bool {
+    pub(crate) fn contains_type(&self, module_id: ModuleId, name: Name) -> bool {
         self.types.contains(&(module_id, name))
     }
-    pub(crate) fn contains_value(&self, module_id: LocalModuleId, name: Name) -> bool {
+    pub(crate) fn contains_value(&self, module_id: ModuleId, name: Name) -> bool {
         self.values.contains(&(module_id, name))
     }
-    pub(crate) fn contains_macro(&self, module_id: LocalModuleId, name: Name) -> bool {
+    pub(crate) fn contains_macro(&self, module_id: ModuleId, name: Name) -> bool {
         self.macros.contains(&(module_id, name))
     }
 }
@@ -261,14 +261,12 @@ impl ItemScope {
     pub fn fully_resolve_import(&self, db: &dyn DefDatabase, mut import: ImportId) -> PerNs {
         let mut res = PerNs::none();
 
-        let mut def_map;
         let mut scope = self;
         while let Some(&m) = scope.use_imports_macros.get(&ImportOrExternCrate::Import(import)) {
             match m {
                 ImportOrDef::Import(i) => {
                     let module_id = i.use_.lookup(db).container;
-                    def_map = module_id.def_map(db);
-                    scope = &def_map[module_id.local_id].scope;
+                    scope = &module_id.def_map(db)[module_id].scope;
                     import = i;
                 }
                 ImportOrDef::Def(ModuleDefId::MacroId(def)) => {
@@ -283,8 +281,7 @@ impl ItemScope {
             match m {
                 ImportOrDef::Import(i) => {
                     let module_id = i.use_.lookup(db).container;
-                    def_map = module_id.def_map(db);
-                    scope = &def_map[module_id.local_id].scope;
+                    scope = &module_id.def_map(db)[module_id].scope;
                     import = i;
                 }
                 ImportOrDef::Def(def) => {
@@ -299,8 +296,7 @@ impl ItemScope {
             match m {
                 ImportOrDef::Import(i) => {
                     let module_id = i.use_.lookup(db).container;
-                    def_map = module_id.def_map(db);
-                    scope = &def_map[module_id.local_id].scope;
+                    scope = &module_id.def_map(db)[module_id].scope;
                     import = i;
                 }
                 ImportOrDef::Def(def) => {
@@ -578,7 +574,7 @@ impl ItemScope {
     pub(crate) fn push_res_with_import(
         &mut self,
         glob_imports: &mut PerNsGlobImports,
-        lookup: (LocalModuleId, Name),
+        lookup: (ModuleId, Name),
         def: PerNs,
         import: Option<ImportOrExternCrate>,
     ) -> bool {
@@ -735,40 +731,51 @@ impl ItemScope {
         }
     }
 
-    pub(crate) fn dump(&self, db: &dyn ExpandDatabase, buf: &mut String) {
+    pub(crate) fn dump(&self, db: &dyn DefDatabase, buf: &mut String) {
         let mut entries: Vec<_> = self.resolutions().collect();
         entries.sort_by_key(|(name, _)| name.clone());
 
+        let print_macro_sub_ns = |buf: &mut String, macro_id: MacroId| {
+            let styles = crate::nameres::macro_styles_from_id(db, macro_id);
+            if styles.contains(MacroCallStyles::FN_LIKE) {
+                buf.push('!');
+            }
+            if styles.contains(MacroCallStyles::ATTR) || styles.contains(MacroCallStyles::DERIVE) {
+                buf.push('#');
+            }
+        };
+
         for (name, def) in entries {
-            format_to!(
-                buf,
-                "{}:",
-                name.map_or("_".to_owned(), |name| name.display(db, Edition::LATEST).to_string())
-            );
+            let display_name: &dyn fmt::Display = match &name {
+                Some(name) => &name.display(db, Edition::LATEST),
+                None => &"_",
+            };
+            format_to!(buf, "- {display_name} :");
 
             if let Some(Item { import, .. }) = def.types {
-                buf.push_str(" t");
+                buf.push_str(" type");
                 match import {
-                    Some(ImportOrExternCrate::Import(_)) => buf.push('i'),
-                    Some(ImportOrExternCrate::Glob(_)) => buf.push('g'),
-                    Some(ImportOrExternCrate::ExternCrate(_)) => buf.push('e'),
+                    Some(ImportOrExternCrate::Import(_)) => buf.push_str(" (import)"),
+                    Some(ImportOrExternCrate::Glob(_)) => buf.push_str(" (glob)"),
+                    Some(ImportOrExternCrate::ExternCrate(_)) => buf.push_str(" (extern)"),
                     None => (),
                 }
             }
             if let Some(Item { import, .. }) = def.values {
-                buf.push_str(" v");
+                buf.push_str(" value");
                 match import {
-                    Some(ImportOrGlob::Import(_)) => buf.push('i'),
-                    Some(ImportOrGlob::Glob(_)) => buf.push('g'),
+                    Some(ImportOrGlob::Import(_)) => buf.push_str(" (import)"),
+                    Some(ImportOrGlob::Glob(_)) => buf.push_str(" (glob)"),
                     None => (),
                 }
             }
-            if let Some(Item { import, .. }) = def.macros {
-                buf.push_str(" m");
+            if let Some(Item { def: macro_id, import, .. }) = def.macros {
+                buf.push_str(" macro");
+                print_macro_sub_ns(buf, macro_id);
                 match import {
-                    Some(ImportOrExternCrate::Import(_)) => buf.push('i'),
-                    Some(ImportOrExternCrate::Glob(_)) => buf.push('g'),
-                    Some(ImportOrExternCrate::ExternCrate(_)) => buf.push('e'),
+                    Some(ImportOrExternCrate::Import(_)) => buf.push_str(" (import)"),
+                    Some(ImportOrExternCrate::Glob(_)) => buf.push_str(" (glob)"),
+                    Some(ImportOrExternCrate::ExternCrate(_)) => buf.push_str(" (extern)"),
                     None => (),
                 }
             }
@@ -776,6 +783,21 @@ impl ItemScope {
                 buf.push_str(" _");
             }
 
+            buf.push('\n');
+        }
+
+        // Also dump legacy-textual-scope macros visible at the _end_ of the scope.
+        //
+        // For tests involving a cursor position, this might include macros that
+        // are _not_ visible at the cursor position.
+        let mut legacy_macros = self.legacy_macros().collect::<Vec<_>>();
+        legacy_macros.sort_by(|(a, _), (b, _)| Ord::cmp(a, b));
+        for (name, macros) in legacy_macros {
+            format_to!(buf, "- (legacy) {} :", name.display(db, Edition::LATEST));
+            for &macro_id in macros {
+                buf.push_str(" macro");
+                print_macro_sub_ns(buf, macro_id);
+            }
             buf.push('\n');
         }
     }
@@ -896,10 +918,7 @@ impl ItemInNs {
 
     /// Returns the crate defining this item (or `None` if `self` is built-in).
     pub fn krate(&self, db: &dyn DefDatabase) -> Option<Crate> {
-        match self {
-            ItemInNs::Types(id) | ItemInNs::Values(id) => id.module(db).map(|m| m.krate),
-            ItemInNs::Macros(id) => Some(id.module(db).krate),
-        }
+        self.module(db).map(|module_id| module_id.krate(db))
     }
 
     pub fn module(&self, db: &dyn DefDatabase) -> Option<ModuleId> {

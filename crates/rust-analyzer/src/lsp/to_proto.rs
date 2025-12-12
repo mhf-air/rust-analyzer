@@ -119,7 +119,7 @@ pub(crate) fn diagnostic_severity(severity: Severity) -> lsp_types::DiagnosticSe
     }
 }
 
-pub(crate) fn documentation(documentation: Documentation) -> lsp_types::Documentation {
+pub(crate) fn documentation(documentation: Documentation<'_>) -> lsp_types::Documentation {
     let value = format_docs(&documentation);
     let markup_content = lsp_types::MarkupContent { kind: lsp_types::MarkupKind::Markdown, value };
     lsp_types::Documentation::MarkupContent(markup_content)
@@ -882,6 +882,7 @@ fn semantic_token_type_and_modifiers(
             HlMod::ControlFlow => mods::CONTROL_FLOW,
             HlMod::CrateRoot => mods::CRATE_ROOT,
             HlMod::DefaultLibrary => mods::DEFAULT_LIBRARY,
+            HlMod::Deprecated => mods::DEPRECATED,
             HlMod::Definition => mods::DECLARATION,
             HlMod::Documentation => mods::DOCUMENTATION,
             HlMod::Injected => mods::INJECTED,
@@ -1974,7 +1975,7 @@ pub(crate) fn markup_content(
         ide::HoverDocFormat::Markdown => lsp_types::MarkupKind::Markdown,
         ide::HoverDocFormat::PlainText => lsp_types::MarkupKind::PlainText,
     };
-    let value = format_docs(&Documentation::new(markup.into()));
+    let value = format_docs(&Documentation::new_owned(markup.into()));
     lsp_types::MarkupContent { kind, value }
 }
 

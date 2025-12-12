@@ -129,17 +129,35 @@ pub(crate) fn handle_analyzer_status(
     Ok(buf)
 }
 
-pub(crate) fn handle_memory_usage(state: &mut GlobalState, _: ()) -> anyhow::Result<String> {
+pub(crate) fn handle_memory_usage(_state: &mut GlobalState, _: ()) -> anyhow::Result<String> {
     let _p = tracing::info_span!("handle_memory_usage").entered();
-    let mem = state.analysis_host.per_query_memory_usage();
 
-    let mut out = String::new();
-    for (name, bytes, entries) in mem {
-        format_to!(out, "{:>8} {:>6} {}\n", bytes, entries, name);
+    #[cfg(not(feature = "dhat"))]
+    {
+        Err(anyhow::anyhow!(
+            "Memory profiling is not enabled for this build of rust-analyzer.\n\n\
+            To build rust-analyzer with profiling support, pass `--features dhat --profile dev-rel` to `cargo build`
+            when building from source, or pass `--enable-profiling` to `cargo xtask`."
+        ))
     }
-    format_to!(out, "{:>8}        Remaining\n", profile::memory_usage().allocated);
-
-    Ok(out)
+    #[cfg(feature = "dhat")]
+    {
+        if let Some(dhat_output_file) = _state.config.dhat_output_file() {
+            let mut profiler = crate::DHAT_PROFILER.lock().unwrap();
+            let old_profiler = profiler.take();
+            // Need to drop the old profiler before creating a new one.
+            drop(old_profiler);
+            *profiler = Some(dhat::Profiler::builder().file_name(&dhat_output_file).build());
+            Ok(format!(
+                "Memory profile was saved successfully to {dhat_output_file}.\n\n\
+                See https://docs.rs/dhat/latest/dhat/#viewing for how to inspect the profile."
+            ))
+        } else {
+            Err(anyhow::anyhow!(
+                "Please set `rust-analyzer.profiling.memoryProfile` to the path where you want to save the profile."
+            ))
+        }
+    }
 }
 
 pub(crate) fn handle_view_syntax_tree(
@@ -269,6 +287,7 @@ pub(crate) fn handle_run_test(
                     path,
                     state.config.cargo_test_options(None),
                     cargo.workspace_root(),
+                    Some(cargo.target_directory().as_ref()),
                     target,
                     state.test_run_sender.clone(),
                 )?;
@@ -2366,21 +2385,9 @@ fn run_rustfmt(
     let file_id = try_default!(from_proto::file_id(snap, &text_document.uri)?);
     let file = snap.analysis.file_text(file_id)?;
 
-    // Determine the edition of the crate the file belongs to (if there's multiple, we pick the
-    // highest edition).
-    let Ok(editions) = snap
-        .analysis
-        .relevant_crates_for(file_id)?
-        .into_iter()
-        .map(|crate_id| snap.analysis.crate_edition(crate_id))
-        .collect::<Result<Vec<_>, _>>()
-    else {
-        return Ok(None);
-    };
-    let edition = editions.iter().copied().max();
-
     let line_index = snap.file_line_index(file_id)?;
     let source_root_id = snap.analysis.source_root_id(file_id).ok();
+    let crates = snap.analysis.relevant_crates_for(file_id)?;
 
     // try to chdir to the file so we can respect `rustfmt.toml`
     // FIXME: use `rustfmt --config-path` once
@@ -2401,6 +2408,17 @@ fn run_rustfmt(
 
     let mut command = match snap.config.rustfmt(source_root_id) {
         RustfmtConfig::Rustfmt { extra_args, enable_range_formatting } => {
+            // Determine the edition of the crate the file belongs to (if there's multiple, we pick the
+            // highest edition).
+            let Ok(editions) = crates
+                .iter()
+                .map(|&crate_id| snap.analysis.crate_edition(crate_id))
+                .collect::<Result<Vec<_>, _>>()
+            else {
+                return Ok(None);
+            };
+            let edition = editions.iter().copied().max();
+
             // FIXME: Set RUSTUP_TOOLCHAIN
             let mut cmd = toolchain::command(
                 toolchain::Tool::Rustfmt.path(),
@@ -2447,7 +2465,8 @@ fn run_rustfmt(
         }
         RustfmtConfig::CustomCommand { command, args } => {
             let cmd = Utf8PathBuf::from(&command);
-            let target_spec = TargetSpec::for_file(snap, file_id)?;
+            let target_spec =
+                crates.first().and_then(|&crate_id| snap.target_spec_for_file(file_id, crate_id));
             let extra_env = snap.config.extra_env(source_root_id);
             let mut cmd = match target_spec {
                 Some(TargetSpec::Cargo(_)) => {

@@ -7,6 +7,7 @@ use rustc_type_ir::{
     GenericArgKind, Interner, TermKind, TyKind, TyVid, Variance,
     inherent::{GenericArg as _, GenericsOf, IntoKind, SliceLike, Term as _, Ty as _},
     relate::{Relate, VarianceDiagInfo},
+    walk::TypeWalker,
 };
 use smallvec::SmallVec;
 
@@ -17,7 +18,7 @@ use super::{
     generics::Generics,
 };
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable, salsa::Supertype)]
 pub enum GenericArg<'db> {
     Ty(Ty<'db>),
     Lifetime(Region<'db>),
@@ -77,6 +78,11 @@ impl<'db> GenericArg<'db> {
             GenericParamId::ConstParamId(_) => Const::error(interner).into(),
             GenericParamId::LifetimeParamId(_) => Region::error(interner).into(),
         }
+    }
+
+    #[inline]
+    pub fn walk(self) -> TypeWalker<DbInterner<'db>> {
+        TypeWalker::new(self)
     }
 }
 
@@ -196,6 +202,11 @@ impl<'db> GenericArgs<'db> {
     {
         let defs = interner.generics_of(def_id);
         let count = defs.count();
+
+        if count == 0 {
+            return Default::default();
+        }
+
         let mut args = SmallVec::with_capacity(count);
         Self::fill_item(&mut args, interner, defs, &mut mk_kind);
         interner.mk_args(&args)

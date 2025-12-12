@@ -8,8 +8,9 @@ use core::fmt;
 use std::{env, fs, ops::Not, path::Path, process::Command};
 
 use anyhow::{Result, format_err};
+use base_db::Env;
 use itertools::Itertools;
-use paths::{AbsPath, AbsPathBuf, Utf8Path, Utf8PathBuf};
+use paths::{AbsPath, AbsPathBuf, Utf8PathBuf};
 use rustc_hash::FxHashMap;
 use stdx::format_to;
 use toolchain::{Tool, probe_for_binary};
@@ -172,6 +173,36 @@ impl Sysroot {
         }
     }
 
+    pub fn tool_path(&self, tool: Tool, current_dir: impl AsRef<Path>, envs: &Env) -> Utf8PathBuf {
+        match self.root() {
+            Some(root) => {
+                let mut cmd = toolchain::command(
+                    Tool::Rustup.path(),
+                    current_dir,
+                    &envs
+                        .into_iter()
+                        .map(|(k, v)| (k.clone(), Some(v.clone())))
+                        .collect::<FxHashMap<_, _>>(),
+                );
+                if !envs.contains_key("RUSTUP_TOOLCHAIN")
+                    && std::env::var_os("RUSTUP_TOOLCHAIN").is_none()
+                {
+                    cmd.env("RUSTUP_TOOLCHAIN", AsRef::<std::path::Path>::as_ref(root));
+                }
+
+                cmd.arg("which");
+                cmd.arg(tool.name());
+                (|| {
+                    Some(Utf8PathBuf::from(
+                        String::from_utf8(cmd.output().ok()?.stdout).ok()?.trim_end(),
+                    ))
+                })()
+                .unwrap_or_else(|| Utf8PathBuf::from(tool.name()))
+            }
+            _ => tool.path(),
+        }
+    }
+
     pub fn discover_proc_macro_srv(&self) -> Option<anyhow::Result<AbsPathBuf>> {
         let root = self.root()?;
         Some(
@@ -219,7 +250,6 @@ impl Sysroot {
         &self,
         sysroot_source_config: &RustSourceWorkspaceConfig,
         no_deps: bool,
-        target_dir: &Utf8Path,
         progress: &dyn Fn(String),
     ) -> Option<RustLibSrcWorkspace> {
         assert!(matches!(self.workspace, RustLibSrcWorkspace::Empty), "workspace already loaded");
@@ -233,7 +263,6 @@ impl Sysroot {
                 match self.load_library_via_cargo(
                     &library_manifest,
                     src_root,
-                    target_dir,
                     cargo_config,
                     no_deps,
                     progress,
@@ -328,7 +357,6 @@ impl Sysroot {
         &self,
         library_manifest: &ManifestPath,
         current_dir: &AbsPath,
-        target_dir: &Utf8Path,
         cargo_config: &CargoMetadataConfig,
         no_deps: bool,
         progress: &dyn Fn(String),
@@ -345,7 +373,7 @@ impl Sysroot {
         let locked = true;
         let (mut res, err) =
             FetchMetadata::new(library_manifest, current_dir, &cargo_config, self, no_deps)
-                .exec(target_dir, locked, progress)?;
+                .exec(locked, progress)?;
 
         // Patch out `rustc-std-workspace-*` crates to point to the real crates.
         // This is done prior to `CrateGraph` construction to prevent de-duplication logic from failing.

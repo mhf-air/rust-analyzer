@@ -5,7 +5,8 @@ mod tests;
 
 use base_db::Crate;
 use hir_def::{
-    EnumVariantId, GeneralConstId, HasModule, StaticId,
+    ConstId, EnumVariantId, GeneralConstId, HasModule, StaticId,
+    attrs::AttrFlags,
     expr_store::Body,
     hir::{Expr, ExprId},
     type_ref::LiteralConstRef,
@@ -15,14 +16,14 @@ use rustc_type_ir::inherent::IntoKind;
 use triomphe::Arc;
 
 use crate::{
-    LifetimeElisionKind, MemoryMap, TraitEnvironment, TyLoweringContext,
+    LifetimeElisionKind, MemoryMap, ParamEnvAndCrate, TyLoweringContext,
     db::HirDatabase,
     display::DisplayTarget,
     infer::InferenceContext,
     mir::{MirEvalError, MirLowerError},
     next_solver::{
         Const, ConstBytes, ConstKind, DbInterner, ErrorGuaranteed, GenericArg, GenericArgs,
-        SolverDefId, Ty, ValueConst,
+        ParamEnv, Ty, ValueConst,
     },
 };
 
@@ -83,8 +84,8 @@ pub fn intern_const_ref<'a>(
     ty: Ty<'a>,
     krate: Crate,
 ) -> Const<'a> {
-    let interner = DbInterner::new_with(db, Some(krate), None);
-    let layout = db.layout_of_ty(ty, TraitEnvironment::empty(krate));
+    let interner = DbInterner::new_no_crate(db);
+    let layout = db.layout_of_ty(ty, ParamEnvAndCrate { param_env: ParamEnv::empty(), krate });
     let kind = match value {
         LiteralConstRef::Int(i) => {
             // FIXME: We should handle failure of layout better.
@@ -128,7 +129,7 @@ pub fn usize_const<'db>(db: &'db dyn HirDatabase, value: Option<u128>, krate: Cr
     intern_const_ref(
         db,
         &value.map_or(LiteralConstRef::Unknown, LiteralConstRef::UInt),
-        Ty::new_uint(DbInterner::new_with(db, Some(krate), None), rustc_type_ir::UintTy::Usize),
+        Ty::new_uint(DbInterner::new_no_crate(db), rustc_type_ir::UintTy::Usize),
         krate,
     )
 }
@@ -139,16 +140,17 @@ pub fn try_const_usize<'db>(db: &'db dyn HirDatabase, c: Const<'db>) -> Option<u
         ConstKind::Infer(_) => None,
         ConstKind::Bound(_, _) => None,
         ConstKind::Placeholder(_) => None,
-        ConstKind::Unevaluated(unevaluated_const) => {
-            let c = match unevaluated_const.def {
-                SolverDefId::ConstId(id) => GeneralConstId::ConstId(id),
-                SolverDefId::StaticId(id) => GeneralConstId::StaticId(id),
-                _ => unreachable!(),
-            };
-            let subst = unevaluated_const.args;
-            let ec = db.const_eval(c, subst, None).ok()?;
-            try_const_usize(db, ec)
-        }
+        ConstKind::Unevaluated(unevaluated_const) => match unevaluated_const.def.0 {
+            GeneralConstId::ConstId(id) => {
+                let subst = unevaluated_const.args;
+                let ec = db.const_eval(id, subst, None).ok()?;
+                try_const_usize(db, ec)
+            }
+            GeneralConstId::StaticId(id) => {
+                let ec = db.const_eval_static(id).ok()?;
+                try_const_usize(db, ec)
+            }
+        },
         ConstKind::Value(val) => Some(u128::from_le_bytes(pad16(&val.value.inner().memory, false))),
         ConstKind::Error(_) => None,
         ConstKind::Expr(_) => None,
@@ -161,16 +163,17 @@ pub fn try_const_isize<'db>(db: &'db dyn HirDatabase, c: &Const<'db>) -> Option<
         ConstKind::Infer(_) => None,
         ConstKind::Bound(_, _) => None,
         ConstKind::Placeholder(_) => None,
-        ConstKind::Unevaluated(unevaluated_const) => {
-            let c = match unevaluated_const.def {
-                SolverDefId::ConstId(id) => GeneralConstId::ConstId(id),
-                SolverDefId::StaticId(id) => GeneralConstId::StaticId(id),
-                _ => unreachable!(),
-            };
-            let subst = unevaluated_const.args;
-            let ec = db.const_eval(c, subst, None).ok()?;
-            try_const_isize(db, &ec)
-        }
+        ConstKind::Unevaluated(unevaluated_const) => match unevaluated_const.def.0 {
+            GeneralConstId::ConstId(id) => {
+                let subst = unevaluated_const.args;
+                let ec = db.const_eval(id, subst, None).ok()?;
+                try_const_isize(db, &ec)
+            }
+            GeneralConstId::StaticId(id) => {
+                let ec = db.const_eval_static(id).ok()?;
+                try_const_isize(db, &ec)
+            }
+        },
         ConstKind::Value(val) => Some(i128::from_le_bytes(pad16(&val.value.inner().memory, true))),
         ConstKind::Error(_) => None,
         ConstKind::Expr(_) => None,
@@ -181,7 +184,7 @@ pub(crate) fn const_eval_discriminant_variant<'db>(
     db: &'db dyn HirDatabase,
     variant_id: EnumVariantId,
 ) -> Result<i128, ConstEvalError<'db>> {
-    let interner = DbInterner::new_with(db, None, None);
+    let interner = DbInterner::new_no_crate(db);
     let def = variant_id.into();
     let body = db.body(def);
     let loc = variant_id.lookup(db);
@@ -198,13 +201,13 @@ pub(crate) fn const_eval_discriminant_variant<'db>(
         return Ok(value);
     }
 
-    let repr = db.enum_signature(loc.parent).repr;
+    let repr = AttrFlags::repr(db, loc.parent.into());
     let is_signed = repr.and_then(|repr| repr.int).is_none_or(|int| int.is_signed());
 
     let mir_body = db.monomorphized_mir_body(
         def,
         GenericArgs::new_from_iter(interner, []),
-        db.trait_environment_for_body(def),
+        ParamEnvAndCrate { param_env: db.trait_environment_for_body(def), krate: def.krate(db) },
     )?;
     let c = interpret_mir(db, mir_body, false, None)?.0?;
     let c = if is_signed {
@@ -254,9 +257,9 @@ pub(crate) fn eval_to_const<'db>(expr: ExprId, ctx: &mut InferenceContext<'_, 'd
 
 pub(crate) fn const_eval_cycle_result<'db>(
     _: &'db dyn HirDatabase,
-    _: GeneralConstId,
+    _: ConstId,
     _: GenericArgs<'db>,
-    _: Option<Arc<TraitEnvironment<'db>>>,
+    _: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<Const<'db>, ConstEvalError<'db>> {
     Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
 }
@@ -277,19 +280,15 @@ pub(crate) fn const_eval_discriminant_cycle_result<'db>(
 
 pub(crate) fn const_eval_query<'db>(
     db: &'db dyn HirDatabase,
-    def: GeneralConstId,
+    def: ConstId,
     subst: GenericArgs<'db>,
-    trait_env: Option<Arc<TraitEnvironment<'db>>>,
+    trait_env: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<Const<'db>, ConstEvalError<'db>> {
-    let body = match def {
-        GeneralConstId::ConstId(c) => {
-            db.monomorphized_mir_body(c.into(), subst, db.trait_environment(c.into()))?
-        }
-        GeneralConstId::StaticId(s) => {
-            let krate = s.module(db).krate();
-            db.monomorphized_mir_body(s.into(), subst, TraitEnvironment::empty(krate))?
-        }
-    };
+    let body = db.monomorphized_mir_body(
+        def.into(),
+        subst,
+        ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) },
+    )?;
     let c = interpret_mir(db, body, false, trait_env)?.0?;
     Ok(c)
 }
@@ -298,11 +297,14 @@ pub(crate) fn const_eval_static_query<'db>(
     db: &'db dyn HirDatabase,
     def: StaticId,
 ) -> Result<Const<'db>, ConstEvalError<'db>> {
-    let interner = DbInterner::new_with(db, None, None);
+    let interner = DbInterner::new_no_crate(db);
     let body = db.monomorphized_mir_body(
         def.into(),
         GenericArgs::new_from_iter(interner, []),
-        db.trait_environment_for_body(def.into()),
+        ParamEnvAndCrate {
+            param_env: db.trait_environment_for_body(def.into()),
+            krate: def.krate(db),
+        },
     )?;
     let c = interpret_mir(db, body, false, None)?.0?;
     Ok(c)

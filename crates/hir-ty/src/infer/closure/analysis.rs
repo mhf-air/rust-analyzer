@@ -11,11 +11,8 @@ use hir_def::{
         Statement, UnaryOp,
     },
     item_tree::FieldsShape,
-    lang_item::LangItem,
     resolver::ValueNs,
 };
-use hir_expand::name::Name;
-use intern::sym;
 use rustc_ast_ir::Mutability;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::{IntoKind, SliceLike, Ty as _};
@@ -34,10 +31,10 @@ use crate::{
 
 // The below functions handle capture and closure kind (Fn, FnMut, ..)
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update)]
 pub(crate) struct HirPlace<'db> {
     pub(crate) local: BindingId,
-    pub(crate) projections: Vec<ProjectionElem<Infallible, Ty<'db>>>,
+    pub(crate) projections: Vec<ProjectionElem<'db, Infallible>>,
 }
 
 impl<'db> HirPlace<'db> {
@@ -46,11 +43,12 @@ impl<'db> HirPlace<'db> {
         for p in &self.projections {
             ty = p.projected_ty(
                 &ctx.table.infer_ctxt,
+                ctx.table.param_env,
                 ty,
                 |_, _, _| {
                     unreachable!("Closure field only happens in MIR");
                 },
-                ctx.owner.module(ctx.db).krate(),
+                ctx.owner.module(ctx.db).krate(ctx.db),
             );
         }
         ty
@@ -79,7 +77,7 @@ pub enum CaptureKind {
     ByValue,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
 pub struct CapturedItem<'db> {
     pub(crate) place: HirPlace<'db>,
     pub(crate) kind: CaptureKind,
@@ -90,6 +88,7 @@ pub struct CapturedItem<'db> {
     /// copy all captures of the inner closure to the outer closure, and then we may
     /// truncate them, and we want the correct span to be reported.
     span_stacks: SmallVec<[SmallVec<[MirSpan; 3]>; 3]>,
+    #[update(unsafe(with(crate::utils::unsafe_update_eq)))]
     pub(crate) ty: EarlyBinder<'db, Ty<'db>>,
 }
 
@@ -104,7 +103,7 @@ impl<'db> CapturedItem<'db> {
     }
 
     pub fn ty(&self, db: &'db dyn HirDatabase, subst: GenericArgs<'db>) -> Ty<'db> {
-        let interner = DbInterner::new_with(db, None, None);
+        let interner = DbInterner::new_no_crate(db);
         self.ty.instantiate(interner, subst.split_closure_args_untupled().parent_args)
     }
 
@@ -151,7 +150,7 @@ impl<'db> CapturedItem<'db> {
                 }
             }
         }
-        if is_raw_identifier(&result, owner.module(db).krate().data(db).edition) {
+        if is_raw_identifier(&result, owner.module(db).krate(db).data(db).edition) {
             result.insert_str(0, "r#");
         }
         result
@@ -351,10 +350,12 @@ impl<'db> InferenceContext<'_, 'db> {
                 return Some(place);
             }
             Expr::UnaryOp { expr, op: UnaryOp::Deref } => {
-                if matches!(
-                    self.expr_ty_after_adjustments(*expr).kind(),
-                    TyKind::Ref(..) | TyKind::RawPtr(..)
-                ) {
+                let is_builtin_deref = match self.expr_ty(*expr).kind() {
+                    TyKind::Ref(..) | TyKind::RawPtr(..) => true,
+                    TyKind::Adt(adt_def, _) if adt_def.is_box() => true,
+                    _ => false,
+                };
+                if is_builtin_deref {
                     let mut place = self.place_of_expr(*expr)?;
                     self.current_capture_span_stack.push(MirSpan::ExprId(tgt_expr));
                     place.projections.push(ProjectionElem::Deref);
@@ -609,28 +610,19 @@ impl<'db> InferenceContext<'_, 'db> {
             }
             Expr::Field { expr, name: _ } => self.select_from_expr(*expr),
             Expr::UnaryOp { expr, op: UnaryOp::Deref } => {
-                if matches!(
-                    self.expr_ty_after_adjustments(*expr).kind(),
-                    TyKind::Ref(..) | TyKind::RawPtr(..)
-                ) {
-                    self.select_from_expr(*expr);
-                } else if let Some((f, _)) = self.result.method_resolution(tgt_expr) {
-                    let mutability = 'b: {
-                        if let Some(deref_trait) =
-                            self.resolve_lang_item(LangItem::DerefMut).and_then(|it| it.as_trait())
-                            && let Some(deref_fn) = deref_trait
-                                .trait_items(self.db)
-                                .method_by_name(&Name::new_symbol_root(sym::deref_mut))
-                        {
-                            break 'b deref_fn == f;
+                if self.result.method_resolution(tgt_expr).is_some() {
+                    // Overloaded deref.
+                    match self.expr_ty_after_adjustments(*expr).kind() {
+                        TyKind::Ref(_, _, mutability) => {
+                            let place = self.place_of_expr(*expr);
+                            match mutability {
+                                Mutability::Mut => self.mutate_expr(*expr, place),
+                                Mutability::Not => self.ref_expr(*expr, place),
+                            }
                         }
-                        false
-                    };
-                    let place = self.place_of_expr(*expr);
-                    if mutability {
-                        self.mutate_expr(*expr, place);
-                    } else {
-                        self.ref_expr(*expr, place);
+                        // FIXME: Is this correct wrt. raw pointer derefs?
+                        TyKind::RawPtr(..) => self.select_from_expr(*expr),
+                        _ => never!("deref adjustments should include taking a mutable reference"),
                     }
                 } else {
                     self.select_from_expr(*expr);
@@ -806,20 +798,6 @@ impl<'db> InferenceContext<'_, 'db> {
         self.body.walk_pats_shallow(p, |p| self.walk_pat_inner(p, update_result, for_mut));
     }
 
-    fn expr_ty(&self, expr: ExprId) -> Ty<'db> {
-        self.result[expr]
-    }
-
-    fn expr_ty_after_adjustments(&self, e: ExprId) -> Ty<'db> {
-        let mut ty = None;
-        if let Some(it) = self.result.expr_adjustments.get(&e)
-            && let Some(it) = it.last()
-        {
-            ty = Some(it.target);
-        }
-        ty.unwrap_or_else(|| self.expr_ty(e))
-    }
-
     fn is_upvar(&self, place: &HirPlace<'db>) -> bool {
         if let Some(c) = self.current_closure {
             let InternedClosure(_, root) = self.db.lookup_intern_closure(c);
@@ -862,11 +840,12 @@ impl<'db> InferenceContext<'_, 'db> {
             for (i, p) in capture.place.projections.iter().enumerate() {
                 ty = p.projected_ty(
                     &self.table.infer_ctxt,
+                    self.table.param_env,
                     ty,
                     |_, _, _| {
                         unreachable!("Closure field only happens in MIR");
                     },
-                    self.owner.module(self.db).krate(),
+                    self.owner.module(self.db).krate(self.db),
                 );
                 if ty.is_raw_ptr() || ty.is_union() {
                     capture.kind = CaptureKind::ByRef(BorrowKind::Shared);

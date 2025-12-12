@@ -109,7 +109,7 @@ impl<'db> InferenceContext<'_, 'db> {
 
                     let expected =
                         EarlyBinder::bind(ty.ty).instantiate(interner, opaque_type_key.args);
-                    self.demand_eqtype(expected, hidden_type.ty);
+                    _ = self.demand_eqtype_fixme_no_diag(expected, hidden_type.ty);
                 }
 
                 self.result.type_of_opaque.insert(def_id, ty.ty);
@@ -136,7 +136,7 @@ impl<'db> InferenceContext<'_, 'db> {
         }
 
         let cause = ObligationCause::new();
-        let at = self.table.infer_ctxt.at(&cause, self.table.trait_env.env);
+        let at = self.table.infer_ctxt.at(&cause, self.table.param_env);
         let hidden_type = match at.deeply_normalize(hidden_type) {
             Ok(hidden_type) => hidden_type,
             Err(_errors) => OpaqueHiddenType { ty: self.types.error },

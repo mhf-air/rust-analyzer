@@ -5,14 +5,13 @@ mod asm;
 mod generics;
 mod path;
 
-use std::mem;
+use std::{cell::OnceCell, mem};
 
 use base_db::FxIndexSet;
 use cfg::CfgOptions;
 use either::Either;
 use hir_expand::{
     HirFileId, InFile, MacroDefId,
-    mod_path::tool_path,
     name::{AsName, Name},
     span_map::SpanMapRef,
 };
@@ -34,6 +33,7 @@ use tt::TextRange;
 use crate::{
     AdtId, BlockId, BlockLoc, DefWithBodyId, FunctionId, GenericDefId, ImplId, MacroId,
     ModuleDefId, ModuleId, TraitId, TypeAliasId, UnresolvedMacro,
+    attrs::AttrFlags,
     builtin_type::BuiltinUint,
     db::DefDatabase,
     expr_store::{
@@ -57,7 +57,7 @@ use crate::{
     },
     item_scope::BuiltinShadowMode,
     item_tree::FieldsShape,
-    lang_item::LangItem,
+    lang_item::{LangItemTarget, LangItems},
     nameres::{DefMap, LocalDefMap, MacroSubNs, block_def_map},
     type_ref::{
         ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, Mutability, PathId, Rawness,
@@ -87,14 +87,16 @@ pub(super) fn lower_body(
     let mut params = vec![];
     let mut collector = ExprCollector::new(db, module, current_file_id);
 
-    let skip_body = match owner {
-        DefWithBodyId::FunctionId(it) => db.attrs(it.into()),
-        DefWithBodyId::StaticId(it) => db.attrs(it.into()),
-        DefWithBodyId::ConstId(it) => db.attrs(it.into()),
-        DefWithBodyId::VariantId(it) => db.attrs(it.into()),
-    }
-    .rust_analyzer_tool()
-    .any(|attr| *attr.path() == tool_path![skip]);
+    let skip_body = AttrFlags::query(
+        db,
+        match owner {
+            DefWithBodyId::FunctionId(it) => it.into(),
+            DefWithBodyId::StaticId(it) => it.into(),
+            DefWithBodyId::ConstId(it) => it.into(),
+            DefWithBodyId::VariantId(it) => it.into(),
+        },
+    )
+    .contains(AttrFlags::RUST_ANALYZER_SKIP);
     // If #[rust_analyzer::skip] annotated, only construct enough information for the signature
     // and skip the body.
     if skip_body {
@@ -416,6 +418,7 @@ pub struct ExprCollector<'db> {
     def_map: &'db DefMap,
     local_def_map: &'db LocalDefMap,
     module: ModuleId,
+    lang_items: OnceCell<&'db LangItems>,
     pub store: ExpressionStoreBuilder,
 
     // state stuff
@@ -431,9 +434,10 @@ pub struct ExprCollector<'db> {
     current_try_block_label: Option<LabelId>,
 
     label_ribs: Vec<LabelRib>,
-    current_binding_owner: Option<ExprId>,
+    unowned_bindings: Vec<BindingId>,
 
     awaitable_context: Option<Awaitable>,
+    krate: base_db::Crate,
 }
 
 #[derive(Clone, Debug)]
@@ -513,7 +517,7 @@ impl BindingList {
     }
 }
 
-impl ExprCollector<'_> {
+impl<'db> ExprCollector<'db> {
     pub fn new(
         db: &dyn DefDatabase,
         module: ModuleId,
@@ -521,22 +525,30 @@ impl ExprCollector<'_> {
     ) -> ExprCollector<'_> {
         let (def_map, local_def_map) = module.local_def_map(db);
         let expander = Expander::new(db, current_file_id, def_map);
+        let krate = module.krate(db);
         ExprCollector {
             db,
-            cfg_options: module.krate().cfg_options(db),
+            cfg_options: krate.cfg_options(db),
             module,
             def_map,
             local_def_map,
+            lang_items: OnceCell::new(),
             store: ExpressionStoreBuilder::default(),
             expander,
             current_try_block_label: None,
             is_lowering_coroutine: false,
             label_ribs: Vec::new(),
-            current_binding_owner: None,
+            unowned_bindings: Vec::new(),
             awaitable_context: None,
             current_block_legacy_macro_defs_count: FxHashMap::default(),
             outer_impl_trait: false,
+            krate,
         }
+    }
+
+    #[inline]
+    pub(crate) fn lang_items(&self) -> &'db LangItems {
+        self.lang_items.get_or_init(|| crate::lang_item::lang_items(self.db, self.def_map.krate()))
     }
 
     #[inline]
@@ -1053,12 +1065,10 @@ impl ExprCollector<'_> {
                 Some(ast::BlockModifier::Const(_)) => {
                     self.with_label_rib(RibKind::Constant, |this| {
                         this.with_awaitable_block(Awaitable::No("constant block"), |this| {
-                            let (result_expr_id, prev_binding_owner) =
-                                this.initialize_binding_owner(syntax_ptr);
-                            let inner_expr = this.collect_block(e);
-                            this.store.exprs[result_expr_id] = Expr::Const(inner_expr);
-                            this.current_binding_owner = prev_binding_owner;
-                            result_expr_id
+                            this.with_binding_owner(|this| {
+                                let inner_expr = this.collect_block(e);
+                                this.alloc_expr(Expr::Const(inner_expr), syntax_ptr)
+                            })
                         })
                     })
                 }
@@ -1269,64 +1279,65 @@ impl ExprCollector<'_> {
                 }
             }
             ast::Expr::ClosureExpr(e) => self.with_label_rib(RibKind::Closure, |this| {
-                let (result_expr_id, prev_binding_owner) =
-                    this.initialize_binding_owner(syntax_ptr);
-                let mut args = Vec::new();
-                let mut arg_types = Vec::new();
-                if let Some(pl) = e.param_list() {
-                    let num_params = pl.params().count();
-                    args.reserve_exact(num_params);
-                    arg_types.reserve_exact(num_params);
-                    for param in pl.params() {
-                        let pat = this.collect_pat_top(param.pat());
-                        let type_ref =
-                            param.ty().map(|it| this.lower_type_ref_disallow_impl_trait(it));
-                        args.push(pat);
-                        arg_types.push(type_ref);
+                this.with_binding_owner(|this| {
+                    let mut args = Vec::new();
+                    let mut arg_types = Vec::new();
+                    if let Some(pl) = e.param_list() {
+                        let num_params = pl.params().count();
+                        args.reserve_exact(num_params);
+                        arg_types.reserve_exact(num_params);
+                        for param in pl.params() {
+                            let pat = this.collect_pat_top(param.pat());
+                            let type_ref =
+                                param.ty().map(|it| this.lower_type_ref_disallow_impl_trait(it));
+                            args.push(pat);
+                            arg_types.push(type_ref);
+                        }
                     }
-                }
-                let ret_type = e
-                    .ret_type()
-                    .and_then(|r| r.ty())
-                    .map(|it| this.lower_type_ref_disallow_impl_trait(it));
+                    let ret_type = e
+                        .ret_type()
+                        .and_then(|r| r.ty())
+                        .map(|it| this.lower_type_ref_disallow_impl_trait(it));
 
-                let prev_is_lowering_coroutine = mem::take(&mut this.is_lowering_coroutine);
-                let prev_try_block_label = this.current_try_block_label.take();
+                    let prev_is_lowering_coroutine = mem::take(&mut this.is_lowering_coroutine);
+                    let prev_try_block_label = this.current_try_block_label.take();
 
-                let awaitable = if e.async_token().is_some() {
-                    Awaitable::Yes
-                } else {
-                    Awaitable::No("non-async closure")
-                };
-                let body =
-                    this.with_awaitable_block(awaitable, |this| this.collect_expr_opt(e.body()));
-
-                let closure_kind = if this.is_lowering_coroutine {
-                    let movability = if e.static_token().is_some() {
-                        Movability::Static
+                    let awaitable = if e.async_token().is_some() {
+                        Awaitable::Yes
                     } else {
-                        Movability::Movable
+                        Awaitable::No("non-async closure")
                     };
-                    ClosureKind::Coroutine(movability)
-                } else if e.async_token().is_some() {
-                    ClosureKind::Async
-                } else {
-                    ClosureKind::Closure
-                };
-                let capture_by =
-                    if e.move_token().is_some() { CaptureBy::Value } else { CaptureBy::Ref };
-                this.is_lowering_coroutine = prev_is_lowering_coroutine;
-                this.current_binding_owner = prev_binding_owner;
-                this.current_try_block_label = prev_try_block_label;
-                this.store.exprs[result_expr_id] = Expr::Closure {
-                    args: args.into(),
-                    arg_types: arg_types.into(),
-                    ret_type,
-                    body,
-                    closure_kind,
-                    capture_by,
-                };
-                result_expr_id
+                    let body = this
+                        .with_awaitable_block(awaitable, |this| this.collect_expr_opt(e.body()));
+
+                    let closure_kind = if this.is_lowering_coroutine {
+                        let movability = if e.static_token().is_some() {
+                            Movability::Static
+                        } else {
+                            Movability::Movable
+                        };
+                        ClosureKind::Coroutine(movability)
+                    } else if e.async_token().is_some() {
+                        ClosureKind::Async
+                    } else {
+                        ClosureKind::Closure
+                    };
+                    let capture_by =
+                        if e.move_token().is_some() { CaptureBy::Value } else { CaptureBy::Ref };
+                    this.is_lowering_coroutine = prev_is_lowering_coroutine;
+                    this.current_try_block_label = prev_try_block_label;
+                    this.alloc_expr(
+                        Expr::Closure {
+                            args: args.into(),
+                            arg_types: arg_types.into(),
+                            ret_type,
+                            body,
+                            closure_kind,
+                            capture_by,
+                        },
+                        syntax_ptr,
+                    )
+                })
             }),
             ast::Expr::BinExpr(e) => {
                 let op = e.op_kind();
@@ -1362,11 +1373,7 @@ impl ExprCollector<'_> {
                         let initializer = self.collect_expr_opt(initializer);
                         let repeat = self.with_label_rib(RibKind::Constant, |this| {
                             if let Some(repeat) = repeat {
-                                let syntax_ptr = AstPtr::new(&repeat);
-                                this.collect_as_a_binding_owner_bad(
-                                    |this| this.collect_expr(repeat),
-                                    syntax_ptr,
-                                )
+                                this.with_binding_owner(|this| this.collect_expr(repeat))
                             } else {
                                 this.missing_expr()
                             }
@@ -1623,38 +1630,20 @@ impl ExprCollector<'_> {
         }
     }
 
-    fn initialize_binding_owner(
-        &mut self,
-        syntax_ptr: AstPtr<ast::Expr>,
-    ) -> (ExprId, Option<ExprId>) {
-        let result_expr_id = self.alloc_expr(Expr::Missing, syntax_ptr);
-        let prev_binding_owner = self.current_binding_owner.take();
-        self.current_binding_owner = Some(result_expr_id);
-
-        (result_expr_id, prev_binding_owner)
-    }
-
-    /// FIXME: This function is bad. It will produce a dangling `Missing` expr which wastes memory. Currently
-    /// it is used only for const blocks and repeat expressions, which are also hacky and ideally should have
-    /// their own body. Don't add more usage for this function so that we can remove this function after
-    /// separating those bodies.
-    fn collect_as_a_binding_owner_bad(
-        &mut self,
-        job: impl FnOnce(&mut ExprCollector<'_>) -> ExprId,
-        syntax_ptr: AstPtr<ast::Expr>,
-    ) -> ExprId {
-        let (id, prev_owner) = self.initialize_binding_owner(syntax_ptr);
-        let tmp = job(self);
-        self.store.exprs[id] = mem::replace(&mut self.store.exprs[tmp], Expr::Missing);
-        self.current_binding_owner = prev_owner;
-        id
+    fn with_binding_owner(&mut self, create_expr: impl FnOnce(&mut Self) -> ExprId) -> ExprId {
+        let prev_unowned_bindings_len = self.unowned_bindings.len();
+        let expr_id = create_expr(self);
+        for binding in self.unowned_bindings.drain(prev_unowned_bindings_len..) {
+            self.store.binding_owners.insert(binding, expr_id);
+        }
+        expr_id
     }
 
     /// Desugar `try { <stmts>; <expr> }` into `'<new_label>: { <stmts>; ::std::ops::Try::from_output(<expr>) }`,
     /// `try { <stmts>; }` into `'<new_label>: { <stmts>; ::std::ops::Try::from_output(()) }`
     /// and save the `<new_label>` to use it as a break target for desugaring of the `?` operator.
     fn desugar_try_block(&mut self, e: BlockExpr) -> ExprId {
-        let try_from_output = self.lang_path(LangItem::TryTraitFromOutput);
+        let try_from_output = self.lang_path(self.lang_items().TryTraitFromOutput);
         let label = self.alloc_label_desugared(Label {
             name: Name::generate_new_name(self.store.labels.len()),
         });
@@ -1753,10 +1742,11 @@ impl ExprCollector<'_> {
     /// }
     /// ```
     fn collect_for_loop(&mut self, syntax_ptr: AstPtr<ast::Expr>, e: ast::ForExpr) -> ExprId {
-        let into_iter_fn = self.lang_path(LangItem::IntoIterIntoIter);
-        let iter_next_fn = self.lang_path(LangItem::IteratorNext);
-        let option_some = self.lang_path(LangItem::OptionSome);
-        let option_none = self.lang_path(LangItem::OptionNone);
+        let lang_items = self.lang_items();
+        let into_iter_fn = self.lang_path(lang_items.IntoIterIntoIter);
+        let iter_next_fn = self.lang_path(lang_items.IteratorNext);
+        let option_some = self.lang_path(lang_items.OptionSome);
+        let option_none = self.lang_path(lang_items.OptionNone);
         let head = self.collect_expr_opt(e.iterable());
         let into_iter_fn_expr =
             self.alloc_expr(into_iter_fn.map_or(Expr::Missing, Expr::Path), syntax_ptr);
@@ -1836,10 +1826,11 @@ impl ExprCollector<'_> {
     /// }
     /// ```
     fn collect_try_operator(&mut self, syntax_ptr: AstPtr<ast::Expr>, e: ast::TryExpr) -> ExprId {
-        let try_branch = self.lang_path(LangItem::TryTraitBranch);
-        let cf_continue = self.lang_path(LangItem::ControlFlowContinue);
-        let cf_break = self.lang_path(LangItem::ControlFlowBreak);
-        let try_from_residual = self.lang_path(LangItem::TryTraitFromResidual);
+        let lang_items = self.lang_items();
+        let try_branch = self.lang_path(lang_items.TryTraitBranch);
+        let cf_continue = self.lang_path(lang_items.ControlFlowContinue);
+        let cf_break = self.lang_path(lang_items.ControlFlowBreak);
+        let try_from_residual = self.lang_path(lang_items.TryTraitFromResidual);
         let operand = self.collect_expr_opt(e.expr());
         let try_branch = self.alloc_expr(try_branch.map_or(Expr::Missing, Expr::Path), syntax_ptr);
         let expr = self
@@ -1904,9 +1895,8 @@ impl ExprCollector<'_> {
         T: ast::AstNode,
     {
         let macro_call_ptr = self.expander.in_file(syntax_ptr);
-        let module = self.module.local_id;
 
-        let block_call = self.def_map.modules[self.module.local_id].scope.macro_invoc(
+        let block_call = self.def_map.modules[self.module].scope.macro_invoc(
             self.expander.in_file(self.expander.ast_id_map().ast_id_for_ptr(syntax_ptr)),
         );
         let res = match block_call {
@@ -1918,7 +1908,7 @@ impl ExprCollector<'_> {
                         .resolve_path(
                             self.local_def_map,
                             self.db,
-                            module,
+                            self.module,
                             path,
                             crate::item_scope::BuiltinShadowMode::Other,
                             Some(MacroSubNs::Bang),
@@ -1929,7 +1919,7 @@ impl ExprCollector<'_> {
                 self.expander.enter_expand(
                     self.db,
                     mcall,
-                    self.module.krate(),
+                    self.krate,
                     resolver,
                     &mut |ptr, call| {
                         _ = self.store.expansions.insert(ptr.map(|(it, _)| it), call);
@@ -2047,7 +2037,8 @@ impl ExprCollector<'_> {
                     return;
                 };
                 let name = name.as_name();
-                let macro_id = self.def_map.modules[DefMap::ROOT].scope.get(&name).take_macros();
+                let macro_id =
+                    self.def_map.modules[self.def_map.root].scope.get(&name).take_macros();
                 self.collect_macro_def(statements, macro_id);
             }
             ast::Stmt::Item(ast::Item::MacroRules(macro_)) => {
@@ -2061,7 +2052,7 @@ impl ExprCollector<'_> {
                 let name = name.as_name();
                 let macro_defs_count =
                     self.current_block_legacy_macro_defs_count.entry(name.clone()).or_insert(0);
-                let macro_id = self.def_map.modules[DefMap::ROOT]
+                let macro_id = self.def_map.modules[self.def_map.root]
                     .scope
                     .get_legacy_macro(&name)
                     .and_then(|it| it.get(*macro_defs_count))
@@ -2107,7 +2098,7 @@ impl ExprCollector<'_> {
             match block_id.map(|block_id| (block_def_map(self.db, block_id), block_id)) {
                 Some((def_map, block_id)) => {
                     self.store.block_scopes.push(block_id);
-                    (def_map.module_id(DefMap::ROOT), def_map)
+                    (def_map.root_module_id(), def_map)
                 }
                 None => (self.module, self.def_map),
             };
@@ -2190,7 +2181,7 @@ impl ExprCollector<'_> {
                     let (resolved, _) = self.def_map.resolve_path(
                         self.local_def_map,
                         self.db,
-                        self.module.local_id,
+                        self.module,
                         &name.clone().into(),
                         BuiltinShadowMode::Other,
                         None,
@@ -2357,11 +2348,7 @@ impl ExprCollector<'_> {
             ast::Pat::ConstBlockPat(const_block_pat) => {
                 if let Some(block) = const_block_pat.block_expr() {
                     let expr_id = self.with_label_rib(RibKind::Constant, |this| {
-                        let syntax_ptr = AstPtr::new(&block.clone().into());
-                        this.collect_as_a_binding_owner_bad(
-                            |this| this.collect_block(block),
-                            syntax_ptr,
-                        )
+                        this.with_binding_owner(|this| this.collect_block(block))
                     });
                     Pat::ConstBlock(expr_id)
                 } else {
@@ -2409,7 +2396,11 @@ impl ExprCollector<'_> {
                 };
                 let start = range_part_lower(p.start());
                 let end = range_part_lower(p.end());
-                Pat::Range { start, end }
+                // FIXME: Exclusive ended pattern range is stabilised
+                match p.op_kind() {
+                    Some(range_type) => Pat::Range { start, end, range_type },
+                    None => Pat::Missing,
+                }
             }
         };
         let ptr = AstPtr::new(&pat);
@@ -2485,7 +2476,7 @@ impl ExprCollector<'_> {
     /// Returns `None` (and emits diagnostics) when `owner` if `#[cfg]`d out, and `Some(())` when
     /// not.
     fn check_cfg(&mut self, owner: &dyn ast::HasAttrs) -> bool {
-        let enabled = self.expander.is_cfg_enabled(self.db, owner, self.cfg_options);
+        let enabled = self.expander.is_cfg_enabled(owner, self.cfg_options);
         match enabled {
             Ok(()) => true,
             Err(cfg) => {
@@ -2769,11 +2760,10 @@ impl ExprCollector<'_> {
 
         // Assume that rustc version >= 1.89.0 iff lang item `format_arguments` exists
         // but `format_unsafe_arg` does not
-        let fmt_args =
-            || crate::lang_item::lang_item(self.db, self.module.krate(), LangItem::FormatArguments);
-        let fmt_unsafe_arg =
-            || crate::lang_item::lang_item(self.db, self.module.krate(), LangItem::FormatUnsafeArg);
-        let use_format_args_since_1_89_0 = fmt_args().is_some() && fmt_unsafe_arg().is_none();
+        let lang_items = self.lang_items();
+        let fmt_args = lang_items.FormatArguments;
+        let fmt_unsafe_arg = lang_items.FormatUnsafeArg;
+        let use_format_args_since_1_89_0 = fmt_args.is_some() && fmt_unsafe_arg.is_none();
 
         let idx = if use_format_args_since_1_89_0 {
             self.collect_format_args_impl(syntax_ptr, fmt, argmap, lit_pieces, format_options)
@@ -2852,16 +2842,13 @@ impl ExprCollector<'_> {
         //         unsafe { ::core::fmt::UnsafeArg::new() }
         //     )
 
-        let new_v1_formatted = LangItem::FormatArguments.ty_rel_path(
-            self.db,
-            self.module.krate(),
+        let lang_items = self.lang_items();
+        let new_v1_formatted = self.ty_rel_lang_path(
+            lang_items.FormatArguments,
             Name::new_symbol_root(sym::new_v1_formatted),
         );
-        let unsafe_arg_new = LangItem::FormatUnsafeArg.ty_rel_path(
-            self.db,
-            self.module.krate(),
-            Name::new_symbol_root(sym::new),
-        );
+        let unsafe_arg_new =
+            self.ty_rel_lang_path(lang_items.FormatUnsafeArg, Name::new_symbol_root(sym::new));
         let new_v1_formatted =
             self.alloc_expr_desugared(new_v1_formatted.map_or(Expr::Missing, Expr::Path));
 
@@ -3040,9 +3027,8 @@ impl ExprCollector<'_> {
             //         )
             //     }
 
-            let new_v1_formatted = LangItem::FormatArguments.ty_rel_path(
-                self.db,
-                self.module.krate(),
+            let new_v1_formatted = self.ty_rel_lang_path(
+                self.lang_items().FormatArguments,
                 Name::new_symbol_root(sym::new_v1_formatted),
             );
             let new_v1_formatted =
@@ -3095,6 +3081,7 @@ impl ExprCollector<'_> {
         placeholder: &FormatPlaceholder,
         argmap: &mut FxIndexSet<(usize, ArgumentType)>,
     ) -> ExprId {
+        let lang_items = self.lang_items();
         let position = match placeholder.argument.index {
             Ok(arg_index) => {
                 let (i, _) =
@@ -3120,7 +3107,7 @@ impl ExprCollector<'_> {
         let precision_expr = self.make_count(precision, argmap);
         let width_expr = self.make_count(width, argmap);
 
-        if self.module.krate().workspace_data(self.db).is_atleast_187() {
+        if self.krate.workspace_data(self.db).is_atleast_187() {
             // These need to match the constants in library/core/src/fmt/rt.rs.
             let align = match alignment {
                 Some(FormatAlignment::Left) => 0,
@@ -3155,15 +3142,14 @@ impl ExprCollector<'_> {
             let width =
                 RecordLitField { name: Name::new_symbol_root(sym::width), expr: width_expr };
             self.alloc_expr_desugared(Expr::RecordLit {
-                path: LangItem::FormatPlaceholder.path(self.db, self.module.krate()).map(Box::new),
+                path: self.lang_path(lang_items.FormatPlaceholder).map(Box::new),
                 fields: Box::new([position, flags, precision, width]),
                 spread: None,
             })
         } else {
             let format_placeholder_new = {
-                let format_placeholder_new = LangItem::FormatPlaceholder.ty_rel_path(
-                    self.db,
-                    self.module.krate(),
+                let format_placeholder_new = self.ty_rel_lang_path(
+                    lang_items.FormatPlaceholder,
                     Name::new_symbol_root(sym::new),
                 );
                 match format_placeholder_new {
@@ -3184,9 +3170,8 @@ impl ExprCollector<'_> {
             )));
             let fill = self.alloc_expr_desugared(Expr::Literal(Literal::Char(fill.unwrap_or(' '))));
             let align = {
-                let align = LangItem::FormatAlignment.ty_rel_path(
-                    self.db,
-                    self.module.krate(),
+                let align = self.ty_rel_lang_path(
+                    lang_items.FormatAlignment,
                     match alignment {
                         Some(FormatAlignment::Left) => Name::new_symbol_root(sym::Left),
                         Some(FormatAlignment::Right) => Name::new_symbol_root(sym::Right),
@@ -3230,6 +3215,7 @@ impl ExprCollector<'_> {
         count: &Option<FormatCount>,
         argmap: &mut FxIndexSet<(usize, ArgumentType)>,
     ) -> ExprId {
+        let lang_items = self.lang_items();
         match count {
             Some(FormatCount::Literal(n)) => {
                 let args = self.alloc_expr_desugared(Expr::Literal(Literal::Uint(
@@ -3237,11 +3223,9 @@ impl ExprCollector<'_> {
                     // FIXME: Change this to Some(BuiltinUint::U16) once we drop support for toolchains < 1.88
                     None,
                 )));
-                let count_is = match LangItem::FormatCount.ty_rel_path(
-                    self.db,
-                    self.module.krate(),
-                    Name::new_symbol_root(sym::Is),
-                ) {
+                let count_is = match self
+                    .ty_rel_lang_path(lang_items.FormatCount, Name::new_symbol_root(sym::Is))
+                {
                     Some(count_is) => self.alloc_expr_desugared(Expr::Path(count_is)),
                     None => self.missing_expr(),
                 };
@@ -3255,11 +3239,9 @@ impl ExprCollector<'_> {
                         i as u128,
                         Some(BuiltinUint::Usize),
                     )));
-                    let count_param = match LangItem::FormatCount.ty_rel_path(
-                        self.db,
-                        self.module.krate(),
-                        Name::new_symbol_root(sym::Param),
-                    ) {
+                    let count_param = match self
+                        .ty_rel_lang_path(lang_items.FormatCount, Name::new_symbol_root(sym::Param))
+                    {
                         Some(count_param) => self.alloc_expr_desugared(Expr::Path(count_param)),
                         None => self.missing_expr(),
                     };
@@ -3273,11 +3255,9 @@ impl ExprCollector<'_> {
                     self.missing_expr()
                 }
             }
-            None => match LangItem::FormatCount.ty_rel_path(
-                self.db,
-                self.module.krate(),
-                Name::new_symbol_root(sym::Implied),
-            ) {
+            None => match self
+                .ty_rel_lang_path(lang_items.FormatCount, Name::new_symbol_root(sym::Implied))
+            {
                 Some(count_param) => self.alloc_expr_desugared(Expr::Path(count_param)),
                 None => self.missing_expr(),
             },
@@ -3295,9 +3275,8 @@ impl ExprCollector<'_> {
         use ArgumentType::*;
         use FormatTrait::*;
 
-        let new_fn = match LangItem::FormatArgument.ty_rel_path(
-            self.db,
-            self.module.krate(),
+        let new_fn = match self.ty_rel_lang_path(
+            self.lang_items().FormatArgument,
             Name::new_symbol_root(match ty {
                 Format(Display) => sym::new_display,
                 Format(Debug) => sym::new_debug,
@@ -3319,8 +3298,16 @@ impl ExprCollector<'_> {
 
     // endregion: format
 
-    fn lang_path(&self, lang: LangItem) -> Option<Path> {
-        lang.path(self.db, self.module.krate())
+    fn lang_path(&self, lang: Option<impl Into<LangItemTarget>>) -> Option<Path> {
+        Some(Path::LangItem(lang?.into(), None))
+    }
+
+    fn ty_rel_lang_path(
+        &self,
+        lang: Option<impl Into<LangItemTarget>>,
+        relative_name: Name,
+    ) -> Option<Path> {
+        Some(Path::LangItem(lang?.into(), Some(relative_name)))
     }
 }
 
@@ -3365,9 +3352,7 @@ impl ExprCollector<'_> {
         hygiene: HygieneId,
     ) -> BindingId {
         let binding = self.store.bindings.alloc(Binding { name, mode, problems: None, hygiene });
-        if let Some(owner) = self.current_binding_owner {
-            self.store.binding_owners.insert(binding, owner);
-        }
+        self.unowned_bindings.push(binding);
         binding
     }
 

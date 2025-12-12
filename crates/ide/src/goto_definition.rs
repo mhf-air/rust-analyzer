@@ -18,7 +18,7 @@ use ide_db::{
     helpers::pick_best_token,
 };
 use itertools::Itertools;
-use span::{Edition, FileId};
+use span::FileId;
 use syntax::{
     AstNode, AstToken,
     SyntaxKind::*,
@@ -50,8 +50,7 @@ pub(crate) fn goto_definition(
 ) -> Option<RangeInfo<Vec<NavigationTarget>>> {
     let sema = &Semantics::new(db);
     let file = sema.parse_guess_edition(file_id).syntax().clone();
-    let edition =
-        sema.attach_first_edition(file_id).map(|it| it.edition(db)).unwrap_or(Edition::CURRENT);
+    let edition = sema.attach_first_edition(file_id).edition(db);
     let original_token = pick_best_token(file.token_at_offset(offset), |kind| match kind {
         IDENT
         | INT_NUMBER
@@ -140,7 +139,7 @@ pub(crate) fn goto_definition(
             if let Definition::ExternCrateDecl(crate_def) = def {
                 return crate_def
                     .resolved_crate(db)
-                    .map(|it| it.root_module().to_nav(sema.db))
+                    .map(|it| it.root_module(db).to_nav(db))
                     .into_iter()
                     .flatten()
                     .collect();
@@ -245,7 +244,7 @@ fn try_lookup_include_path(
     Some(NavigationTarget {
         file_id,
         full_range: TextRange::new(0.into(), size),
-        name: path.into(),
+        name: hir::Symbol::intern(&path),
         alias: None,
         focus_range: None,
         kind: None,
@@ -263,7 +262,7 @@ fn try_lookup_macro_def_in_macro_use(
     let extern_crate = sema.to_def(&extern_crate)?;
     let krate = extern_crate.resolved_crate(sema.db)?;
 
-    for mod_def in krate.root_module().declarations(sema.db) {
+    for mod_def in krate.root_module(sema.db).declarations(sema.db) {
         if let ModuleDef::Macro(mac) = mod_def
             && mac.name(sema.db).as_str() == token.text()
             && let Some(nav) = mac.try_to_nav(sema)
@@ -598,7 +597,13 @@ fn expr_to_nav(
     let value_range = value.syntax().text_range();
     let navs = navigation_target::orig_range_with_focus_r(db, file_id, value_range, focus_range);
     navs.map(|(hir::FileRangeWrapper { file_id, range }, focus_range)| {
-        NavigationTarget::from_syntax(file_id, "<expr>".into(), focus_range, range, kind)
+        NavigationTarget::from_syntax(
+            file_id,
+            hir::Symbol::intern("<expr>"),
+            focus_range,
+            range,
+            kind,
+        )
     })
 }
 
@@ -607,7 +612,6 @@ mod tests {
     use crate::{GotoDefinitionConfig, fixture};
     use ide_db::{FileRange, MiniCore};
     use itertools::Itertools;
-    use syntax::SmolStr;
 
     const TEST_CONFIG: GotoDefinitionConfig<'_> =
         GotoDefinitionConfig { minicore: MiniCore::default() };
@@ -658,7 +662,7 @@ mod tests {
         let Some(target) = navs.into_iter().next() else {
             panic!("expected single navigation target but encountered none");
         };
-        assert_eq!(target.name, SmolStr::new_inline(expected_name));
+        assert_eq!(target.name, hir::Symbol::intern(expected_name));
     }
 
     #[test]

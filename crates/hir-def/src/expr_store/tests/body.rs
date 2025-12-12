@@ -32,14 +32,14 @@ fn def_map_at(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> String {
     let (db, position) = TestDB::with_position(ra_fixture);
 
     let module = db.module_at_position(position);
-    module.def_map(&db).dump(&db)
+    salsa::plumbing::attach(&db, || module.def_map(&db).dump(&db))
 }
 
 fn check_block_scopes_at(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
     let (db, position) = TestDB::with_position(ra_fixture);
 
     let module = db.module_at_position(position);
-    let actual = module.def_map(&db).dump_block_scopes(&db);
+    let actual = salsa::plumbing::attach(&db, || format!("{module:#?}"));
     expect.assert_eq(&actual);
 }
 
@@ -159,7 +159,7 @@ fn main() {
     expect![[r#"
         fn main() {
             match builtin#lang(into_iter)(
-                (0) ..(10) ,
+                0..10,
             ) {
                 mut <ra@gennew>11 => loop {
                     match builtin#lang(next)(
@@ -580,7 +580,7 @@ const fn f(x: i32) -> i32 {
 
     let MatchArm { pat, .. } = mtch_arms[1];
     match body[pat] {
-        Pat::Range { start, end } => {
+        Pat::Range { start, end, range_type: _ } => {
             let hir_start = &body[start.unwrap()];
             let hir_end = &body[end.unwrap()];
 
@@ -589,4 +589,31 @@ const fn f(x: i32) -> i32 {
         }
         _ => {}
     }
+}
+
+#[test]
+fn print_hir_precedences() {
+    let (db, body, def) = lower(
+        r#"
+fn main() {
+    _ = &(1 - (2 - 3) + 4 * 5 * (6 + 7));
+    _ = 1 + 2 < 3 && true && 4 < 5 && (a || b || c) || d && e;
+    if let _ = 2 && true && let _ = 3 {}
+    break a && b || (return) || (return 2);
+    let r = &2;
+    let _ = &mut (*r as i32)
+}
+"#,
+    );
+
+    expect![[r#"
+        fn main() {
+            _ = &((1 - (2 - 3)) + (4 * 5) * (6 + 7));
+            _ = 1 + 2 < 3 && true && 4 < 5 && (a || b || c) || d && e;
+            if let _ = 2 && true && let _ = 3 {}
+            break a && b || (return) || (return 2);
+            let r = &2;
+            let _ = &mut (*r as i32);
+        }"#]]
+    .assert_eq(&body.pretty_print(&db, def, Edition::CURRENT))
 }

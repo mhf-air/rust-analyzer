@@ -183,9 +183,9 @@ fn main() {
 "#####,
         r#####"
 fn main() {
-    'l: loop {
-        break 'l;
-        continue 'l;
+    ${1:'l}: loop {
+        break ${2:'l};
+        continue ${0:'l};
     }
 }
 "#####,
@@ -420,6 +420,19 @@ fn main() {
         println!("foo");
     }
 }
+"#####,
+    )
+}
+
+#[test]
+fn doctest_convert_char_literal() {
+    check_doc_test(
+        "convert_char_literal",
+        r#####"
+const _: char = 'a'$0;
+"#####,
+        r#####"
+const _: char = '\x61';
 "#####,
     )
 }
@@ -726,6 +739,29 @@ fn main() {
     };
 
     foo("Bar", 100);
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_convert_range_for_to_while() {
+    check_doc_test(
+        "convert_range_for_to_while",
+        r#####"
+fn foo() {
+    $0for i in 3..7 {
+        foo(i);
+    }
+}
+"#####,
+        r#####"
+fn foo() {
+    let mut i = 3;
+    while i < 7 {
+        foo(i);
+        i += 1;
+    }
 }
 "#####,
     )

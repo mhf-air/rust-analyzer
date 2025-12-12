@@ -657,7 +657,7 @@ fn expected_type_and_name<'db>(
                     cov_mark::hit!(expected_type_fn_param);
                     ActiveParameter::at_token(
                         sema,
-                       token.clone(),
+                        token.clone(),
                     ).map(|ap| {
                         let name = ap.ident().map(NameOrNameRef::Name);
                         (Some(ap.ty), name)
@@ -1012,6 +1012,25 @@ fn classify_name_ref<'db>(
             .and_then(|next| next.first_token())
             .is_some_and(|token| token.kind() == SyntaxKind::ELSE_KW)
     };
+    let is_in_value = |it: &SyntaxNode| {
+        let Some(node) = it.parent() else { return false };
+        let kind = node.kind();
+        ast::LetStmt::can_cast(kind)
+            || ast::ArgList::can_cast(kind)
+            || ast::ArrayExpr::can_cast(kind)
+            || ast::ParenExpr::can_cast(kind)
+            || ast::BreakExpr::can_cast(kind)
+            || ast::ReturnExpr::can_cast(kind)
+            || ast::PrefixExpr::can_cast(kind)
+            || ast::FormatArgsArg::can_cast(kind)
+            || ast::RecordExprField::can_cast(kind)
+            || ast::BinExpr::cast(node.clone())
+                .and_then(|expr| expr.rhs())
+                .is_some_and(|expr| expr.syntax() == it)
+            || ast::IndexExpr::cast(node)
+                .and_then(|expr| expr.index())
+                .is_some_and(|expr| expr.syntax() == it)
+    };
 
     // We do not want to generate path completions when we are sandwiched between an item decl signature and its body.
     // ex. trait Foo $0 {}
@@ -1302,12 +1321,11 @@ fn classify_name_ref<'db>(
         let incomplete_expr_stmt =
             it.parent().and_then(ast::ExprStmt::cast).map(|it| it.semicolon_token().is_none());
         let before_else_kw = before_else_kw(it);
-        let incomplete_let = it
-            .parent()
-            .and_then(ast::LetStmt::cast)
+        let incomplete_let = left_ancestors(it.parent())
+            .find_map(ast::LetStmt::cast)
             .is_some_and(|it| it.semicolon_token().is_none())
             || after_incomplete_let && incomplete_expr_stmt.unwrap_or(true) && !before_else_kw;
-        let in_value = it.parent().and_then(Either::<ast::LetStmt, ast::ArgList>::cast).is_some();
+        let in_value = is_in_value(it);
         let impl_ = fetch_immediate_impl_or_trait(sema, original_file, expr.syntax())
             .and_then(Either::left);
 
@@ -1609,6 +1627,7 @@ fn classify_name_ref<'db>(
                     }
                 }
                 qualifier_ctx.vis_node = error_node.children().find_map(ast::Visibility::cast);
+                qualifier_ctx.abi_node = error_node.children().find_map(ast::Abi::cast);
             }
 
             if let PathKind::Item { .. } = path_ctx.kind
@@ -1616,7 +1635,7 @@ fn classify_name_ref<'db>(
                 && let Some(t) = top.first_token()
                 && let Some(prev) =
                     t.prev_token().and_then(|t| syntax::algo::skip_trivia_token(t, Direction::Prev))
-                && ![T![;], T!['}'], T!['{']].contains(&prev.kind())
+                && ![T![;], T!['}'], T!['{'], T![']']].contains(&prev.kind())
             {
                 // This was inferred to be an item position path, but it seems
                 // to be part of some other broken node which leaked into an item
@@ -1660,12 +1679,16 @@ fn pattern_context_for(
     let mut param_ctx = None;
 
     let mut missing_variants = vec![];
+    let is_pat_like = |kind| {
+        ast::Pat::can_cast(kind)
+            || ast::RecordPatField::can_cast(kind)
+            || ast::RecordPatFieldList::can_cast(kind)
+    };
 
-    let (refutability, has_type_ascription) =
-    pat
+    let (refutability, has_type_ascription) = pat
         .syntax()
         .ancestors()
-        .find(|it| !ast::Pat::can_cast(it.kind()))
+        .find(|it| !is_pat_like(it.kind()))
         .map_or((PatternRefutability::Irrefutable, false), |node| {
             let refutability = match_ast! {
                 match node {
@@ -1856,6 +1879,13 @@ fn path_or_use_tree_qualifier(path: &ast::Path) -> Option<(ast::Path, bool)> {
     let use_tree_list = path.syntax().ancestors().find_map(ast::UseTreeList::cast)?;
     let use_tree = use_tree_list.syntax().parent().and_then(ast::UseTree::cast)?;
     Some((use_tree.path()?, true))
+}
+
+fn left_ancestors(node: Option<SyntaxNode>) -> impl Iterator<Item = SyntaxNode> {
+    node.into_iter().flat_map(|node| {
+        let end = node.text_range().end();
+        node.ancestors().take_while(move |it| it.text_range().end() == end)
+    })
 }
 
 fn is_in_token_of_for_loop(path: &ast::Path) -> bool {

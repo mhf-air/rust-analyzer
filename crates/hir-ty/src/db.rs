@@ -3,36 +3,33 @@
 
 use base_db::{Crate, target::TargetLoadError};
 use hir_def::{
-    AdtId, BlockId, CallableDefId, ConstParamId, DefWithBodyId, EnumVariantId, FunctionId,
-    GeneralConstId, GenericDefId, ImplId, LifetimeParamId, LocalFieldId, StaticId, TraitId,
-    TypeAliasId, TypeOrConstParamId, VariantId, db::DefDatabase, hir::ExprId,
-    layout::TargetDataLayout,
+    AdtId, CallableDefId, ConstId, ConstParamId, DefWithBodyId, EnumVariantId, FunctionId,
+    GenericDefId, ImplId, LifetimeParamId, LocalFieldId, StaticId, TraitId, TypeAliasId, VariantId,
+    db::DefDatabase, hir::ExprId, layout::TargetDataLayout,
 };
-use hir_expand::name::Name;
 use la_arena::ArenaMap;
 use salsa::plumbing::AsId;
-use smallvec::SmallVec;
 use triomphe::Arc;
 
 use crate::{
-    ImplTraitId, InferenceResult, TraitEnvironment, TyDefId, ValueTyDefId,
+    ImplTraitId, TyDefId, ValueTyDefId,
     consteval::ConstEvalError,
     dyn_compatibility::DynCompatibilityViolation,
     layout::{Layout, LayoutError},
-    lower::{Diagnostics, GenericDefaults, GenericPredicates, ImplTraits},
-    method_resolution::{InherentImpls, TraitImpls, TyFingerprint},
+    lower::{Diagnostics, GenericDefaults},
     mir::{BorrowckResult, MirBody, MirLowerError},
-    next_solver::{Const, EarlyBinder, GenericArgs, PolyFnSig, TraitRef, Ty, VariancesOf},
+    next_solver::{
+        Const, EarlyBinder, GenericArgs, ParamEnv, PolyFnSig, TraitRef, Ty, VariancesOf,
+    },
+    traits::ParamEnvAndCrate,
 };
 
 #[query_group::query_group]
 pub trait HirDatabase: DefDatabase + std::fmt::Debug {
-    #[salsa::invoke(crate::infer::infer_query)]
-    #[salsa::cycle(cycle_result = crate::infer::infer_cycle_result)]
-    fn infer<'db>(&'db self, def: DefWithBodyId) -> Arc<InferenceResult<'db>>;
-
     // region:mir
 
+    // FXME: Collapse `mir_body_for_closure` into `mir_body`
+    // and `monomorphized_mir_body_for_closure` into `monomorphized_mir_body`
     #[salsa::invoke(crate::mir::mir_body_query)]
     #[salsa::cycle(cycle_result = crate::mir::mir_body_cycle_result)]
     fn mir_body<'db>(
@@ -52,7 +49,7 @@ pub trait HirDatabase: DefDatabase + std::fmt::Debug {
         &'db self,
         def: DefWithBodyId,
         subst: GenericArgs<'db>,
-        env: Arc<TraitEnvironment<'db>>,
+        env: ParamEnvAndCrate<'db>,
     ) -> Result<Arc<MirBody<'db>>, MirLowerError<'db>>;
 
     #[salsa::invoke(crate::mir::monomorphized_mir_body_for_closure_query)]
@@ -60,7 +57,7 @@ pub trait HirDatabase: DefDatabase + std::fmt::Debug {
         &'db self,
         def: InternedClosureId,
         subst: GenericArgs<'db>,
-        env: Arc<TraitEnvironment<'db>>,
+        env: ParamEnvAndCrate<'db>,
     ) -> Result<Arc<MirBody<'db>>, MirLowerError<'db>>;
 
     #[salsa::invoke(crate::mir::borrowck_query)]
@@ -74,9 +71,9 @@ pub trait HirDatabase: DefDatabase + std::fmt::Debug {
     #[salsa::cycle(cycle_result = crate::consteval::const_eval_cycle_result)]
     fn const_eval<'db>(
         &'db self,
-        def: GeneralConstId,
+        def: ConstId,
         subst: GenericArgs<'db>,
-        trait_env: Option<Arc<TraitEnvironment<'db>>>,
+        trait_env: Option<ParamEnvAndCrate<'db>>,
     ) -> Result<Const<'db>, ConstEvalError<'db>>;
 
     #[salsa::invoke(crate::consteval::const_eval_static_query)]
@@ -94,7 +91,7 @@ pub trait HirDatabase: DefDatabase + std::fmt::Debug {
     #[salsa::transparent]
     fn lookup_impl_method<'db>(
         &'db self,
-        env: Arc<TraitEnvironment<'db>>,
+        env: ParamEnvAndCrate<'db>,
         func: FunctionId,
         fn_subst: GenericArgs<'db>,
     ) -> (FunctionId, GenericArgs<'db>);
@@ -107,7 +104,7 @@ pub trait HirDatabase: DefDatabase + std::fmt::Debug {
         &'db self,
         def: AdtId,
         args: GenericArgs<'db>,
-        trait_env: Arc<TraitEnvironment<'db>>,
+        trait_env: ParamEnvAndCrate<'db>,
     ) -> Result<Arc<Layout>, LayoutError>;
 
     #[salsa::invoke(crate::layout::layout_of_ty_query)]
@@ -115,7 +112,7 @@ pub trait HirDatabase: DefDatabase + std::fmt::Debug {
     fn layout_of_ty<'db>(
         &'db self,
         ty: Ty<'db>,
-        env: Arc<TraitEnvironment<'db>>,
+        env: ParamEnvAndCrate<'db>,
     ) -> Result<Arc<Layout>, LayoutError>;
 
     #[salsa::invoke(crate::layout::target_data_layout_query)]
@@ -190,50 +187,12 @@ pub trait HirDatabase: DefDatabase + std::fmt::Debug {
         def: CallableDefId,
     ) -> EarlyBinder<'db, PolyFnSig<'db>>;
 
-    #[salsa::invoke(crate::lower::return_type_impl_traits)]
-    fn return_type_impl_traits<'db>(
-        &'db self,
-        def: FunctionId,
-    ) -> Option<Arc<EarlyBinder<'db, ImplTraits<'db>>>>;
-
-    #[salsa::invoke(crate::lower::type_alias_impl_traits)]
-    fn type_alias_impl_traits<'db>(
-        &'db self,
-        def: TypeAliasId,
-    ) -> Option<Arc<EarlyBinder<'db, ImplTraits<'db>>>>;
-
-    #[salsa::invoke(crate::lower::generic_predicates_without_parent_with_diagnostics_query)]
-    fn generic_predicates_without_parent_with_diagnostics<'db>(
-        &'db self,
-        def: GenericDefId,
-    ) -> (GenericPredicates<'db>, Diagnostics);
-
-    #[salsa::invoke(crate::lower::generic_predicates_without_parent_query)]
-    #[salsa::transparent]
-    fn generic_predicates_without_parent<'db>(
-        &'db self,
-        def: GenericDefId,
-    ) -> GenericPredicates<'db>;
-
-    #[salsa::invoke(crate::lower::generic_predicates_for_param_query)]
-    #[salsa::cycle(cycle_result = crate::lower::generic_predicates_for_param_cycle_result)]
-    fn generic_predicates_for_param<'db>(
-        &'db self,
-        def: GenericDefId,
-        param_id: TypeOrConstParamId,
-        assoc_name: Option<Name>,
-    ) -> GenericPredicates<'db>;
-
-    #[salsa::invoke(crate::lower::generic_predicates_query)]
-    fn generic_predicates<'db>(&'db self, def: GenericDefId) -> GenericPredicates<'db>;
-
     #[salsa::invoke(crate::lower::trait_environment_for_body_query)]
     #[salsa::transparent]
-    fn trait_environment_for_body<'db>(&'db self, def: DefWithBodyId)
-    -> Arc<TraitEnvironment<'db>>;
+    fn trait_environment_for_body<'db>(&'db self, def: DefWithBodyId) -> ParamEnv<'db>;
 
     #[salsa::invoke(crate::lower::trait_environment_query)]
-    fn trait_environment<'db>(&'db self, def: GenericDefId) -> Arc<TraitEnvironment<'db>>;
+    fn trait_environment<'db>(&'db self, def: GenericDefId) -> ParamEnv<'db>;
 
     #[salsa::invoke(crate::lower::generic_defaults_with_diagnostics_query)]
     #[salsa::cycle(cycle_result = crate::lower::generic_defaults_with_diagnostics_cycle_result)]
@@ -248,32 +207,6 @@ pub trait HirDatabase: DefDatabase + std::fmt::Debug {
     #[salsa::invoke(crate::lower::generic_defaults_query)]
     #[salsa::transparent]
     fn generic_defaults<'db>(&'db self, def: GenericDefId) -> GenericDefaults<'db>;
-
-    #[salsa::invoke(InherentImpls::inherent_impls_in_crate_query)]
-    fn inherent_impls_in_crate(&self, krate: Crate) -> Arc<InherentImpls>;
-
-    #[salsa::invoke(InherentImpls::inherent_impls_in_block_query)]
-    fn inherent_impls_in_block(&self, block: BlockId) -> Option<Arc<InherentImpls>>;
-
-    /// Collects all crates in the dependency graph that have impls for the
-    /// given fingerprint. This is only used for primitive types and types
-    /// annotated with `rustc_has_incoherent_inherent_impls`; for other types
-    /// we just look at the crate where the type is defined.
-    #[salsa::invoke(crate::method_resolution::incoherent_inherent_impl_crates)]
-    fn incoherent_inherent_impl_crates(
-        &self,
-        krate: Crate,
-        fp: TyFingerprint,
-    ) -> SmallVec<[Crate; 2]>;
-
-    #[salsa::invoke(TraitImpls::trait_impls_in_crate_query)]
-    fn trait_impls_in_crate(&self, krate: Crate) -> Arc<TraitImpls>;
-
-    #[salsa::invoke(TraitImpls::trait_impls_in_block_query)]
-    fn trait_impls_in_block(&self, block: BlockId) -> Option<Arc<TraitImpls>>;
-
-    #[salsa::invoke(TraitImpls::trait_impls_in_deps_query)]
-    fn trait_impls_in_deps(&self, krate: Crate) -> Arc<[Arc<TraitImpls>]>;
 
     // Interned IDs for solver integration
     #[salsa::interned]
@@ -297,13 +230,6 @@ pub trait HirDatabase: DefDatabase + std::fmt::Debug {
 #[test]
 fn hir_database_is_dyn_compatible() {
     fn _assert_dyn_compatible(_: &dyn HirDatabase) {}
-}
-
-#[salsa_macros::interned(no_lifetime, debug, revisions = usize::MAX)]
-#[derive(PartialOrd, Ord)]
-pub struct InternedTypeOrConstParamId {
-    /// This stores the param and its index.
-    pub loc: (TypeOrConstParamId, u32),
 }
 
 #[salsa_macros::interned(no_lifetime, debug, revisions = usize::MAX)]
