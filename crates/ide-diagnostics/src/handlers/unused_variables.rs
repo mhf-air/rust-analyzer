@@ -1,3 +1,5 @@
+#![expect(unused, reason = "diagnostics is temporarily disabled due to too many false positives")]
+
 use hir::Name;
 use ide_db::text_edit::TextEdit;
 use ide_db::{
@@ -40,25 +42,26 @@ pub(crate) fn unused_variables(
         .and_then(syntax::ast::RecordPatField::cast)
         .is_some_and(|field| field.colon_token().is_none());
     let var_name = d.local.name(ctx.sema.db);
-    Some(
-        Diagnostic::new_with_syntax_node_ptr(
-            ctx,
-            DiagnosticCode::RustcLint("unused_variables"),
-            "unused variable",
-            ast,
-        )
-        .with_fixes(name_range.and_then(|it| {
-            fixes(
-                ctx.sema.db,
-                var_name,
-                it.range,
-                diagnostic_range,
-                ast.file_id.is_macro(),
-                is_shorthand_field,
-                ctx.edition,
-            )
-        })),
-    )
+    // Some(
+    //     Diagnostic::new_with_syntax_node_ptr(
+    //         ctx,
+    //         DiagnosticCode::RustcLint("unused_variables"),
+    //         "unused variable",
+    //         ast,
+    //     )
+    //     .with_fixes(name_range.and_then(|it| {
+    //         fixes(
+    //             ctx.sema.db,
+    //             var_name,
+    //             it.range,
+    //             diagnostic_range,
+    //             ast.file_id.is_macro(),
+    //             is_shorthand_field,
+    //             ctx.edition,
+    //         )
+    //     })),
+    // )
+    None
 }
 
 fn fixes(
@@ -91,6 +94,7 @@ fn fixes(
 }
 
 #[cfg(test)]
+#[cfg(false)] // Diagnostic temporarily disabled
 mod tests {
     use crate::tests::{check_diagnostics, check_fix};
 
@@ -177,6 +181,61 @@ fn main() {
 fn main2() {
     let x = 2;
       //^ 💡 error: unused variable
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn apply_last_lint_attribute_when_multiple_are_present() {
+        check_diagnostics(
+            r#"
+#![allow(unused_variables)]
+#![warn(unused_variables)]
+#![deny(unused_variables)]
+
+fn main() {
+    let x = 2;
+      //^ 💡 error: unused variable
+
+    #[deny(unused_variables)]
+    #[warn(unused_variables)]
+    #[allow(unused_variables)]
+    let y = 0;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn prefer_closest_ancestor_lint_attribute() {
+        check_diagnostics(
+            r#"
+#![allow(unused_variables)]
+
+fn main() {
+    #![warn(unused_variables)]
+
+    #[deny(unused_variables)]
+    let x = 2;
+      //^ 💡 error: unused variable
+}
+
+#[warn(unused_variables)]
+fn main2() {
+    #[deny(unused_variables)]
+    let x = 2;
+      //^ 💡 error: unused variable
+}
+
+#[warn(unused_variables)]
+fn main3() {
+    let x = 2;
+      //^ 💡 warn: unused variable
+}
+
+fn main4() {
+    let x = 2;
 }
 "#,
         );
@@ -331,6 +390,46 @@ fn main() {
 struct S { field : u32 }
 fn f(S { field }: error) {
       // ^^^^^ 💡 warn: unused variable
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn crate_attrs_lint_smoke_test() {
+        check_diagnostics(
+            r#"
+//- /lib.rs crate:foo crate-attr:deny(unused_variables)
+fn main() {
+    let x = 2;
+      //^ 💡 error: unused variable
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn crate_attrs_should_not_override_lints_in_source() {
+        check_diagnostics(
+            r#"
+//- /lib.rs crate:foo crate-attr:allow(unused_variables)
+#![deny(unused_variables)]
+fn main() {
+    let x = 2;
+      //^ 💡 error: unused variable
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn crate_attrs_should_preserve_lint_order() {
+        check_diagnostics(
+            r#"
+//- /lib.rs crate:foo crate-attr:allow(unused_variables) crate-attr:warn(unused_variables)
+fn main() {
+    let x = 2;
+      //^ 💡 warn: unused variable
 }
 "#,
         );

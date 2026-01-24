@@ -4,20 +4,21 @@
 use std::{fmt, sync::LazyLock};
 
 use base_db::Crate;
+use either::Either;
 use hir_expand::{AstId, MacroCallId, attrs::AttrId, name::Name};
 use indexmap::map::Entry;
 use itertools::Itertools;
 use la_arena::Idx;
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 use span::Edition;
 use stdx::format_to;
 use syntax::ast;
 use thin_vec::ThinVec;
 
 use crate::{
-    AdtId, BuiltinType, ConstId, ExternBlockId, ExternCrateId, FxIndexMap, HasModule, ImplId,
-    Lookup, MacroCallStyles, MacroId, ModuleDefId, ModuleId, TraitId, UseId,
+    AdtId, BuiltinDeriveImplId, BuiltinType, ConstId, ExternBlockId, ExternCrateId, FxIndexMap,
+    HasModule, ImplId, Lookup, MacroCallStyles, MacroId, ModuleDefId, ModuleId, TraitId, UseId,
     db::DefDatabase,
     per_ns::{Item, MacrosItem, PerNs, TypesItem, ValuesItem},
     visibility::Visibility,
@@ -158,7 +159,8 @@ pub struct ItemScope {
     /// declared.
     declarations: ThinVec<ModuleDefId>,
 
-    impls: ThinVec<ImplId>,
+    impls: ThinVec<(ImplId, /* trait impl */ bool)>,
+    builtin_derive_impls: ThinVec<BuiltinDeriveImplId>,
     extern_blocks: ThinVec<ExternBlockId>,
     unnamed_consts: ThinVec<ConstId>,
     /// Traits imported via `use Trait as _;`.
@@ -198,7 +200,7 @@ struct DeriveMacroInvocation {
     attr_id: AttrId,
     /// The `#[derive]` call
     attr_call_id: MacroCallId,
-    derive_call_ids: SmallVec<[Option<MacroCallId>; 4]>,
+    derive_call_ids: SmallVec<[Option<Either<MacroCallId, BuiltinDeriveImplId>>; 4]>,
 }
 
 pub(crate) static BUILTIN_SCOPE: LazyLock<FxIndexMap<Name, PerNs>> = LazyLock::new(|| {
@@ -326,13 +328,27 @@ impl ItemScope {
     }
 
     pub fn impls(&self) -> impl ExactSizeIterator<Item = ImplId> + '_ {
-        self.impls.iter().copied()
+        self.impls.iter().map(|&(id, _)| id)
+    }
+
+    pub fn trait_impls(&self) -> impl Iterator<Item = ImplId> + '_ {
+        self.impls.iter().filter(|&&(_, is_trait_impl)| is_trait_impl).map(|&(id, _)| id)
+    }
+
+    pub fn inherent_impls(&self) -> impl Iterator<Item = ImplId> + '_ {
+        self.impls.iter().filter(|&&(_, is_trait_impl)| !is_trait_impl).map(|&(id, _)| id)
+    }
+
+    pub fn builtin_derive_impls(&self) -> impl ExactSizeIterator<Item = BuiltinDeriveImplId> + '_ {
+        self.builtin_derive_impls.iter().copied()
     }
 
     pub fn all_macro_calls(&self) -> impl Iterator<Item = MacroCallId> + '_ {
         self.macro_invocations.values().copied().chain(self.attr_macros.values().copied()).chain(
             self.derive_macros.values().flat_map(|it| {
-                it.iter().flat_map(|it| it.derive_call_ids.iter().copied().flatten())
+                it.iter().flat_map(|it| {
+                    it.derive_call_ids.iter().copied().flatten().flat_map(|it| it.left())
+                })
             }),
         )
     }
@@ -364,6 +380,10 @@ impl ItemScope {
 
     pub(crate) fn type_(&self, name: &Name) -> Option<(ModuleDefId, Visibility)> {
         self.types.get(name).map(|item| (item.def, item.vis))
+    }
+
+    pub(crate) fn makro(&self, name: &Name) -> Option<MacroId> {
+        self.macros.get(name).map(|item| item.def)
     }
 
     /// XXX: this is O(N) rather than O(1), try to not introduce new usages.
@@ -467,8 +487,12 @@ impl ItemScope {
         self.legacy_macros.get(name).map(|it| &**it)
     }
 
-    pub(crate) fn define_impl(&mut self, imp: ImplId) {
-        self.impls.push(imp);
+    pub(crate) fn define_impl(&mut self, imp: ImplId, is_trait_impl: bool) {
+        self.impls.push((imp, is_trait_impl));
+    }
+
+    pub(crate) fn define_builtin_derive_impl(&mut self, imp: BuiltinDeriveImplId) {
+        self.builtin_derive_impls.push(imp);
     }
 
     pub(crate) fn define_extern_block(&mut self, extern_block: ExternBlockId) {
@@ -502,7 +526,7 @@ impl ItemScope {
     pub(crate) fn set_derive_macro_invoc(
         &mut self,
         adt: AstId<ast::Adt>,
-        call: MacroCallId,
+        call: Either<MacroCallId, BuiltinDeriveImplId>,
         id: AttrId,
         idx: usize,
     ) {
@@ -522,12 +546,13 @@ impl ItemScope {
         adt: AstId<ast::Adt>,
         attr_id: AttrId,
         attr_call_id: MacroCallId,
-        len: usize,
+        mut derive_call_ids: SmallVec<[Option<Either<MacroCallId, BuiltinDeriveImplId>>; 4]>,
     ) {
+        derive_call_ids.shrink_to_fit();
         self.derive_macros.entry(adt).or_default().push(DeriveMacroInvocation {
             attr_id,
             attr_call_id,
-            derive_call_ids: smallvec![None; len],
+            derive_call_ids,
         });
     }
 
@@ -536,7 +561,9 @@ impl ItemScope {
     ) -> impl Iterator<
         Item = (
             AstId<ast::Adt>,
-            impl Iterator<Item = (AttrId, MacroCallId, &[Option<MacroCallId>])>,
+            impl Iterator<
+                Item = (AttrId, MacroCallId, &[Option<Either<MacroCallId, BuiltinDeriveImplId>>]),
+            >,
         ),
     > + '_ {
         self.derive_macros.iter().map(|(k, v)| {
@@ -811,6 +838,7 @@ impl ItemScope {
             unresolved,
             declarations,
             impls,
+            builtin_derive_impls,
             unnamed_consts,
             unnamed_trait_imports,
             legacy_macros,
@@ -834,6 +862,7 @@ impl ItemScope {
         unresolved.shrink_to_fit();
         declarations.shrink_to_fit();
         impls.shrink_to_fit();
+        builtin_derive_impls.shrink_to_fit();
         unnamed_consts.shrink_to_fit();
         unnamed_trait_imports.shrink_to_fit();
         legacy_macros.shrink_to_fit();

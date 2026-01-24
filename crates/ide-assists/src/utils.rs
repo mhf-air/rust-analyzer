@@ -27,7 +27,7 @@ use syntax::{
         make,
         syntax_factory::SyntaxFactory,
     },
-    syntax_editor::{Removable, SyntaxEditor},
+    syntax_editor::{Element, Removable, SyntaxEditor},
 };
 
 use crate::{
@@ -84,6 +84,17 @@ pub fn extract_trivial_expression(block_expr: &ast::BlockExpr) -> Option<ast::Ex
         }
     }
     None
+}
+
+pub(crate) fn wrap_block(expr: &ast::Expr) -> ast::BlockExpr {
+    if let ast::Expr::BlockExpr(block) = expr
+        && let Some(first) = block.syntax().first_token()
+        && first.kind() == T!['{']
+    {
+        block.reset_indent()
+    } else {
+        make::block_expr(None, Some(expr.reset_indent().indent(1.into())))
+    }
 }
 
 /// This is a method with a heuristics to support test methods annotated with custom test annotations, such as
@@ -382,6 +393,28 @@ fn invert_special_case_legacy(expr: &ast::Expr) -> Option<ast::Expr> {
         },
         _ => None,
     }
+}
+
+pub(crate) fn insert_attributes(
+    before: impl Element,
+    edit: &mut SyntaxEditor,
+    attrs: impl IntoIterator<Item = ast::Attr>,
+) {
+    let mut attrs = attrs.into_iter().peekable();
+    if attrs.peek().is_none() {
+        return;
+    }
+    let elem = before.syntax_element();
+    let indent = IndentLevel::from_element(&elem);
+    let whitespace = format!("\n{indent}");
+    edit.insert_all(
+        syntax::syntax_editor::Position::before(elem),
+        attrs
+            .flat_map(|attr| {
+                [attr.syntax().clone().into(), make::tokens::whitespace(&whitespace).into()]
+            })
+            .collect(),
+    );
 }
 
 pub(crate) fn next_prev() -> impl Iterator<Item = Direction> {

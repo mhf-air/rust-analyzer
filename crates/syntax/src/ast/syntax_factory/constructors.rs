@@ -748,6 +748,22 @@ impl SyntaxFactory {
         ast.into()
     }
 
+    pub fn expr_raw_ref(&self, expr: ast::Expr, exclusive: bool) -> ast::Expr {
+        let ast::Expr::RefExpr(ast) =
+            make::expr_raw_ref(expr.clone(), exclusive).clone_for_update()
+        else {
+            unreachable!()
+        };
+
+        if let Some(mut mapping) = self.mappings() {
+            let mut builder = SyntaxMappingBuilder::new(ast.syntax().clone());
+            builder.map_node(expr.syntax().clone(), ast.expr().unwrap().syntax().clone());
+            builder.finish(&mut mapping);
+        }
+
+        ast.into()
+    }
+
     pub fn expr_closure(
         &self,
         pats: impl IntoIterator<Item = ast::Param>,
@@ -1561,6 +1577,44 @@ impl SyntaxFactory {
 
     pub fn ident(&self, text: &str) -> SyntaxToken {
         make::tokens::ident(text)
+    }
+
+    pub fn mut_self_param(&self) -> ast::SelfParam {
+        let ast = make::mut_self_param().clone_for_update();
+
+        if let Some(mut mapping) = self.mappings() {
+            let builder = SyntaxMappingBuilder::new(ast.syntax().clone());
+            builder.finish(&mut mapping);
+        }
+
+        ast
+    }
+
+    pub fn ret_type(&self, ty: ast::Type) -> ast::RetType {
+        let ast = make::ret_type(ty.clone()).clone_for_update();
+
+        if let Some(mut mapping) = self.mappings() {
+            let mut builder = SyntaxMappingBuilder::new(ast.syntax().clone());
+            builder.map_node(ty.syntax().clone(), ast.ty().unwrap().syntax().clone());
+            builder.finish(&mut mapping);
+        }
+        ast
+    }
+
+    pub fn ty_ref(&self, ty: ast::Type, is_mut: bool) -> ast::Type {
+        let ast = make::ty_ref(ty.clone(), is_mut).clone_for_update();
+
+        if let Some(mut mapping) = self.mappings() {
+            let mut builder = SyntaxMappingBuilder::new(ast.syntax().clone());
+            match &ast {
+                ast::Type::RefType(ref_ty) => {
+                    builder.map_node(ty.syntax().clone(), ref_ty.ty().unwrap().syntax().clone());
+                }
+                _ => unreachable!(),
+            }
+            builder.finish(&mut mapping);
+        }
+        ast
     }
 }
 

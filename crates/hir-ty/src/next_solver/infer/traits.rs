@@ -9,8 +9,11 @@ use std::{
 
 use hir_def::TraitId;
 use macros::{TypeFoldable, TypeVisitable};
-use rustc_type_ir::Upcast;
 use rustc_type_ir::elaborate::Elaboratable;
+use rustc_type_ir::{
+    Upcast,
+    solve::{Certainty, NoSolution, inspect},
+};
 use tracing::debug;
 
 use crate::next_solver::{
@@ -52,6 +55,13 @@ impl ObligationCause {
     }
 }
 
+impl Default for ObligationCause {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// An `Obligation` represents some trait reference (e.g., `i32: Eq`) for
 /// which the "impl_source" must be found. The process of finding an "impl_source" is
 /// called "resolving" the `Obligation`. This process consists of
@@ -78,6 +88,15 @@ pub struct Obligation<'db, T> {
     /// holds for certain. Stupid halting problem; such a drag.
     pub recursion_depth: usize,
 }
+
+/// A callback that can be provided to `inspect_typeck`. Invoked on evaluation
+/// of root obligations.
+pub type ObligationInspector<'db> = fn(
+    &InferCtxt<'db>,
+    &PredicateObligation<'db>,
+    Result<Certainty, NoSolution>,
+    Option<inspect::GoalEvaluation<DbInterner<'db>>>,
+);
 
 /// For [`Obligation`], a sub-obligation is combined with the current obligation's
 /// param-env and cause code.

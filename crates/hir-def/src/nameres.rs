@@ -61,6 +61,7 @@ mod tests;
 use std::ops::{Deref, DerefMut, Index, IndexMut};
 
 use base_db::Crate;
+use either::Either;
 use hir_expand::{
     EditionedFileId, ErasedAstId, HirFileId, InFile, MacroCallId, mod_path::ModPath, name::Name,
     proc_macro::ProcMacroKind,
@@ -75,8 +76,8 @@ use triomphe::Arc;
 use tt::TextRange;
 
 use crate::{
-    AstId, BlockId, BlockLoc, ExternCrateId, FunctionId, FxIndexMap, Lookup, MacroCallStyles,
-    MacroExpander, MacroId, ModuleId, ModuleIdLt, ProcMacroId, UseId,
+    AstId, BlockId, BlockLoc, BuiltinDeriveImplId, ExternCrateId, FunctionId, FxIndexMap, Lookup,
+    MacroCallStyles, MacroExpander, MacroId, ModuleId, ModuleIdLt, ProcMacroId, UseId,
     db::DefDatabase,
     item_scope::{BuiltinShadowMode, ItemScope},
     item_tree::TreeId,
@@ -86,6 +87,25 @@ use crate::{
 };
 
 pub use self::path_resolution::ResolvePathResultPrefixInfo;
+
+#[cfg(test)]
+thread_local! {
+    /// HACK: In order to test builtin derive expansion, we gate their fast path with this atomic when cfg(test).
+    pub(crate) static ENABLE_BUILTIN_DERIVE_FAST_PATH: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(true) };
+}
+
+#[inline]
+#[cfg(test)]
+fn enable_builtin_derive_fast_path() -> bool {
+    ENABLE_BUILTIN_DERIVE_FAST_PATH.get()
+}
+
+#[inline(always)]
+#[cfg(not(test))]
+fn enable_builtin_derive_fast_path() -> bool {
+    true
+}
 
 const PREDEFINED_TOOLS: &[SmolStr] = &[
     SmolStr::new_static("clippy"),
@@ -173,7 +193,8 @@ pub struct DefMap {
     /// Tracks which custom derives are in scope for an item, to allow resolution of derive helper
     /// attributes.
     // FIXME: Figure out a better way for the IDE layer to resolve these?
-    derive_helpers_in_scope: FxHashMap<AstId<ast::Item>, Vec<(Name, MacroId, MacroCallId)>>,
+    derive_helpers_in_scope:
+        FxHashMap<AstId<ast::Item>, Vec<(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)>>,
     /// A mapping from [`hir_expand::MacroDefId`] to [`crate::MacroId`].
     pub macro_def_to_macro_id: FxHashMap<ErasedAstId, MacroId>,
 
@@ -195,7 +216,7 @@ struct DefMapCrateData {
     registered_tools: Vec<Symbol>,
     /// Unstable features of Rust enabled with `#![feature(A, B)]`.
     unstable_features: FxHashSet<Symbol>,
-    /// #[rustc_coherence_is_core]
+    /// `#[rustc_coherence_is_core]`
     rustc_coherence_is_core: bool,
     no_core: bool,
     no_std: bool,
@@ -483,6 +504,7 @@ impl DefMap {
 }
 
 impl DefMap {
+    /// Returns all modules in the crate that are associated with the given file.
     pub fn modules_for_file<'a>(
         &'a self,
         db: &'a dyn DefDatabase,
@@ -490,20 +512,37 @@ impl DefMap {
     ) -> impl Iterator<Item = ModuleId> + 'a {
         self.modules
             .iter()
-            .filter(move |(_id, data)| {
+            .filter(move |(_, data)| {
                 data.origin.file_id().map(|file_id| file_id.file_id(db)) == Some(file_id)
             })
-            .map(|(id, _data)| id)
+            .map(|(id, _)| id)
     }
 
     pub fn modules(&self) -> impl Iterator<Item = (ModuleId, &ModuleData)> + '_ {
         self.modules.iter()
     }
 
+    /// Returns all inline modules (mod name { ... }) in the crate that are associated with the given macro expansion.
+    pub fn inline_modules_for_macro_file(
+        &self,
+        file_id: MacroCallId,
+    ) -> impl Iterator<Item = ModuleId> + '_ {
+        self.modules
+            .iter()
+            .filter(move |(_, data)| {
+                matches!(
+                    data.origin,
+                    ModuleOrigin::Inline { definition_tree_id, .. }
+                    if definition_tree_id.file_id().macro_file() == Some(file_id)
+                )
+            })
+            .map(|(id, _)| id)
+    }
+
     pub fn derive_helpers_in_scope(
         &self,
         id: AstId<ast::Adt>,
-    ) -> Option<&[(Name, MacroId, MacroCallId)]> {
+    ) -> Option<&[(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)]> {
         self.derive_helpers_in_scope.get(&id.map(|it| it.upcast())).map(Deref::deref)
     }
 

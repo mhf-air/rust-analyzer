@@ -435,17 +435,15 @@ fn traverse(
             |node| unsafe_ops.contains(&InFile::new(descended_element.file_id, node));
         let element = match descended_element.value {
             NodeOrToken::Node(name_like) => {
-                let hl = hir::attach_db(sema.db, || {
-                    highlight::name_like(
-                        sema,
-                        krate,
-                        bindings_shadow_count,
-                        &is_unsafe_node,
-                        config.syntactic_name_ref_highlighting,
-                        name_like,
-                        edition,
-                    )
-                });
+                let hl = highlight::name_like(
+                    sema,
+                    krate,
+                    bindings_shadow_count,
+                    &is_unsafe_node,
+                    config.syntactic_name_ref_highlighting,
+                    name_like,
+                    edition,
+                );
                 if hl.is_some() && !in_macro {
                     // skip highlighting the contained token of our name-like node
                     // as that would potentially overwrite our result
@@ -453,10 +451,10 @@ fn traverse(
                 }
                 hl
             }
-            NodeOrToken::Token(token) => hir::attach_db(sema.db, || {
+            NodeOrToken::Token(token) => {
                 highlight::token(sema, token, edition, &is_unsafe_node, tt_level > 0)
                     .zip(Some(None))
-            }),
+            }
         };
         if let Some((mut highlight, binding_hash)) = element {
             if is_unlinked && highlight.tag == HlTag::UnresolvedReference {
@@ -515,21 +513,21 @@ fn string_injections(
             );
 
             if !string.is_raw() {
-                highlight_escape_string(hl, &string);
+                highlight_escape_string(hl, config, &string);
             }
         }
     } else if let Some(byte_string) = ast::ByteString::cast(token.clone()) {
         if !byte_string.is_raw() {
-            highlight_escape_string(hl, &byte_string);
+            highlight_escape_string(hl, config, &byte_string);
         }
     } else if let Some(c_string) = ast::CString::cast(token.clone()) {
         if !c_string.is_raw() {
-            highlight_escape_string(hl, &c_string);
+            highlight_escape_string(hl, config, &c_string);
         }
     } else if let Some(char) = ast::Char::cast(token.clone()) {
-        highlight_escape_char(hl, &char)
+        highlight_escape_char(hl, config, &char)
     } else if let Some(byte) = ast::Byte::cast(token) {
-        highlight_escape_byte(hl, &byte)
+        highlight_escape_byte(hl, config, &byte)
     }
     ControlFlow::Continue(())
 }
@@ -588,7 +586,11 @@ fn descend_token(
 
 fn filter_by_config(highlight: &mut Highlight, config: &HighlightConfig<'_>) -> bool {
     match &mut highlight.tag {
-        HlTag::StringLiteral if !config.strings => return false,
+        HlTag::StringLiteral | HlTag::EscapeSequence | HlTag::InvalidEscapeSequence
+            if !config.strings =>
+        {
+            return false;
+        }
         HlTag::Comment if !config.comments => return false,
         // If punctuation is disabled, make the macro bang part of the macro call again.
         tag @ HlTag::Punctuation(HlPunct::MacroBang) => {

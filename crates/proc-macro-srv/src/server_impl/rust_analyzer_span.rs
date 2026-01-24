@@ -14,13 +14,14 @@ use proc_macro::bridge::server;
 use span::{FIXUP_ERASED_FILE_AST_ID_MARKER, Span, TextRange, TextSize};
 
 use crate::{
+    ProcMacroClientHandle,
     bridge::{Diagnostic, ExpnGlobals, Literal, TokenTree},
     server_impl::literal_from_str,
 };
 
 pub struct FreeFunctions;
 
-pub struct RaSpanServer {
+pub struct RaSpanServer<'a> {
     // FIXME: Report this back to the caller to track as dependencies
     pub tracked_env_vars: HashMap<Box<str>, Option<Box<str>>>,
     // FIXME: Report this back to the caller to track as dependencies
@@ -28,16 +29,17 @@ pub struct RaSpanServer {
     pub call_site: Span,
     pub def_site: Span,
     pub mixed_site: Span,
+    pub callback: Option<ProcMacroClientHandle<'a>>,
 }
 
-impl server::Types for RaSpanServer {
+impl server::Types for RaSpanServer<'_> {
     type FreeFunctions = FreeFunctions;
     type TokenStream = crate::token_stream::TokenStream<Span>;
     type Span = Span;
     type Symbol = Symbol;
 }
 
-impl server::FreeFunctions for RaSpanServer {
+impl server::FreeFunctions for RaSpanServer<'_> {
     fn injected_env_var(&mut self, _: &str) -> Option<std::string::String> {
         None
     }
@@ -58,7 +60,7 @@ impl server::FreeFunctions for RaSpanServer {
     }
 }
 
-impl server::TokenStream for RaSpanServer {
+impl server::TokenStream for RaSpanServer<'_> {
     fn is_empty(&mut self, stream: &Self::TokenStream) -> bool {
         stream.is_empty()
     }
@@ -121,17 +123,15 @@ impl server::TokenStream for RaSpanServer {
     }
 }
 
-impl server::Span for RaSpanServer {
+impl server::Span for RaSpanServer<'_> {
     fn debug(&mut self, span: Self::Span) -> String {
         format!("{:?}", span)
     }
-    fn file(&mut self, _: Self::Span) -> String {
-        // FIXME
-        String::new()
+    fn file(&mut self, span: Self::Span) -> String {
+        self.callback.as_mut().map(|cb| cb.file(span.anchor.file_id.file_id())).unwrap_or_default()
     }
-    fn local_file(&mut self, _: Self::Span) -> Option<String> {
-        // FIXME
-        None
+    fn local_file(&mut self, span: Self::Span) -> Option<String> {
+        self.callback.as_mut().and_then(|cb| cb.local_file(span.anchor.file_id.file_id()))
     }
     fn save_span(&mut self, _span: Self::Span) -> usize {
         // FIXME, quote is incompatible with third-party tools
@@ -149,9 +149,8 @@ impl server::Span for RaSpanServer {
     ///
     /// See PR:
     /// https://github.com/rust-lang/rust/pull/55780
-    fn source_text(&mut self, _span: Self::Span) -> Option<String> {
-        // FIXME requires db, needs special handling wrt fixup spans
-        None
+    fn source_text(&mut self, span: Self::Span) -> Option<String> {
+        self.callback.as_mut()?.source_text(span)
     }
 
     fn parent(&mut self, _span: Self::Span) -> Option<Self::Span> {
@@ -163,7 +162,10 @@ impl server::Span for RaSpanServer {
         span
     }
     fn byte_range(&mut self, span: Self::Span) -> Range<usize> {
-        // FIXME requires db to resolve the ast id, THIS IS NOT INCREMENTAL
+        if let Some(cb) = self.callback.as_mut() {
+            return cb.byte_range(span);
+        }
+
         Range { start: span.range.start().into(), end: span.range.end().into() }
     }
     fn join(&mut self, first: Self::Span, second: Self::Span) -> Option<Self::Span> {
@@ -258,25 +260,23 @@ impl server::Span for RaSpanServer {
         Span { range: TextRange::empty(span.range.start()), ..span }
     }
 
-    fn line(&mut self, _span: Self::Span) -> usize {
-        // FIXME requires db to resolve line index, THIS IS NOT INCREMENTAL
-        1
+    fn line(&mut self, span: Self::Span) -> usize {
+        self.callback.as_mut().and_then(|cb| cb.line_column(span)).map_or(1, |(l, _)| l as usize)
     }
 
-    fn column(&mut self, _span: Self::Span) -> usize {
-        // FIXME requires db to resolve line index, THIS IS NOT INCREMENTAL
-        1
+    fn column(&mut self, span: Self::Span) -> usize {
+        self.callback.as_mut().and_then(|cb| cb.line_column(span)).map_or(1, |(_, c)| c as usize)
     }
 }
 
-impl server::Symbol for RaSpanServer {
+impl server::Symbol for RaSpanServer<'_> {
     fn normalize_and_validate_ident(&mut self, string: &str) -> Result<Self::Symbol, ()> {
         // FIXME: nfc-normalize and validate idents
         Ok(<Self as server::Server>::intern_symbol(string))
     }
 }
 
-impl server::Server for RaSpanServer {
+impl server::Server for RaSpanServer<'_> {
     fn globals(&mut self) -> ExpnGlobals<Self::Span> {
         ExpnGlobals {
             def_site: self.def_site,
