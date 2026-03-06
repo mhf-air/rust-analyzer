@@ -4,14 +4,21 @@
 //! channels without needing to spawn the actual server and client processes.
 
 #![cfg(feature = "sysroot-abi")]
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
 
 mod common {
     pub(crate) mod utils;
 }
 
-use common::utils::{create_empty_token_tree, proc_macro_test_dylib_path, request, with_server};
+use common::utils::{
+    create_empty_token_tree, proc_macro_test_dylib_path, request_legacy, with_server,
+};
 use expect_test::expect;
 use proc_macro_api::{
+    ProtocolFormat::JsonLegacy,
     legacy_protocol::msg::{
         ExpandMacro, ExpandMacroData, ExpnGlobals, PanicMessage, Request, Response, ServerConfig,
         SpanDataIndexMap, SpanMode,
@@ -21,8 +28,8 @@ use proc_macro_api::{
 
 #[test]
 fn test_version_check() {
-    with_server(|writer, reader| {
-        let response = request(writer, reader, Request::ApiVersionCheck {});
+    with_server(JsonLegacy, |writer, reader| {
+        let response = request_legacy(writer, reader, Request::ApiVersionCheck {});
 
         match response {
             Response::ApiVersionCheck(version) => {
@@ -35,9 +42,9 @@ fn test_version_check() {
 
 #[test]
 fn test_list_macros() {
-    with_server(|writer, reader| {
+    with_server(JsonLegacy, |writer, reader| {
         let dylib_path = proc_macro_test_dylib_path();
-        let response = request(writer, reader, Request::ListMacros { dylib_path });
+        let response = request_legacy(writer, reader, Request::ListMacros { dylib_path });
 
         let Response::ListMacros(Ok(macros)) = response else {
             panic!("expected successful ListMacros response");
@@ -71,8 +78,8 @@ fn test_list_macros() {
 
 #[test]
 fn test_list_macros_invalid_path() {
-    with_server(|writer, reader| {
-        let response = request(
+    with_server(JsonLegacy, |writer, reader| {
+        let response = request_legacy(
             writer,
             reader,
             Request::ListMacros { dylib_path: "/nonexistent/path/to/dylib.so".into() },
@@ -90,9 +97,9 @@ fn test_list_macros_invalid_path() {
 
 #[test]
 fn test_set_config() {
-    with_server(|writer, reader| {
+    with_server(JsonLegacy, |writer, reader| {
         let config = ServerConfig { span_mode: SpanMode::Id };
-        let response = request(writer, reader, Request::SetConfig(config));
+        let response = request_legacy(writer, reader, Request::SetConfig(config));
 
         match response {
             Response::SetConfig(returned_config) => {
@@ -105,9 +112,9 @@ fn test_set_config() {
 
 #[test]
 fn test_set_config_rust_analyzer_mode() {
-    with_server(|writer, reader| {
+    with_server(JsonLegacy, |writer, reader| {
         let config = ServerConfig { span_mode: SpanMode::RustAnalyzer };
-        let response = request(writer, reader, Request::SetConfig(config));
+        let response = request_legacy(writer, reader, Request::SetConfig(config));
 
         match response {
             Response::SetConfig(returned_config) => {
@@ -120,10 +127,10 @@ fn test_set_config_rust_analyzer_mode() {
 
 #[test]
 fn test_expand_macro_panic() {
-    with_server(|writer, reader| {
+    with_server(JsonLegacy, |writer, reader| {
         let dylib_path = proc_macro_test_dylib_path();
 
-        let version_response = request(writer, reader, Request::ApiVersionCheck {});
+        let version_response = request_legacy(writer, reader, Request::ApiVersionCheck {});
         let Response::ApiVersionCheck(version) = version_response else {
             panic!("expected version check response");
         };
@@ -149,7 +156,7 @@ fn test_expand_macro_panic() {
             },
         }));
 
-        let response = request(writer, reader, expand_request);
+        let response = request_legacy(writer, reader, expand_request);
 
         match response {
             Response::ExpandMacro(Err(PanicMessage(msg))) => {
@@ -165,28 +172,31 @@ fn test_expand_macro_panic() {
 
 #[test]
 fn test_basic_call_flow() {
-    with_server(|writer, reader| {
+    with_server(JsonLegacy, |writer, reader| {
         let dylib_path = proc_macro_test_dylib_path();
 
-        let response1 = request(writer, reader, Request::ApiVersionCheck {});
+        let response1 = request_legacy(writer, reader, Request::ApiVersionCheck {});
         assert!(matches!(response1, Response::ApiVersionCheck(_)));
 
-        let response2 =
-            request(writer, reader, Request::SetConfig(ServerConfig { span_mode: SpanMode::Id }));
+        let response2 = request_legacy(
+            writer,
+            reader,
+            Request::SetConfig(ServerConfig { span_mode: SpanMode::Id }),
+        );
         assert!(matches!(response2, Response::SetConfig(_)));
 
         let response3 =
-            request(writer, reader, Request::ListMacros { dylib_path: dylib_path.clone() });
+            request_legacy(writer, reader, Request::ListMacros { dylib_path: dylib_path.clone() });
         assert!(matches!(response3, Response::ListMacros(Ok(_))));
     });
 }
 
 #[test]
 fn test_expand_nonexistent_macro() {
-    with_server(|writer, reader| {
+    with_server(JsonLegacy, |writer, reader| {
         let dylib_path = proc_macro_test_dylib_path();
 
-        let version_response = request(writer, reader, Request::ApiVersionCheck {});
+        let version_response = request_legacy(writer, reader, Request::ApiVersionCheck {});
         let Response::ApiVersionCheck(version) = version_response else {
             panic!("expected version check response");
         };
@@ -212,7 +222,7 @@ fn test_expand_nonexistent_macro() {
             },
         }));
 
-        let response = request(writer, reader, expand_request);
+        let response = request_legacy(writer, reader, expand_request);
 
         match response {
             Response::ExpandMacro(Err(PanicMessage(msg))) => {

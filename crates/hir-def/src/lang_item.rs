@@ -456,6 +456,7 @@ language_item_table! { LangItems =>
     TryTraitFromOutput,      sym::from_output,         FunctionId;
     TryTraitBranch,          sym::branch,              FunctionId;
     TryTraitFromYeet,        sym::from_yeet,           FunctionId;
+    ResidualIntoTryType,     sym::into_try_type,       FunctionId;
 
     PointerLike,             sym::pointer_like,        TraitId;
 
@@ -498,6 +499,11 @@ language_item_table! { LangItems =>
     Range,                   sym::Range,               StructId;
     RangeToInclusive,        sym::RangeToInclusive,    StructId;
     RangeTo,                 sym::RangeTo,             StructId;
+
+    RangeFromCopy,           sym::RangeFromCopy,           StructId;
+    RangeInclusiveCopy,      sym::RangeInclusiveCopy,      StructId;
+    RangeCopy,               sym::RangeCopy,               StructId;
+    RangeToInclusiveCopy,    sym::RangeToInclusiveCopy,    StructId;
 
     String,                  sym::String,              StructId;
     CStr,                    sym::CStr,                StructId;

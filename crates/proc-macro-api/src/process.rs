@@ -17,8 +17,12 @@ use span::Span;
 use stdx::JodChild;
 
 use crate::{
-    Codec, ProcMacro, ProcMacroKind, ProtocolFormat, ServerError,
-    bidirectional_protocol::{self, SubCallback, msg::BidirectionalMessage, reject_subrequests},
+    ProcMacro, ProcMacroKind, ProtocolFormat, ServerError,
+    bidirectional_protocol::{
+        self, SubCallback,
+        msg::{BidirectionalMessage, SubResponse},
+        reject_subrequests,
+    },
     legacy_protocol::{self, SpanMode},
     version,
 };
@@ -207,14 +211,18 @@ impl ProcMacroServerProcess {
     pub(crate) fn find_proc_macros(
         &self,
         dylib_path: &AbsPath,
-        callback: Option<SubCallback<'_>>,
     ) -> Result<Result<Vec<(String, ProcMacroKind)>, String>, ServerError> {
         match self.protocol {
             Protocol::LegacyJson { .. } => legacy_protocol::find_proc_macros(self, dylib_path),
 
             Protocol::BidirectionalPostcardPrototype { .. } => {
-                let cb = callback.expect("callback required for bidirectional protocol");
-                bidirectional_protocol::find_proc_macros(self, dylib_path, cb)
+                bidirectional_protocol::find_proc_macros(self, dylib_path, &|_| {
+                    Ok(SubResponse::Cancel {
+                        reason: String::from(
+                            "Server should not do a sub request when loading proc-macros",
+                        ),
+                    })
+                })
             }
         }
     }
@@ -305,17 +313,17 @@ impl ProcMacroServerProcess {
         result
     }
 
-    pub(crate) fn send_task<Request, Response, C: Codec>(
+    pub(crate) fn send_task_legacy<Request, Response>(
         &self,
         send: impl FnOnce(
             &mut dyn Write,
             &mut dyn BufRead,
             Request,
-            &mut C::Buf,
+            &mut String,
         ) -> Result<Option<Response>, ServerError>,
         req: Request,
     ) -> Result<Response, ServerError> {
-        self.with_locked_io::<C, _>(|writer, reader, buf| {
+        self.with_locked_io(String::new(), |writer, reader, buf| {
             send(writer, reader, req, buf).and_then(|res| {
                 res.ok_or_else(|| {
                     let message = "proc-macro server did not respond with data".to_owned();
@@ -331,13 +339,12 @@ impl ProcMacroServerProcess {
         })
     }
 
-    pub(crate) fn with_locked_io<C: Codec, R>(
+    fn with_locked_io<R, B>(
         &self,
-        f: impl FnOnce(&mut dyn Write, &mut dyn BufRead, &mut C::Buf) -> Result<R, ServerError>,
+        mut buf: B,
+        f: impl FnOnce(&mut dyn Write, &mut dyn BufRead, &mut B) -> Result<R, ServerError>,
     ) -> Result<R, ServerError> {
         let state = &mut *self.state.lock().unwrap();
-        let mut buf = C::Buf::default();
-
         f(&mut state.stdin, &mut state.stdout, &mut buf).map_err(|e| {
             if e.io.as_ref().map(|it| it.kind()) == Some(io::ErrorKind::BrokenPipe) {
                 match state.process.exit_err() {
@@ -352,13 +359,13 @@ impl ProcMacroServerProcess {
         })
     }
 
-    pub(crate) fn run_bidirectional<C: Codec>(
+    pub(crate) fn run_bidirectional(
         &self,
         initial: BidirectionalMessage,
         callback: SubCallback<'_>,
     ) -> Result<BidirectionalMessage, ServerError> {
-        self.with_locked_io::<C, _>(|writer, reader, buf| {
-            bidirectional_protocol::run_conversation::<C>(writer, reader, buf, initial, callback)
+        self.with_locked_io(Vec::new(), |writer, reader, buf| {
+            bidirectional_protocol::run_conversation(writer, reader, buf, initial, callback)
         })
     }
 

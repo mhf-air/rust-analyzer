@@ -1819,6 +1819,28 @@ impl<'db> SemanticsImpl<'db> {
         self.analyze(try_expr.syntax())?.resolve_try_expr(self.db, try_expr)
     }
 
+    /// The type that the associated `try` block, closure or function expects.
+    pub fn try_expr_returned_type(&self, try_expr: &ast::TryExpr) -> Option<Type<'db>> {
+        self.ancestors_with_macros(try_expr.syntax().clone()).find_map(|parent| {
+            if let Some(try_block) = ast::BlockExpr::cast(parent.clone())
+                && try_block.try_block_modifier().is_some()
+            {
+                Some(self.type_of_expr(&try_block.into())?.original)
+            } else if let Some(closure) = ast::ClosureExpr::cast(parent.clone()) {
+                Some(
+                    self.type_of_expr(&closure.into())?
+                        .original
+                        .as_callable(self.db)?
+                        .return_type(),
+                )
+            } else if let Some(function) = ast::Fn::cast(parent) {
+                Some(self.to_def(&function)?.ret_type(self.db))
+            } else {
+                None
+            }
+        })
+    }
+
     // This does not resolve the method call to the correct trait impl!
     // We should probably fix that.
     pub fn resolve_method_call_as_callable(
@@ -2003,12 +2025,30 @@ impl<'db> SemanticsImpl<'db> {
             .unwrap_or_default()
     }
 
+    pub fn record_literal_matched_fields(
+        &self,
+        literal: &ast::RecordExpr,
+    ) -> Vec<(Field, Type<'db>)> {
+        self.analyze(literal.syntax())
+            .and_then(|it| it.record_literal_matched_fields(self.db, literal))
+            .unwrap_or_default()
+    }
+
     pub fn record_pattern_missing_fields(
         &self,
         pattern: &ast::RecordPat,
     ) -> Vec<(Field, Type<'db>)> {
         self.analyze(pattern.syntax())
             .and_then(|it| it.record_pattern_missing_fields(self.db, pattern))
+            .unwrap_or_default()
+    }
+
+    pub fn record_pattern_matched_fields(
+        &self,
+        pattern: &ast::RecordPat,
+    ) -> Vec<(Field, Type<'db>)> {
+        self.analyze(pattern.syntax())
+            .and_then(|it| it.record_pattern_matched_fields(self.db, pattern))
             .unwrap_or_default()
     }
 

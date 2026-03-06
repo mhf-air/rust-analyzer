@@ -1250,6 +1250,11 @@ fn classify_name_ref<'db>(
                     let original = ast::Const::cast(name.syntax().parent()?)?;
                     TypeLocation::TypeAscription(TypeAscriptionTarget::Const(original.body()))
                 },
+                ast::Static(it) => {
+                    let name = find_opt_node_in_file(original_file, it.name())?;
+                    let original = ast::Static::cast(name.syntax().parent()?)?;
+                    TypeLocation::TypeAscription(TypeAscriptionTarget::Const(original.body()))
+                },
                 ast::RetType(it) => {
                     it.thin_arrow_token()?;
                     let parent = match ast::Fn::cast(parent.parent()?) {
@@ -1496,7 +1501,7 @@ fn classify_name_ref<'db>(
                         | SyntaxKind::RECORD_FIELD
                 )
             })
-            .and_then(|_| nameref.as_ref()?.syntax().ancestors().find_map(ast::Adt::cast))
+            .and_then(|_| find_node_at_offset::<ast::Adt>(original_file, original_offset))
             .and_then(|adt| sema.derive_helpers_in_scope(&adt))
             .unwrap_or_default();
         Some(PathKind::Attr { attr_ctx: AttrCtx { kind, annotated_item_kind, derive_helpers } })
@@ -2030,9 +2035,10 @@ fn is_after_if_expr(node: SyntaxNode) -> bool {
         Some(stmt) => stmt.syntax().clone(),
         None => node,
     };
-    let prev_sibling =
-        non_trivia_sibling(node.into(), Direction::Prev).and_then(NodeOrToken::into_node);
-    iter::successors(prev_sibling, |it| it.last_child_or_token()?.into_node())
+    let Some(prev_token) = previous_non_trivia_token(node) else { return false };
+    prev_token
+        .parent_ancestors()
+        .take_while(|it| it.text_range().end() == prev_token.text_range().end())
         .find_map(ast::IfExpr::cast)
         .is_some()
 }
