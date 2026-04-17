@@ -13,7 +13,10 @@ use syntax::{
 
 use crate::{
     AssistContext, AssistId, Assists,
-    utils::{does_pat_match_variant, does_pat_variant_nested_or_literal, unwrap_trivial_block},
+    utils::{
+        does_pat_match_variant, does_pat_variant_nested_or_literal, unwrap_trivial_block,
+        wrap_paren,
+    },
 };
 
 // Assist: replace_if_let_with_match
@@ -108,9 +111,10 @@ pub(crate) fn replace_if_let_with_match(acc: &mut Assists, ctx: &AssistContext<'
         format!("Replace if{let_} with match"),
         available_range,
         move |builder| {
-            let make = SyntaxFactory::with_mappings();
+            let editor = builder.make_editor(if_expr.syntax());
+            let make = editor.make();
             let match_expr: ast::Expr = {
-                let else_arm = make_else_arm(ctx, &make, else_block, &cond_bodies);
+                let else_arm = make_else_arm(ctx, make, else_block, &cond_bodies);
                 let make_match_arm =
                     |(pat, guard, body): (_, Option<ast::Expr>, ast::BlockExpr)| {
                         // Dedent from original position, then indent for match arm
@@ -143,10 +147,7 @@ pub(crate) fn replace_if_let_with_match(acc: &mut Assists, ctx: &AssistContext<'
             } else {
                 match_expr
             };
-
-            let mut editor = builder.make_editor(if_expr.syntax());
             editor.replace(if_expr.syntax(), expr.syntax());
-            editor.add_mappings(make.finish_with_mappings());
             builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
@@ -264,7 +265,8 @@ pub(crate) fn replace_match_with_if_let(acc: &mut Assists, ctx: &AssistContext<'
         format!("Replace match with if{let_}"),
         match_expr.syntax().text_range(),
         move |builder| {
-            let make = SyntaxFactory::with_mappings();
+            let editor = builder.make_editor(match_expr.syntax());
+            let make = editor.make();
             let make_block_expr = |expr: ast::Expr| {
                 // Blocks with modifiers (unsafe, async, etc.) are parsed as BlockExpr, but are
                 // formatted without enclosing braces. If we encounter such block exprs,
@@ -289,6 +291,7 @@ pub(crate) fn replace_match_with_if_let(acc: &mut Assists, ctx: &AssistContext<'
                 _ => make.expr_let(if_let_pat, scrutinee).into(),
             };
             let condition = if let Some(guard) = guard {
+                let guard = wrap_paren(guard, make, ast::prec::ExprPrecedence::LAnd);
                 make.expr_bin(condition, ast::BinaryOp::LogicOp(ast::LogicOp::And), guard).into()
             } else {
                 condition
@@ -305,9 +308,7 @@ pub(crate) fn replace_match_with_if_let(acc: &mut Assists, ctx: &AssistContext<'
                 )
                 .indent(IndentLevel::from_node(match_expr.syntax()));
 
-            let mut editor = builder.make_editor(match_expr.syntax());
             editor.replace(match_expr.syntax(), if_let_expr.syntax());
-            editor.add_mappings(make.finish_with_mappings());
             builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
@@ -398,22 +399,20 @@ fn let_and_guard(cond: &ast::Expr) -> (Option<ast::LetExpr>, Option<ast::Expr>) 
     } else if let ast::Expr::BinExpr(bin_expr) = cond
         && let Some(ast::Expr::LetExpr(let_expr)) = and_bin_expr_left(bin_expr).lhs()
     {
-        let new_expr = bin_expr.clone_subtree();
-        let mut edit = SyntaxEditor::new(new_expr.syntax().clone());
-
+        let (editor, new_expr) = SyntaxEditor::with_ast_node(bin_expr);
         let left_bin = and_bin_expr_left(&new_expr);
         if let Some(rhs) = left_bin.rhs() {
-            edit.replace(left_bin.syntax(), rhs.syntax());
+            editor.replace(left_bin.syntax(), rhs.syntax());
         } else {
             if let Some(next) = left_bin.syntax().next_sibling_or_token()
                 && next.kind() == SyntaxKind::WHITESPACE
             {
-                edit.delete(next);
+                editor.delete(next);
             }
-            edit.delete(left_bin.syntax());
+            editor.delete(left_bin.syntax());
         }
 
-        let new_expr = edit.finish().new_root().clone();
+        let new_expr = editor.finish().new_root().clone();
         (Some(let_expr), ast::Expr::cast(new_expr))
     } else {
         (None, Some(cond.clone()))
@@ -2268,14 +2267,35 @@ fn main() {
 "#,
             r#"
 fn main() {
-    if let Some(n) = Some(0) && n % 2 == 0 && n != 6 {
+    if let Some(n) = Some(0) && (n % 2 == 0 && n != 6) {
         ()
     } else {
         code()
     }
 }
 "#,
-        )
+        );
+
+        check_assist(
+            replace_match_with_if_let,
+            r#"
+fn main() {
+    match$0 Some(0) {
+        Some(n) if n % 2 == 0 || n == 7 => (),
+        _ => code(),
+    }
+}
+"#,
+            r#"
+fn main() {
+    if let Some(n) = Some(0) && (n % 2 == 0 || n == 7) {
+        ()
+    } else {
+        code()
+    }
+}
+"#,
+        );
     }
 
     #[test]

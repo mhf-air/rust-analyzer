@@ -6,7 +6,7 @@ use base_db::Crate;
 use either::Either;
 use hir_def::{
     DefWithBodyId, FieldId, StaticId, TupleFieldId, UnionId, VariantId,
-    expr_store::Body,
+    expr_store::ExpressionStore,
     hir::{BindingAnnotation, BindingId, Expr, ExprId, Ordering, PatId},
 };
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
@@ -23,8 +23,8 @@ use crate::{
     display::{DisplayTarget, HirDisplay},
     infer::PointerCast,
     next_solver::{
-        Const, DbInterner, ErrorGuaranteed, GenericArgs, ParamEnv, StoredConst, StoredGenericArgs,
-        StoredTy, Ty, TyKind,
+        Allocation, AllocationData, DbInterner, ErrorGuaranteed, GenericArgs, ParamEnv,
+        StoredAllocation, StoredConst, StoredGenericArgs, StoredTy, Ty, TyKind,
         infer::{InferCtxt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
     },
@@ -40,7 +40,10 @@ pub use borrowck::{BorrowckResult, MutabilityReason, borrowck_query};
 pub use eval::{
     Evaluator, MirEvalError, VTableMap, interpret_mir, pad16, render_const_using_debug_impl,
 };
-pub use lower::{MirLowerError, lower_to_mir, mir_body_for_closure_query, mir_body_query};
+pub use lower::{
+    MirLowerError, lower_body_to_mir, lower_to_mir_with_store, mir_body_for_closure_query,
+    mir_body_query,
+};
 pub use monomorphization::{
     monomorphized_mir_body_for_closure_query, monomorphized_mir_body_query,
 };
@@ -104,7 +107,13 @@ pub enum OperandKind {
     /// [UCG#188]: https://github.com/rust-lang/unsafe-code-guidelines/issues/188
     Move(Place),
     /// Constants are already semantically values, and remain unchanged.
-    Constant { konst: StoredConst, ty: StoredTy },
+    Constant {
+        konst: StoredConst,
+        ty: StoredTy,
+    },
+    Allocation {
+        allocation: StoredAllocation,
+    },
     /// NON STANDARD: This kind of operand returns an immutable reference to that static memory. Rustc
     /// handles it with the `Constant` variant somehow.
     Static(StaticId),
@@ -112,11 +121,10 @@ pub enum OperandKind {
 
 impl<'db> Operand {
     fn from_concrete_const(data: Box<[u8]>, memory_map: MemoryMap<'db>, ty: Ty<'db>) -> Self {
-        let interner = DbInterner::conjure();
         Operand {
-            kind: OperandKind::Constant {
-                konst: Const::new_valtree(interner, ty, data, memory_map).store(),
-                ty: ty.store(),
+            kind: OperandKind::Allocation {
+                allocation: Allocation::new(AllocationData { ty, memory: data, memory_map })
+                    .store(),
             },
             span: None,
         }
@@ -1092,7 +1100,9 @@ impl MirBody {
                 OperandKind::Copy(p) | OperandKind::Move(p) => {
                     f(p, store);
                 }
-                OperandKind::Constant { .. } | OperandKind::Static(_) => (),
+                OperandKind::Constant { .. }
+                | OperandKind::Static(_)
+                | OperandKind::Allocation { .. } => (),
             }
         }
         for (_, block) in self.basic_blocks.iter_mut() {
@@ -1207,12 +1217,12 @@ pub enum MirSpan {
 }
 
 impl MirSpan {
-    pub fn is_ref_span(&self, body: &Body) -> bool {
+    pub fn is_ref_span(&self, store: &ExpressionStore) -> bool {
         match *self {
-            MirSpan::ExprId(expr) => matches!(body[expr], Expr::Ref { .. }),
+            MirSpan::ExprId(expr) => matches!(store[expr], Expr::Ref { .. }),
             // FIXME: Figure out if this is correct wrt. match ergonomics.
             MirSpan::BindingId(binding) => {
-                matches!(body[binding].mode, BindingAnnotation::Ref | BindingAnnotation::RefMut)
+                matches!(store[binding].mode, BindingAnnotation::Ref | BindingAnnotation::RefMut)
             }
             MirSpan::PatId(_) | MirSpan::SelfParam | MirSpan::Unknown => false,
         }

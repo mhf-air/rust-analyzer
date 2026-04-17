@@ -1663,7 +1663,7 @@ fn coerce<'db>(
                         Const::new_bound(
                             self.interner,
                             self.debruijn,
-                            BoundConst { var: BoundVar::from_usize(i) },
+                            BoundConst::new(BoundVar::from_usize(i)),
                         )
                     },
                 )
@@ -1718,6 +1718,9 @@ fn coerce<'db>(
 
 fn is_capturing_closure(db: &dyn HirDatabase, closure: InternedClosureId) -> bool {
     let InternedClosure(owner, expr) = closure.loc(db);
-    upvars_mentioned(db, owner)
+    let Some(body_owner) = owner.as_def_with_body() else {
+        return false;
+    };
+    upvars_mentioned(db, body_owner)
         .is_some_and(|upvars| upvars.get(&expr).is_some_and(|upvars| !upvars.is_empty()))
 }

@@ -11,12 +11,13 @@ use hir_def::{
         InlineAsmKind, LabelId, Literal, Pat, PatId, RecordSpread, Statement, UnaryOp,
     },
     resolver::ValueNs,
+    signatures::{FunctionSignature, VariantFields},
 };
 use hir_def::{FunctionId, hir::ClosureKind};
 use hir_expand::name::Name;
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::{
-    CoroutineArgs, CoroutineArgsParts, InferTy, Interner,
+    InferTy, Interner,
     inherent::{AdtDef, GenericArgs as _, IntoKind, Ty as _},
 };
 use syntax::ast::RangeOp;
@@ -26,7 +27,6 @@ use crate::{
     Adjust, Adjustment, CallableDefId, DeclContext, DeclOrigin, Rawness,
     autoderef::InferenceContextAutoderef,
     consteval,
-    db::InternedCoroutine,
     generics::generics,
     infer::{
         AllowTwoPhase, BreakableKind, coerce::CoerceMany, find_continuable,
@@ -155,7 +155,7 @@ impl<'db> InferenceContext<'_, 'db> {
     /// it is matching against. This is used to determine whether we should
     /// perform `NeverToAny` coercions.
     fn pat_guaranteed_to_constitute_read_for_never(&self, pat: PatId) -> bool {
-        match &self.body[pat] {
+        match &self.store[pat] {
             // Does not constitute a read.
             Pat::Wild => false,
 
@@ -197,25 +197,25 @@ impl<'db> InferenceContext<'_, 'db> {
     // FIXME(tschottdorf): this is problematic as the HIR is being scraped, but
     // ref bindings are be implicit after #42640 (default match binding modes). See issue #44848.
     fn contains_explicit_ref_binding(&self, pat: PatId) -> bool {
-        if let Pat::Bind { id, .. } = self.body[pat]
-            && matches!(self.body[id].mode, BindingAnnotation::Ref | BindingAnnotation::RefMut)
+        if let Pat::Bind { id, .. } = self.store[pat]
+            && matches!(self.store[id].mode, BindingAnnotation::Ref | BindingAnnotation::RefMut)
         {
             return true;
         }
 
         let mut result = false;
-        self.body.walk_pats_shallow(pat, |pat| result |= self.contains_explicit_ref_binding(pat));
+        self.store.walk_pats_shallow(pat, |pat| result |= self.contains_explicit_ref_binding(pat));
         result
     }
 
     fn is_syntactic_place_expr(&self, expr: ExprId) -> bool {
-        match &self.body[expr] {
+        match &self.store[expr] {
             // Lang item paths cannot currently be local variables or statics.
             Expr::Path(Path::LangItem(_, _)) => false,
             Expr::Path(Path::Normal(path)) => path.type_anchor.is_none(),
             Expr::Path(path) => self
                 .resolver
-                .resolve_path_in_value_ns_fully(self.db, path, self.body.expr_path_hygiene(expr))
+                .resolve_path_in_value_ns_fully(self.db, path, self.store.expr_path_hygiene(expr))
                 .is_none_or(|res| matches!(res, ValueNs::LocalBinding(_) | ValueNs::StaticId(_))),
             Expr::Underscore => true,
             Expr::UnaryOp { op: UnaryOp::Deref, .. } => true,
@@ -243,7 +243,6 @@ impl<'db> InferenceContext<'_, 'db> {
             | Expr::Assignment { .. }
             | Expr::Yield { .. }
             | Expr::Cast { .. }
-            | Expr::Async { .. }
             | Expr::Unsafe { .. }
             | Expr::Await { .. }
             | Expr::Ref { .. }
@@ -311,7 +310,7 @@ impl<'db> InferenceContext<'_, 'db> {
     ) -> Ty<'db> {
         self.db.unwind_if_revision_cancelled();
 
-        let expr = &self.body[tgt_expr];
+        let expr = &self.store[tgt_expr];
         tracing::trace!(?expr);
         let ty = match expr {
             Expr::Missing => self.err_ty(),
@@ -388,9 +387,6 @@ impl<'db> InferenceContext<'_, 'db> {
                     this.infer_expr(*id, expected, ExprIsRead::Yes)
                 })
                 .1
-            }
-            Expr::Async { id: _, statements, tail } => {
-                self.infer_async_block(tgt_expr, statements, tail)
             }
             &Expr::Loop { body, label } => {
                 // FIXME: should be:
@@ -608,7 +604,7 @@ impl<'db> InferenceContext<'_, 'db> {
                     Some(def) => {
                         let field_types = self.db.field_types(def);
                         let variant_data = def.fields(self.db);
-                        let visibilities = self.db.field_visibilities(def);
+                        let visibilities = VariantFields::field_visibilities(self.db, def);
                         for field in fields.iter() {
                             let field_def = {
                                 match variant_data.field(&field.name) {
@@ -717,7 +713,7 @@ impl<'db> InferenceContext<'_, 'db> {
                 // instantiations in RHS can be coerced to it. Note that this
                 // cannot happen in destructuring assignments because of how
                 // they are desugared.
-                let lhs_ty = match &self.body[target] {
+                let lhs_ty = match &self.store[target] {
                     // LHS of assignment doesn't constitute reads.
                     &Pat::Expr(expr) => {
                         Some(self.infer_expr(expr, &Expectation::none(), ExprIsRead::No))
@@ -728,7 +724,7 @@ impl<'db> InferenceContext<'_, 'db> {
                         let resolution = self.resolver.resolve_path_in_value_ns_fully(
                             self.db,
                             path,
-                            self.body.pat_path_hygiene(target),
+                            self.store.pat_path_hygiene(target),
                         );
                         self.resolver.reset_to_guard(resolver_guard);
 
@@ -1184,72 +1180,6 @@ impl<'db> InferenceContext<'_, 'db> {
         oprnd_t
     }
 
-    fn infer_async_block(
-        &mut self,
-        tgt_expr: ExprId,
-        statements: &[Statement],
-        tail: &Option<ExprId>,
-    ) -> Ty<'db> {
-        let ret_ty = self.table.next_ty_var();
-        let prev_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
-        let prev_ret_ty = mem::replace(&mut self.return_ty, ret_ty);
-        let prev_ret_coercion = self.return_coercion.replace(CoerceMany::new(ret_ty));
-
-        // FIXME: We should handle async blocks like we handle closures
-        let expected = &Expectation::has_type(ret_ty);
-        let (_, inner_ty) = self.with_breakable_ctx(BreakableKind::Border, None, None, |this| {
-            let ty = this.infer_block(tgt_expr, statements, *tail, None, expected);
-            if let Some(target) = expected.only_has_type(&mut this.table) {
-                match this.coerce(tgt_expr.into(), ty, target, AllowTwoPhase::No, ExprIsRead::Yes) {
-                    Ok(res) => res,
-                    Err(_) => {
-                        this.result.type_mismatches.get_or_insert_default().insert(
-                            tgt_expr.into(),
-                            TypeMismatch { expected: target.store(), actual: ty.store() },
-                        );
-                        target
-                    }
-                }
-            } else {
-                ty
-            }
-        });
-
-        self.diverges = prev_diverges;
-        self.return_ty = prev_ret_ty;
-        self.return_coercion = prev_ret_coercion;
-
-        self.lower_async_block_type_impl_trait(inner_ty, tgt_expr)
-    }
-
-    pub(crate) fn lower_async_block_type_impl_trait(
-        &mut self,
-        inner_ty: Ty<'db>,
-        tgt_expr: ExprId,
-    ) -> Ty<'db> {
-        let coroutine_id = InternedCoroutine(self.owner, tgt_expr);
-        let coroutine_id = self.db.intern_coroutine(coroutine_id).into();
-        let parent_args = GenericArgs::identity_for_item(self.interner(), self.generic_def.into());
-        Ty::new_coroutine(
-            self.interner(),
-            coroutine_id,
-            CoroutineArgs::new(
-                self.interner(),
-                CoroutineArgsParts {
-                    parent_args: parent_args.as_slice(),
-                    kind_ty: self.types.types.unit,
-                    // rustc uses a special lang item type for the resume ty. I don't believe this can cause us problems.
-                    resume_ty: self.types.types.unit,
-                    yield_ty: self.types.types.unit,
-                    return_ty: inner_ty,
-                    // FIXME: Infer upvars.
-                    tupled_upvars_ty: self.types.types.unit,
-                },
-            )
-            .args,
-        )
-    }
-
     pub(crate) fn write_fn_trait_method_resolution(
         &mut self,
         fn_x: FnTrait,
@@ -1351,7 +1281,7 @@ impl<'db> InferenceContext<'_, 'db> {
                     ExprIsRead::Yes,
                 );
                 let usize = self.types.types.usize;
-                let len = match self.body[repeat] {
+                let len = match self.store[repeat] {
                     Expr::Underscore => {
                         self.write_expr_ty(repeat, usize);
                         self.table.next_const_var()
@@ -1491,7 +1421,7 @@ impl<'db> InferenceContext<'_, 'db> {
                                     } else {
                                         ExprIsRead::No
                                     };
-                                let ty = if contains_explicit_ref_binding(this.body, *pat) {
+                                let ty = if contains_explicit_ref_binding(this.store, *pat) {
                                     this.infer_expr(
                                         *expr,
                                         &Expectation::has_type(decl_ty),
@@ -1624,7 +1554,8 @@ impl<'db> InferenceContext<'_, 'db> {
                 },
                 _ => return None,
             };
-            let is_visible = self.db.field_visibilities(field_id.parent)[field_id.local_id]
+            let is_visible = VariantFields::field_visibilities(self.db, field_id.parent)
+                [field_id.local_id]
                 .is_visible_from(self.db, self.resolver.module());
             if !is_visible {
                 if private_field.is_none() {
@@ -2117,7 +2048,7 @@ impl<'db> InferenceContext<'_, 'db> {
                 // the return value of an argument-position async block to an argument-position
                 // closure wrapped in a block.
                 // See <https://github.com/rust-lang/rust/issues/112225>.
-                let is_closure = if let Expr::Closure { closure_kind, .. } = self.body[*arg] {
+                let is_closure = if let Expr::Closure { closure_kind, .. } = self.store[*arg] {
                     !matches!(closure_kind, ClosureKind::Coroutine(_))
                 } else {
                     false
@@ -2156,7 +2087,7 @@ impl<'db> InferenceContext<'_, 'db> {
             );
             let param_env = self.table.param_env;
             self.table.register_predicates(clauses_as_obligations(
-                generic_predicates.iter_instantiated_copied(self.interner(), parameters.as_slice()),
+                generic_predicates.iter_instantiated(self.interner(), parameters.as_slice()),
                 ObligationCause::new(),
                 param_env,
             ));
@@ -2194,7 +2125,7 @@ impl<'db> InferenceContext<'_, 'db> {
             _ => return Default::default(),
         };
 
-        let data = self.db.function_signature(func);
+        let data = FunctionSignature::of(self.db, func);
         let Some(legacy_const_generics_indices) = data.legacy_const_generics_indices(self.db, func)
         else {
             return Default::default();
