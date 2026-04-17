@@ -3109,6 +3109,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6af6ae20167a9ece4bcb41af5b80f8a1f1df981f6391189ce00fd257af04126a"
 
 [[package]]
+name = "u"
+version = "0.1.0"
+dependencies = [
+ "ctrlc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "unarray"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3117,15 +3126,6 @@ checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
 [[package]]
 name = "ungrammar"
 version = "1.16.1"
-
-[[package]]
-name = "u"
-version = "0.1.0"
-dependencies = [
- "ctrlc",
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "ungrammar"

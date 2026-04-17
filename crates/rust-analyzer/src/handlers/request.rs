@@ -838,7 +838,7 @@ pub(crate) fn handle_goto_definition(
 ) -> anyhow::Result<Option<lsp_types::GotoDefinitionResponse>> {
     let mut params = params;
     u_to_rs_url(
-        &snap.config.root_path(),
+        &snap.config.default_root_path(),
         &mut params.text_document_position_params.text_document.uri,
     );
     u_to_rs_position(&snap, &mut params.text_document_position_params);
@@ -1137,7 +1137,7 @@ pub(crate) fn handle_completion(
     }: lsp_types::CompletionParams,
 ) -> anyhow::Result<Option<lsp_types::CompletionResponse>> {
     let mut text_document_position = text_document_position;
-    u_to_rs_url(&snap.config.root_path(), &mut text_document_position.text_document.uri);
+    u_to_rs_url(&snap.config.default_root_path(), &mut text_document_position.text_document.uri);
     u_to_rs_position(&snap, &mut text_document_position);
 
     let _p = tracing::info_span!("handle_completion").entered();
@@ -1314,7 +1314,7 @@ pub(crate) fn handle_signature_help(
 ) -> anyhow::Result<Option<lsp_types::SignatureHelp>> {
     let mut params = params;
     u_to_rs_url(
-        &snap.config.root_path(),
+        &snap.config.default_root_path(),
         &mut params.text_document_position_params.text_document.uri,
     );
     u_to_rs_position(&snap, &mut params.text_document_position_params);

@@ -63,7 +63,7 @@ pub(crate) fn handle_did_open_text_document(
     let _p = tracing::info_span!("handle_did_open_text_document").entered();
 
     let mut params = params;
-    let url_path = u_to_rs_url(&state.config.root_path(), &mut params.text_document.uri);
+    let url_path = u_to_rs_url(&state.config.default_root_path(), &mut params.text_document.uri);
     let span_pairs = u_compile_to_rust(&mut params.text_document.text, &url_path);
 
     if let Ok(path) = from_proto::vfs_path(&params.text_document.uri) {
@@ -110,7 +110,7 @@ pub(crate) fn handle_did_change_text_document(
     let _p = tracing::info_span!("handle_did_change_text_document").entered();
 
     let mut params = params;
-    let url_path = u_to_rs_url(&state.config.root_path(), &mut params.text_document.uri);
+    let url_path = u_to_rs_url(&state.config.default_root_path(), &mut params.text_document.uri);
     if !params.content_changes.is_empty() {
         let span_pairs = u_compile_to_rust(&mut params.content_changes[0].text, &url_path);
         u_save_span_pairs(state, &params.text_document.uri, span_pairs);
@@ -146,7 +146,7 @@ pub(crate) fn handle_did_close_text_document(
     let _p = tracing::info_span!("handle_did_close_text_document").entered();
 
     let mut params = params;
-    u_to_rs_url(&state.config.root_path(), &mut params.text_document.uri);
+    u_to_rs_url(&state.config.default_root_path(), &mut params.text_document.uri);
 
     if let Ok(path) = from_proto::vfs_path(&params.text_document.uri) {
         if state.mem_docs.remove(&path).is_err() {
