@@ -54,7 +54,7 @@ use crate::{
 // ```
 pub(crate) fn convert_named_struct_to_tuple_struct(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
 ) -> Option<()> {
     // XXX: We don't currently provide this assist for struct definitions inside macros, but if we
     // are to lift this limitation, don't forget to make `edit_struct_def()` consider macro files
@@ -92,27 +92,26 @@ pub(crate) fn convert_named_struct_to_tuple_struct(
 }
 
 fn edit_struct_def(
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     builder: &mut SourceChangeBuilder,
     strukt: &Either<ast::Struct, ast::Variant>,
     record_fields: ast::RecordFieldList,
 ) {
     // Note that we don't need to consider macro files in this function because this is
     // currently not triggered for struct definitions inside macro calls.
+    let editor = builder.make_editor(strukt.syntax());
+    let make = editor.make();
+
     let tuple_fields = record_fields.fields().filter_map(|f| {
-        let (editor, field) =
-            SyntaxEditor::with_ast_node(&ast::make::tuple_field(f.visibility(), f.ty()?));
-        editor.insert_all(
+        let (field_editor, field) =
+            SyntaxEditor::with_ast_node(&make.tuple_field(f.visibility(), f.ty()?));
+        field_editor.insert_all(
             Position::first_child_of(field.syntax()),
             f.attrs().map(|attr| attr.syntax().clone().into()).collect(),
         );
-        let field_syntax = editor.finish().new_root().clone();
-        let field = ast::TupleField::cast(field_syntax)?;
-        Some(field)
+        let field_syntax = field_editor.finish().new_root().clone();
+        ast::TupleField::cast(field_syntax)
     });
-
-    let editor = builder.make_editor(strukt.syntax());
-    let make = editor.make();
 
     let tuple_fields = make.tuple_field_list(tuple_fields);
 
@@ -154,7 +153,7 @@ fn edit_struct_def(
 }
 
 fn edit_struct_references(
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     builder: &mut SourceChangeBuilder,
     strukt: Either<hir::Struct, hir::EnumVariant>,
 ) {
@@ -175,7 +174,7 @@ fn edit_struct_references(
 }
 
 fn process_struct_name_reference(
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     r: FileReference,
     edit: &SyntaxEditor,
     source: &ast::SourceFile,
@@ -228,7 +227,7 @@ fn process_struct_name_reference(
 }
 
 fn record_to_tuple_struct_like<T, I>(
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     source: &ast::SourceFile,
     editor: &SyntaxEditor,
     field_list: T,
@@ -283,7 +282,7 @@ where
 }
 
 fn edit_field_references(
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     builder: &mut SourceChangeBuilder,
     fields: impl Iterator<Item = ast::RecordField>,
 ) {

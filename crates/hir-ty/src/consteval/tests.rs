@@ -287,6 +287,9 @@ fn floating_point_casts() {
     check_number(r#"const GOAL: i8 = (0./0.) as i8"#, 0);
     check_number(r#"const GOAL: i8 = (1./0.) as i8"#, 127);
     check_number(r#"const GOAL: i8 = (-1./0.) as i8"#, -128);
+    check_number(r#"const GOAL: u8 = (1./0.) as u8"#, 255);
+    check_number(r#"const GOAL: u8 = 256.0f32 as u8"#, 255);
+    check_number(r#"const GOAL: u16 = 1e10f32 as u16"#, 65535);
     check_number(r#"const GOAL: i64 = 1e18f64 as f32 as i64"#, 999999984306749440);
 }
 
@@ -1792,14 +1795,14 @@ const GOAL: i32 = {
 fn closure_capture_unsized_type() {
     check_number(
         r#"
-    //- minicore: fn, copy, slice, index, coerce_unsized
+    //- minicore: fn, copy, slice, index, coerce_unsized, sized
     fn f<T: A>(x: &<T as A>::Ty) -> &<T as A>::Ty {
         let c = || &*x;
         c()
     }
 
     trait A {
-        type Ty;
+        type Ty: ?Sized;
     }
 
     impl A for i32 {
@@ -1810,7 +1813,7 @@ fn closure_capture_unsized_type() {
         let k: &[u8] = &[1, 2, 3];
         let k = f::<i32>(k);
         k[0] + k[1] + k[2]
-    }
+    };
     "#,
         6,
     );
@@ -2474,8 +2477,6 @@ fn extern_weak_statics() {
 }
 
 #[test]
-// FIXME
-#[should_panic]
 fn from_ne_bytes() {
     check_number(
         r#"
@@ -2567,9 +2568,8 @@ fn const_transfer_memory() {
 fn anonymous_const_block() {
     check_number(
         r#"
-    extern "rust-intrinsic" {
-        pub fn size_of<T>() -> usize;
-    }
+    #[rustc_intrinsic]
+    pub fn size_of<T>() -> usize;
 
     const fn f<T>() -> usize {
         let r = const { size_of::<T>() };
