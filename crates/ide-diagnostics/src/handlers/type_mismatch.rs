@@ -1,5 +1,5 @@
 use either::Either;
-use hir::{CallableKind, ClosureStyle, HirDisplay, InFile, db::ExpandDatabase};
+use hir::{CallableKind, ClosureStyle, HirDisplay, InFile};
 use ide_db::{
     famous_defs::FamousDefs,
     source_change::{SourceChange, SourceChangeBuilder},
@@ -74,6 +74,7 @@ fn fixes(ctx: &DiagnosticsContext<'_, '_>, d: &hir::TypeMismatch<'_>) -> Option<
         remove_unnecessary_wrapper(ctx, d, expr_ptr, &mut fixes);
         remove_semicolon(ctx, d, expr_ptr, &mut fixes);
         str_ref_to_owned(ctx, d, expr_ptr, &mut fixes);
+        add_await(ctx, d, expr_ptr, &mut fixes);
     }
 
     if fixes.is_empty() { None } else { Some(fixes) }
@@ -150,7 +151,7 @@ fn add_missing_ok_or_some(
     expr_ptr: &InFile<AstPtr<ast::Expr>>,
     acc: &mut Vec<Assist>,
 ) -> Option<()> {
-    let root = ctx.db().parse_or_expand(expr_ptr.file_id);
+    let root = expr_ptr.file_id.parse_or_expand(ctx.db());
     let expr = expr_ptr.value.to_node(&root);
     let hir::FileRange { file_id, range: expr_range } =
         ctx.sema.original_range_opt(expr.syntax())?;
@@ -245,7 +246,7 @@ fn remove_unnecessary_wrapper(
     acc: &mut Vec<Assist>,
 ) -> Option<()> {
     let db = ctx.db();
-    let root = db.parse_or_expand(expr_ptr.file_id);
+    let root = expr_ptr.file_id.parse_or_expand(db);
     let expr = expr_ptr.value.to_node(&root);
     // FIXME: support inside MacroCall?
     let expr = ctx.sema.original_ast_node(expr)?;
@@ -326,7 +327,7 @@ fn remove_semicolon(
     expr_ptr: &InFile<AstPtr<ast::Expr>>,
     acc: &mut Vec<Assist>,
 ) -> Option<()> {
-    let root = ctx.db().parse_or_expand(expr_ptr.file_id);
+    let root = expr_ptr.file_id.parse_or_expand(ctx.db());
     let expr = expr_ptr.value.to_node(&root);
     if !d.actual.is_unit() {
         return None;
@@ -364,7 +365,7 @@ fn str_ref_to_owned(
         return None;
     }
 
-    let root = ctx.db().parse_or_expand(expr_ptr.file_id);
+    let root = expr_ptr.file_id.parse_or_expand(ctx.db());
     let expr = expr_ptr.value.to_node(&root);
     let hir::FileRange { file_id, range } = ctx.sema.original_range_opt(expr.syntax())?;
 
@@ -373,6 +374,30 @@ fn str_ref_to_owned(
     let edit = TextEdit::insert(range.end(), to_owned);
     let source_change = SourceChange::from_text_edit(file_id.file_id(ctx.db()), edit);
     acc.push(fix("str_ref_to_owned", "Add .to_owned() here", source_change, range));
+
+    Some(())
+}
+
+fn add_await(
+    ctx: &DiagnosticsContext<'_, '_>,
+    d: &hir::TypeMismatch<'_>,
+    expr_ptr: &InFile<AstPtr<ast::Expr>>,
+    acc: &mut Vec<Assist>,
+) -> Option<()> {
+    let output = d.actual.clone().future_output(ctx.db())?;
+    // XXX: maybe should check if ctx is async
+    let is_applicable = output.could_coerce_to(ctx.db(), &d.expected);
+    if !is_applicable {
+        return None;
+    }
+
+    let root = expr_ptr.file_id.parse_or_expand(ctx.db());
+    let expr = expr_ptr.value.to_node(&root);
+    let hir::FileRange { file_id, range } = ctx.sema.original_range_opt(expr.syntax())?;
+
+    let edit = TextEdit::insert(range.end(), ".await".to_owned());
+    let source_change = SourceChange::from_text_edit(file_id.file_id(ctx.db()), edit);
+    acc.push(fix("add_await", "Add .await here", source_change, range));
 
     Some(())
 }
@@ -1388,6 +1413,47 @@ struct String;
 identity! {
     fn test() -> String {
         "a".to_owned()
+    }
+}
+            "#,
+        );
+    }
+
+    #[test]
+    fn add_await() {
+        check_fix(
+            r#"
+//- minicore: future
+async fn foo() -> u32 { 2 }
+async fn test() {
+    let x: u32 = foo()$0;
+}
+            "#,
+            r#"
+async fn foo() -> u32 { 2 }
+async fn test() {
+    let x: u32 = foo().await;
+}
+            "#,
+        );
+
+        check_fix(
+            r#"
+//- minicore: future
+macro_rules! identity { ($($t:tt)*) => ($($t)*) }
+async fn foo() -> u32 { 2 }
+identity! {
+    async fn test() {
+        let x: u32 = foo()$0;
+    }
+}
+            "#,
+            r#"
+macro_rules! identity { ($($t:tt)*) => ($($t)*) }
+async fn foo() -> u32 { 2 }
+identity! {
+    async fn test() {
+        let x: u32 = foo().await;
     }
 }
             "#,

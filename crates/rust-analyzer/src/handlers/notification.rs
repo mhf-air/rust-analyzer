@@ -10,7 +10,8 @@ use itertools::Itertools;
 use lsp_types::{
     CancelParams, DidChangeConfigurationParams, DidChangeTextDocumentParams,
     DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, WorkDoneProgressCancelParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, TextDocumentContentChangeEvent,
+    WorkDoneProgressCancelParams,
 };
 use paths::Utf8PathBuf;
 use triomphe::Arc;
@@ -31,8 +32,8 @@ use crate::{
 
 pub(crate) fn handle_cancel(state: &mut GlobalState, params: CancelParams) -> anyhow::Result<()> {
     let id: lsp_server::RequestId = match params.id {
-        lsp_types::NumberOrString::Number(id) => id.into(),
-        lsp_types::NumberOrString::String(id) => id.into(),
+        lsp_types::Id::Int(id) => id.into(),
+        lsp_types::Id::String(id) => id.into(),
     };
     state.cancel(id);
     Ok(())
@@ -42,7 +43,7 @@ pub(crate) fn handle_work_done_progress_cancel(
     state: &mut GlobalState,
     params: WorkDoneProgressCancelParams,
 ) -> anyhow::Result<()> {
-    if let lsp_types::NumberOrString::String(s) = &params.token
+    if let lsp_types::ProgressToken::String(s) = &params.token
         && let Some(id) = s.strip_prefix("rust-analyzer/flycheck/")
         && let Ok(id) = id.parse::<u32>()
         && let Some(flycheck) = state.flycheck.get(id as usize)
@@ -110,13 +111,29 @@ pub(crate) fn handle_did_change_text_document(
     let _p = tracing::info_span!("handle_did_change_text_document").entered();
 
     let mut params = params;
-    let url_path = u_to_rs_url(&state.config.default_root_path(), &mut params.text_document.uri);
+    let url_path = u_to_rs_url(
+        &state.config.default_root_path(),
+        &mut params.text_document.text_document_identifier.uri,
+    );
     if !params.content_changes.is_empty() {
-        let span_pairs = u_compile_to_rust(&mut params.content_changes[0].text, &url_path);
-        u_save_span_pairs(state, &params.text_document.uri, span_pairs);
+        let mut text = match &params.content_changes[0] {
+            TextDocumentContentChangeEvent::TextDocumentContentChangePartial(a) => a.text.clone(),
+            TextDocumentContentChangeEvent::TextDocumentContentChangeWholeDocument(a) => {
+                a.text.clone()
+            }
+        };
+        let span_pairs = u_compile_to_rust(&mut text, &url_path);
+        // note: the following is neccessary
+        match &mut params.content_changes[0] {
+            TextDocumentContentChangeEvent::TextDocumentContentChangePartial(a) => a.text = text,
+            TextDocumentContentChangeEvent::TextDocumentContentChangeWholeDocument(a) => {
+                a.text = text
+            }
+        }
+        u_save_span_pairs(state, &params.text_document.text_document_identifier.uri, span_pairs);
     }
 
-    if let Ok(path) = from_proto::vfs_path(&params.text_document.uri) {
+    if let Ok(path) = from_proto::vfs_path(&params.text_document.text_document_identifier.uri) {
         let Some(DocumentData { version, data }) = state.mem_docs.get_mut(&path) else {
             tracing::error!(?path, "unexpected DidChangeTextDocument");
             return Ok(());
@@ -231,7 +248,7 @@ pub(crate) fn handle_did_change_configuration(
 ) -> anyhow::Result<()> {
     // As stated in https://github.com/microsoft/language-server-protocol/issues/676,
     // this notification's parameters should be ignored and the actual config queried separately.
-    state.send_request::<lsp_types::request::WorkspaceConfiguration>(
+    state.send_request::<lsp_types::ConfigurationRequest>(
         lsp_types::ConfigurationParams {
             items: vec![lsp_types::ConfigurationItem {
                 scope_uri: None,
@@ -569,7 +586,7 @@ pub(crate) fn handle_run_flycheck(
 
 pub(crate) fn handle_abort_run_test(state: &mut GlobalState, _: ()) -> anyhow::Result<()> {
     if state.test_run_session.take().is_some() {
-        state.send_notification::<lsp_ext::EndRunTest>(());
+        state.send_notification::<lsp_ext::EndRunTestNotification>(());
     }
     Ok(())
 }

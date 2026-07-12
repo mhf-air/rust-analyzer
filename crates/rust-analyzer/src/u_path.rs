@@ -12,11 +12,11 @@ mainly changed files:
     - crates/rust-analyzer/src/main_loop.rs
 */
 
-use crate::global_state::{url_to_file_id, GlobalState, GlobalStateSnapshot};
+use crate::global_state::{GlobalState, GlobalStateSnapshot, url_to_file_id};
 use ide::FileId;
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionTextEdit, Position, SignatureHelp,
-    TextDocumentPositionParams, Url,
+    CompletionItem, CompletionItemKind, CompletionItemTextEdit, Position, SignatureHelp,
+    TextDocumentPositionParams, Uri,
 };
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
@@ -25,7 +25,7 @@ use u::SpanPair;
 
 /** map *.u file url to corresponding *.rs file url
 */
-pub(crate) fn u_to_rs_url(root_path: &vfs::AbsPathBuf, u_uri: &mut Url) -> String {
+pub(crate) fn u_to_rs_url(root_path: &vfs::AbsPathBuf, u_uri: &mut Uri) -> String {
     let r = String::new();
     let root = match root_path.parent() {
         Some(root) => match root.as_os_str().to_str() {
@@ -132,7 +132,7 @@ pub(crate) fn u_compile_to_rust(text: &mut String, url_path: &str) -> Vec<SpanPa
     }
 }
 
-pub(crate) fn u_save_span_pairs(this: &mut GlobalState, url: &Url, pairs: Vec<SpanPair>) {
+pub(crate) fn u_save_span_pairs(this: &mut GlobalState, url: &Uri, pairs: Vec<SpanPair>) {
     match url_to_file_id(&this.vfs.read().0, &url) {
         Ok(file_id) => match file_id {
             Some(file_id) => {
@@ -194,7 +194,7 @@ pub(crate) fn u_to_rs_position(
 
 pub(crate) fn u_transform_completion_items(
     snap: &GlobalStateSnapshot,
-    url: &Url,
+    url: &Uri,
     items: &mut Vec<CompletionItem>,
 ) {
     if items.is_empty() {
@@ -225,13 +225,13 @@ pub(crate) fn u_transform_completion_items(
     let mut m: BTreeMap<Position, Position> = BTreeMap::new();
     for item in items {
         match &mut item.text_edit {
-            Some(CompletionTextEdit::Edit(edit)) => {
+            Some(CompletionItemTextEdit::TextEdit(edit)) => {
                 transform_position(&mut m, &mut edit.range.start, &pairs, true);
                 transform_position(&mut m, &mut edit.range.end, &pairs, false);
 
                 transform_text(&mut edit.new_text, item.kind);
             }
-            Some(CompletionTextEdit::InsertAndReplace(_)) => {
+            Some(CompletionItemTextEdit::InsertReplaceEdit(_)) => {
                 // NOTE it seems this is not used
                 // tracing::error!("insert {:#?}", insert);
             }
@@ -239,7 +239,7 @@ pub(crate) fn u_transform_completion_items(
         }
         transform_text(&mut item.label, item.kind);
         if let Some(ref mut text) = item.detail {
-            if let Some(CompletionItemKind::METHOD) = item.kind {
+            if let Some(CompletionItemKind::Method) = item.kind {
                 transform_method(text);
             }
             transform_text(text, item.kind);
@@ -359,8 +359,8 @@ pub(crate) fn u_transform_completion_items(
         // SCREAMING_SNAKE_CASE to screaming-snake-case--c
         if let Some(kind) = kind {
             let b = match kind {
-                CompletionItemKind::CONSTANT => "--c",
-                CompletionItemKind::VALUE => "--g",
+                CompletionItemKind::Constant => "--c",
+                CompletionItemKind::Value => "--g",
                 _ => "",
             };
             if !b.is_empty() {
