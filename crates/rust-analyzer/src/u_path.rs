@@ -327,7 +327,8 @@ pub(crate) fn u_transform_completion_items(
             if ch == ':' {
                 if i + 1 < total_len {
                     if chars[i + 1] == ':' {
-                        new_text.push_str("..");
+                        // otherwise it will completes fmt.. instead of fmt
+                        // new_text.push_str("..");
                         i += 2;
                         continue;
                     }
@@ -429,15 +430,31 @@ pub(crate) fn u_transform_completion_items(
 
 pub(crate) fn u_transform_signature_help(sig_help: &mut SignatureHelp) {
     for sig in sig_help.signatures.iter_mut() {
-        sig.label = sig.label.replace("fn", "  ");
         sig.label = sig.label.replace("_", "-");
-        sig.label = sig.label.replace(":", " ");
-        sig.label = sig.label.replace("->", " ");
+        sig.label = sig.label.replace(": ", " ");
+        sig.label = sig.label.replace(" -> ", " ");
         sig.label = sig.label.replace("[", "«");
         sig.label = sig.label.replace("]", "»");
         sig.label = sig.label.replace("<", "[");
         sig.label = sig.label.replace(">", "]");
         sig.label = sig.label.replace("::", "..");
+        if sig.label.contains("(&self") {
+            sig.label = sig.label.replace("fn ", "(&) ");
+            if sig.label.contains("(&self, ") {
+                sig.label = sig.label.replace("(&self, ", "(");
+            } else {
+                sig.label = sig.label.replace("(&self", "(");
+            }
+        } else if sig.label.contains("(&mut self") {
+            sig.label = sig.label.replace("fn ", "(&mut) ");
+            if sig.label.contains("(&mut self, ") {
+                sig.label = sig.label.replace("(&mut self, ", "(");
+            } else {
+                sig.label = sig.label.replace("(&mut self", "(");
+            }
+        }
+        sig.label = sig.label.replace(" fn ", " ");
+        sig.label = sig.label.replace("fn ", " ");
     }
 }
 
