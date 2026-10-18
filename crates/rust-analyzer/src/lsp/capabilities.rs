@@ -66,7 +66,9 @@ pub fn server_capabilities(config: &Config) -> ServerCapabilities {
             work_done_progress_options: WorkDoneProgressOptions { work_done_progress: None },
         }),
         signature_help_provider: Some(SignatureHelpOptions {
-            trigger_characters: Some(vec!["(".to_owned(), ",".to_owned(), "<".to_owned()]),
+            // mhf
+            // trigger_characters: Some(vec!["(".to_owned(), ",".to_owned(), "<".to_owned()]),
+            trigger_characters: Some(vec!["(".to_owned(), ",".to_owned(), "[".to_owned()]),
             retrigger_characters: None,
             work_done_progress_options: WorkDoneProgressOptions { work_done_progress: None },
         }),

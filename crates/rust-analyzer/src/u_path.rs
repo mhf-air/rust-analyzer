@@ -1,16 +1,14 @@
-/*
-debug:
-    add in .vimrc
-        \       'cmdline': [ 'u-analyzer', '--no-log-buffering', '--log-file', '/tmp/u' ],
-
-    touch /tmp/u
-    tail -f /tmp/u
-
-mainly changed files:
-    - crates/rust-analyzer/src/caps.rs
-    - crates/rust-analyzer/src/handlers.rs
-    - crates/rust-analyzer/src/main_loop.rs
-*/
+// debug:
+//     add in .vimrc
+//         \       'cmdline': [ 'u-analyzer', '--no-log-buffering', '--log-file', '/tmp/u' ],
+//
+//     touch /tmp/u
+//     tail -f /tmp/u
+//
+// mainly changed files:
+//     - crates/rust-analyzer/src/caps.rs
+//     - crates/rust-analyzer/src/handlers.rs
+//     - crates/rust-analyzer/src/main_loop.rs
 
 use crate::global_state::{GlobalState, GlobalStateSnapshot, url_to_file_id};
 use ide::FileId;
@@ -21,114 +19,65 @@ use lsp_types::{
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use u::SpanPair;
+use u::compile::ast::SpanPair;
+use u::compile::lex::{Identifier, Keyword, Lex, Op, Span, Token, TokenCode};
+use u::compile::parse::Parse;
 
-/** map *.u file url to corresponding *.rs file url
-*/
-pub(crate) fn u_to_rs_url(root_path: &vfs::AbsPathBuf, u_uri: &mut Uri) -> String {
-    let r = String::new();
-    let root = match root_path.parent() {
-        Some(root) => match root.as_os_str().to_str() {
-            Some(a) => a,
-            None => return r,
-        },
-        None => return r,
-    };
-    let u_str = match u_uri.path().strip_prefix(root) {
-        Some(a) => a,
-        None => return r,
-    };
-    if u_str.len() <= 2 {
-        return r;
-    }
-    let u_str = &u_str[0..u_str.len() - 2];
-    let r = u_str[1..].to_string();
-    let p = &format!("{}/.u{}.rs", &root, u_str);
-    u_uri.set_path(p);
-
-    r
+// map *.u file url to corresponding *.rs file url
+pub(crate) fn u_to_rs_url(u_uri: &mut Uri) -> String {
+    let path = u_uri.path();
+    let (dir, file_name) = path.rsplit_once('/').unwrap();
+    let p = format!("{}/{}.rs", dir, &file_name[1..file_name.len() - 2]);
+    u_uri.set_path(&p);
+    p
 }
 
-/** compile .u file to .rs, and generate Vec<SpanPair>
-*/
-pub(crate) fn u_compile_to_rust(text: &mut String, url_path: &str) -> Vec<SpanPair> {
-    return compile_to_rust(text, url_path).unwrap_or(Vec::new());
+// compile .u file to .rs, and generate Vec<SpanPair>
+pub(crate) fn u_compile_to_rust(text: &mut String) -> Vec<SpanPair> {
+    return compile_to_rust(text).unwrap_or(Vec::new());
 
-    fn compile_to_rust(
-        text: &mut String,
-        url_path: &str,
-    ) -> Result<Vec<SpanPair>, Box<dyn std::error::Error>> {
-        let buf: Vec<_> = url_path.split('/').collect();
-        if buf.len() < 3 {
-            tracing::error!("{:?}", buf);
-            let p = format!("{:?} not supported", url_path);
-            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, p)));
-        }
-
-        let file_name = buf.last().unwrap();
-
-        let is_main = if buf.len() == 3 {
-            true
-        } else if *file_name == "mod" {
-            true
-        } else {
-            match buf[0] {
-                "benches" | "bin" | "examples" | "tests" => {
-                    // bin/a.rs or bin/a/main.rs -> true
-                    // bin/a/src/a.rs -> false
-                    buf.len() == 4 || buf.len() == 5
-                }
-                _ => false,
-            }
-        };
-
-        let new_text = std::mem::take(text);
-        let data = u::about_mod(new_text, *file_name == "mod");
-
-        let mut l = u::Lex::new();
+    fn compile_to_rust(text: &mut String) -> Result<Vec<SpanPair>, Box<dyn std::error::Error>> {
+        let data = std::mem::take(text);
+        let mut l = Lex::new();
         l.lex(data)?;
+
         // check the first case that the token after . and .. is not an Identifier or integer or await,
         // insert an empty Identifier after . or ..
         if let Some(index) = l.tokens.windows(2).position(|a| {
-            matches!(a[0].code, u::TokenCode::Op(u::Op::Dot | u::Op::DotDot))
+            matches!(a[0].code, TokenCode::Op(Op::Dot | Op::DotDot))
                 && !matches!(
                     a[1].code,
-                    u::TokenCode::Identifier(_)
-                        | u::TokenCode::Literal(_)
-                        | u::TokenCode::Keyword(u::Keyword::Await)
+                    TokenCode::Identifier(_)
+                        | TokenCode::Literal(_)
+                        | TokenCode::Keyword(Keyword::Await)
                 )
         }) {
             let token = &l.tokens[index];
-            let span = u::Span {
+            let mut t = Token::default();
+            t.span = Span {
                 width: 0,
                 line: token.span.line,
                 column: token.span.column + token.span.width,
+                ..Span::default()
             };
-            l.tokens.insert(
-                index + 1,
-                u::Token {
-                    code: u::TokenCode::Identifier(u::Identifier::new(
-                        String::new(),
-                        span.line,
-                        span.column,
-                    )),
-                    span,
-                },
-            );
+            let mut ident = Identifier::new("".to_owned(), "".to_owned());
+            ident.span.line = t.span.line;
+            ident.span.column = t.span.column;
+            t.code = TokenCode::Identifier(ident);
+            l.tokens.insert(index + 1, t);
         }
 
-        let mut p = u::Parse::new(l);
+        let mut p = Parse::new(l);
         p.set_magic();
         if let Err(err) = p.parse() {
             tracing::error!("{:?}", err);
             return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "parse error")));
         }
 
-        let mut f = p.to_rust(is_main)?;
-        let span_pairs = f.span_pairs_move();
-        *text = f.buf();
+        let f = p.to_rs()?;
+        *text = f.buf;
         // tracing::error!("{}", text);
-        Ok(span_pairs)
+        Ok(f.span_pairs)
     }
 }
 
@@ -169,7 +118,7 @@ pub(crate) fn u_to_rs_position(
     let pairs = match snap.u.span_pairs.get(&file_id) {
         Some(a) => a,
         None => {
-            tracing::error!("{:?} not found in snap", file_id);
+            tracing::error!("{:?} not found in snap: u_to_rs_position", params.text_document.uri);
             return;
         }
     };
@@ -217,7 +166,7 @@ pub(crate) fn u_transform_completion_items(
     let pairs = match snap.u.span_pairs.get(&file_id) {
         Some(a) => a,
         None => {
-            tracing::error!("{:?} not found in snap", file_id);
+            tracing::error!("{:?} not found in snap: u_transform_completion_items", url);
             return;
         }
     };
@@ -229,7 +178,7 @@ pub(crate) fn u_transform_completion_items(
                 transform_position(&mut m, &mut edit.range.start, &pairs, true);
                 transform_position(&mut m, &mut edit.range.end, &pairs, false);
 
-                transform_text(&mut edit.new_text, item.kind);
+                transform_text(&mut edit.new_text);
             }
             Some(CompletionItemTextEdit::InsertReplaceEdit(_)) => {
                 // NOTE it seems this is not used
@@ -237,15 +186,15 @@ pub(crate) fn u_transform_completion_items(
             }
             None => {}
         }
-        transform_text(&mut item.label, item.kind);
+        transform_text(&mut item.label);
         if let Some(ref mut text) = item.detail {
             if let Some(CompletionItemKind::Method) = item.kind {
                 transform_method(text);
             }
-            transform_text(text, item.kind);
+            transform_text(text);
         }
         if let Some(ref mut text) = item.filter_text {
-            transform_text(text, item.kind);
+            transform_text(text);
         }
     }
 
@@ -280,7 +229,7 @@ pub(crate) fn u_transform_completion_items(
         });
     }
 
-    fn transform_text(text: &mut String, kind: Option<CompletionItemKind>) {
+    fn transform_text(text: &mut String) {
         if text.is_empty() {
             return;
         }
@@ -307,8 +256,8 @@ pub(crate) fn u_transform_completion_items(
                 if i == total_len {
                     end_index = total_len;
                 }
-                let mut ident = chars[start_index..end_index].iter().collect();
-                transform_identifier(&mut ident, kind);
+                let mut ident: String = chars[start_index..end_index].iter().collect();
+                ident = u::rs::rl::Identifier::to_u_string_no_prefix(&ident);
                 new_text.push_str(&ident);
                 continue;
             }
@@ -335,9 +284,9 @@ pub(crate) fn u_transform_completion_items(
                 }
             }
             match ch {
-                '!' => new_text.push_str(",,"),
-                '[' => new_text.push('«'),
-                ']' => new_text.push('»'),
+                '!' => new_text.push_str("_"),
+                '[' => new_text.push_str("[`"),
+                ']' => new_text.push_str("`]"),
                 '<' => new_text.push('['),
                 '>' => new_text.push(']'),
                 '-' => new_text.push('~'),
@@ -348,60 +297,6 @@ pub(crate) fn u_transform_completion_items(
         }
 
         *text = new_text;
-    }
-
-    fn transform_identifier(text: &mut String, kind: Option<CompletionItemKind>) {
-        *text = text.replace("_", "-");
-        let chars: Vec<_> = text.chars().collect();
-        if !chars[0].is_uppercase() {
-            return;
-        }
-
-        // SCREAMING_SNAKE_CASE to screaming-snake-case--c
-        if let Some(kind) = kind {
-            let b = match kind {
-                CompletionItemKind::Constant => "--c",
-                CompletionItemKind::Value => "--g",
-                _ => "",
-            };
-            if !b.is_empty() {
-                let raw = chars.iter().find(|a| a.is_lowercase());
-                if raw.is_some() {
-                    let mut a = String::new();
-                    a.push_str(text);
-                    a.push_str("--r");
-                    *text = a;
-                    return;
-                }
-
-                let mut a = text.to_lowercase();
-                a.push_str(b);
-                *text = a;
-                return;
-            }
-        }
-
-        // UpperCamelCase to Upper-camel-case
-        let mut a = String::new();
-        if chars.contains(&'-') {
-            a.push_str(text);
-            a.push_str("--r");
-            *text = a;
-            return;
-        }
-        for (i, ch) in chars.iter().enumerate() {
-            if i == 0 {
-                a.push(chars[i]);
-                continue;
-            }
-            if ch.is_uppercase() {
-                a.push('-');
-                a.push_str(&chars[i].to_lowercase().to_string());
-            } else {
-                a.push(chars[i]);
-            }
-        }
-        *text = a;
     }
 
     fn transform_method(text: &mut String) {
@@ -422,7 +317,7 @@ pub(crate) fn u_transform_completion_items(
         let pat = "fn(self";
         if text.starts_with(pat) {
             let start = if text.as_bytes()[pat.len()] == ')' as u8 { 0 } else { 2 };
-            *text = format!(" (Self)  func({}", &text[pat.len() + start..]);
+            *text = format!(" ()  func({}", &text[pat.len() + start..]);
             return;
         }
     }
@@ -433,8 +328,8 @@ pub(crate) fn u_transform_signature_help(sig_help: &mut SignatureHelp) {
         sig.label = sig.label.replace("_", "-");
         sig.label = sig.label.replace(": ", " ");
         sig.label = sig.label.replace(" -> ", " ");
-        sig.label = sig.label.replace("[", "«");
-        sig.label = sig.label.replace("]", "»");
+        sig.label = sig.label.replace("[", "[`");
+        sig.label = sig.label.replace("]", "`]");
         sig.label = sig.label.replace("<", "[");
         sig.label = sig.label.replace(">", "]");
         sig.label = sig.label.replace("::", "..");

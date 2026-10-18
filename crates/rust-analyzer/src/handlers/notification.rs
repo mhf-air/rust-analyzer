@@ -64,8 +64,7 @@ pub(crate) fn handle_did_open_text_document(
     let _p = tracing::info_span!("handle_did_open_text_document").entered();
 
     let mut params = params;
-    let url_path = u_to_rs_url(&state.config.default_root_path(), &mut params.text_document.uri);
-    let span_pairs = u_compile_to_rust(&mut params.text_document.text, &url_path);
+    let span_pairs = u_compile_to_rust(&mut params.text_document.text);
 
     if let Ok(path) = from_proto::vfs_path(&params.text_document.uri) {
         let already_exists = state
@@ -115,10 +114,6 @@ pub(crate) fn handle_did_change_text_document(
     let _p = tracing::info_span!("handle_did_change_text_document").entered();
 
     let mut params = params;
-    let url_path = u_to_rs_url(
-        &state.config.default_root_path(),
-        &mut params.text_document.text_document_identifier.uri,
-    );
     if !params.content_changes.is_empty() {
         let mut text = match &params.content_changes[0] {
             TextDocumentContentChangeEvent::TextDocumentContentChangePartial(a) => a.text.clone(),
@@ -126,7 +121,7 @@ pub(crate) fn handle_did_change_text_document(
                 a.text.clone()
             }
         };
-        let span_pairs = u_compile_to_rust(&mut text, &url_path);
+        let span_pairs = u_compile_to_rust(&mut text);
         // note: the following is neccessary
         match &mut params.content_changes[0] {
             TextDocumentContentChangeEvent::TextDocumentContentChangePartial(a) => a.text = text,
@@ -170,7 +165,7 @@ pub(crate) fn handle_did_close_text_document(
     let _p = tracing::info_span!("handle_did_close_text_document").entered();
 
     let mut params = params;
-    u_to_rs_url(&state.config.default_root_path(), &mut params.text_document.uri);
+    u_to_rs_url(&mut params.text_document.uri);
 
     if let Ok(path) = from_proto::vfs_path(&params.text_document.uri) {
         if state.mem_docs.remove(&path).is_err() {

@@ -843,10 +843,7 @@ pub(crate) fn handle_goto_definition(
     params: lsp_types::DefinitionParams,
 ) -> anyhow::Result<Option<lsp_types::DefinitionResponse>> {
     let mut params = params;
-    u_to_rs_url(
-        &snap.config.default_root_path(),
-        &mut params.text_document_position_params.text_document.uri,
-    );
+    u_to_rs_url(&mut params.text_document_position_params.text_document.uri);
     u_to_rs_position(&snap, &mut params.text_document_position_params);
 
     let _p = tracing::info_span!("handle_goto_definition").entered();
@@ -1172,10 +1169,7 @@ pub(crate) fn handle_completion(
         ..
     }: lsp_types::CompletionParams,
 ) -> anyhow::Result<Option<lsp_types::CompletionResponse>> {
-    u_to_rs_url(
-        &snap.config.default_root_path(),
-        &mut text_document_position_params.text_document.uri,
-    );
+    u_to_rs_url(&mut text_document_position_params.text_document.uri);
     u_to_rs_position(&snap, &mut text_document_position_params);
 
     let _p = tracing::info_span!("handle_completion").entered();
@@ -1359,10 +1353,7 @@ pub(crate) fn handle_signature_help(
     params: lsp_types::SignatureHelpParams,
 ) -> anyhow::Result<Option<lsp_types::SignatureHelp>> {
     let mut params = params;
-    u_to_rs_url(
-        &snap.config.default_root_path(),
-        &mut params.text_document_position_params.text_document.uri,
-    );
+    u_to_rs_url(&mut params.text_document_position_params.text_document.uri);
     u_to_rs_position(&snap, &mut params.text_document_position_params);
 
     let _p = tracing::info_span!("handle_signature_help").entered();

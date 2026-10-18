@@ -68,9 +68,7 @@ pub fn run_session(
         .and_then(|it| Utf8PathBuf::from_path_buf(it).ok())
         .and_then(|it| AbsPathBuf::try_from(it).ok())
     {
-        // Some(it) => it,
-        // $CRATE_ROOT to $WORKSPACE_ROOT/.u
-        Some(it) => it.parent().unwrap().parent().unwrap().join(".u"),
+        Some(it) => it,
         None => {
             let cwd = env::current_dir().context("couldn't determine working directory")?;
             AbsPathBuf::assert_utf8(cwd)
@@ -100,7 +98,6 @@ pub fn run_session(
                 .map(patch_path_prefix)
                 .filter_map(|it| Utf8PathBuf::from_path_buf(it).ok())
                 .filter_map(|it| AbsPathBuf::try_from(it).ok())
-                .filter_map(|it| Some(it.parent().unwrap().parent().unwrap().join(".u"))) // mhf
                 .collect::<Vec<_>>()
         })
         .filter(|workspaces| !workspaces.is_empty())
