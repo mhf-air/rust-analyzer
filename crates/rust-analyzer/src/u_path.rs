@@ -3,12 +3,12 @@
 //         \       'cmdline': [ 'u-analyzer', '--no-log-buffering', '--log-file', '/tmp/u' ],
 //
 //     touch /tmp/u
-//     tail -f /tmp/u
+//     echo > /tmp/u && tail -f /tmp/u
 //
 // mainly changed files:
 //     - crates/rust-analyzer/src/caps.rs
-//     - crates/rust-analyzer/src/handlers.rs
-//     - crates/rust-analyzer/src/main_loop.rs
+//     - crates/rust-analyzer/src/handlers/notification.rs
+//     - crates/rust-analyzer/src/handlers/request.rs
 
 use crate::global_state::{GlobalState, GlobalStateSnapshot, url_to_file_id};
 use ide::FileId;
@@ -57,12 +57,12 @@ pub(crate) fn u_compile_to_rust(text: &mut String) -> Vec<SpanPair> {
             t.span = Span {
                 width: 0,
                 line: token.span.line,
-                column: token.span.column + token.span.width,
-                ..Span::default()
+                column: token.span.end_column + 1,
+                end_line: token.span.line,
+                end_column: token.span.end_column + 1,
             };
-            let mut ident = Identifier::new("".to_owned(), "".to_owned());
-            ident.span.line = t.span.line;
-            ident.span.column = t.span.column;
+            let mut ident = Identifier::default();
+            ident.span = t.span;
             t.code = TokenCode::Identifier(ident);
             l.tokens.insert(index + 1, t);
         }
@@ -136,7 +136,7 @@ pub(crate) fn u_to_rs_position(
     };
     let delta = u_pair.rust.width;
     params.position.line = (u_pair.rust.line - 1) as u32;
-    params.position.character = (u_pair.rust.column - 1 + delta) as u32;
+    params.position.character = (u_pair.rust.column + delta) as u32;
     // tracing::error!("{:?}", u_pair);
     // tracing::error!("{:?}", params.position);
 }
@@ -303,21 +303,21 @@ pub(crate) fn u_transform_completion_items(
         let pat = "fn(&self";
         if text.starts_with(pat) {
             let start = if text.as_bytes()[pat.len()] == ')' as u8 { 0 } else { 2 };
-            *text = format!("    (&)  func({}", &text[pat.len() + start..]);
+            *text = format!(" (&) func({}", &text[pat.len() + start..]);
             return;
         }
 
         let pat = "fn(&mut self";
         if text.starts_with(pat) {
             let start = if text.as_bytes()[pat.len()] == ')' as u8 { 0 } else { 2 };
-            *text = format!(" (&mut)  func({}", &text[pat.len() + start..]);
+            *text = format!(" (&mut) func({}", &text[pat.len() + start..]);
             return;
         }
 
         let pat = "fn(self";
         if text.starts_with(pat) {
             let start = if text.as_bytes()[pat.len()] == ')' as u8 { 0 } else { 2 };
-            *text = format!(" ()  func({}", &text[pat.len() + start..]);
+            *text = format!(" () func({}", &text[pat.len() + start..]);
             return;
         }
     }

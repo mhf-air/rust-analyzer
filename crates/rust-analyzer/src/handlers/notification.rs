@@ -64,6 +64,7 @@ pub(crate) fn handle_did_open_text_document(
     let _p = tracing::info_span!("handle_did_open_text_document").entered();
 
     let mut params = params;
+    u_to_rs_url(&mut params.text_document.uri);
     let span_pairs = u_compile_to_rust(&mut params.text_document.text);
 
     if let Ok(path) = from_proto::vfs_path(&params.text_document.uri) {
@@ -114,6 +115,7 @@ pub(crate) fn handle_did_change_text_document(
     let _p = tracing::info_span!("handle_did_change_text_document").entered();
 
     let mut params = params;
+    u_to_rs_url(&mut params.text_document.text_document_identifier.uri);
     if !params.content_changes.is_empty() {
         let mut text = match &params.content_changes[0] {
             TextDocumentContentChangeEvent::TextDocumentContentChangePartial(a) => a.text.clone(),
