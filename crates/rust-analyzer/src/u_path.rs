@@ -20,7 +20,7 @@ use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use u::compile::ast::SpanPair;
-use u::compile::lex::{Identifier, Keyword, Lex, Op, Span, Token, TokenCode};
+use u::compile::lex::{Identifier, Keyword, Lex, Op, Pair, Span, Token, TokenCode};
 use u::compile::parse::Parse;
 
 // map *.u file url to corresponding *.rs file url
@@ -55,7 +55,9 @@ pub(crate) fn u_compile_to_rust(text: &mut String) -> Vec<SpanPair> {
                 TokenCode::Identifier(_)
                     | TokenCode::Literal(_)
                     | TokenCode::Keyword(Keyword::Await)
+                    // in use clause
                     | TokenCode::Op(Op::Star)
+                    | TokenCode::Pair(Pair::BraceOpen)
             );
         });
         if let Some(index) = a {
