@@ -43,15 +43,22 @@ pub(crate) fn u_compile_to_rust(text: &mut String) -> Vec<SpanPair> {
 
         // check the first case that the token after . and .. is not an Identifier or integer or await,
         // insert an empty Identifier after . or ..
-        if let Some(index) = l.tokens.windows(2).position(|a| {
-            matches!(a[0].code, TokenCode::Op(Op::Dot | Op::DotDot))
-                && !matches!(
-                    a[1].code,
-                    TokenCode::Identifier(_)
-                        | TokenCode::Literal(_)
-                        | TokenCode::Keyword(Keyword::Await)
-                )
-        }) {
+        let a = l.tokens.windows(2).position(|a| {
+            if !matches!(a[0].code, TokenCode::Op(Op::Dot | Op::DotDot)) {
+                return false;
+            }
+            if a[0].span.end_line != a[1].span.line {
+                return true;
+            }
+            return !matches!(
+                a[1].code,
+                TokenCode::Identifier(_)
+                    | TokenCode::Literal(_)
+                    | TokenCode::Keyword(Keyword::Await)
+                    | TokenCode::Op(Op::Star)
+            );
+        });
+        if let Some(index) = a {
             let token = &l.tokens[index];
             let mut t = Token::default();
             t.span = Span {
