@@ -65,6 +65,8 @@ pub(crate) fn handle_did_open_text_document(
 
     let mut params = params;
     u_to_rs_url(&mut params.text_document.uri);
+    // have to be here to compile
+    let span_pairs = u_compile_to_rust(&mut params.text_document.text);
 
     if let Ok(path) = from_proto::vfs_path(&params.text_document.uri) {
         let already_exists = state
@@ -92,10 +94,9 @@ pub(crate) fn handle_did_open_text_document(
         // Library files are immutable: the client never becomes authoritative over their
         // contents, disk is the truth.
         if !state.source_root_config.path_is_library(&path) {
-            let span_pairs = u_compile_to_rust(&mut params.text_document.text);
-            u_save_span_pairs(state, &params.text_document.uri, span_pairs);
             let contents = params.text_document.text.into_bytes();
             state.vfs.write().0.set_file_contents(path, Some(contents));
+            u_save_span_pairs(state, &params.text_document.uri, span_pairs);
         }
         if state.config.discover_workspace_config().is_some() {
             tracing::debug!("queuing task");

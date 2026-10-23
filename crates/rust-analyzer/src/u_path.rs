@@ -143,7 +143,7 @@ pub(crate) fn u_to_rs_position(
     };
     let delta = u_pair.rust.width;
     params.position.line = (u_pair.rust.line - 1) as u32;
-    params.position.character = (u_pair.rust.column + delta) as u32;
+    params.position.character = (u_pair.rust.column + delta - 1) as u32;
     // tracing::error!("{:?}", u_pair);
     // tracing::error!("{:?}", params.position);
 }
