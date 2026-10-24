@@ -305,6 +305,7 @@ pub(crate) fn u_transform_completion_items(
             i += 1;
         }
 
+        new_text = new_text.replace("self.", "s.");
         *text = new_text;
     }
 
